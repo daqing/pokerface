@@ -1,0 +1,7 @@
+// pokerface, scaffolded by `emo new` — run it with `emo run main.emo`.
+
+def greet(whom String) String {
+  return "Hello, ${whom}!"
+}
+
+println(greet("world"))
