@@ -1,0 +1,79 @@
+// Tests for src/cli.emo — run them with `emo test`.
+
+const cli = src.cli
+
+
+def test_exit_code_constants() {
+  expect_equal(0, cli.exit_ok)
+  expect_equal(1, cli.exit_failure)
+  expect_equal(2, cli.exit_usage)
+}
+
+def test_help_flag_exits_zero() {
+  expect_equal(cli.exit_ok, cli.route(["pokerface", "--help"]))
+}
+
+def test_short_help_flag_exits_zero() {
+  expect_equal(cli.exit_ok, cli.route(["pokerface", "-h"]))
+}
+
+def test_version_exits_zero() {
+  expect_equal(cli.exit_ok, cli.route(["pokerface", "version"]))
+}
+
+def test_version_json_flag_exits_zero() {
+  expect_equal(cli.exit_ok, cli.route(["pokerface", "version", "--json"]))
+}
+
+def test_version_verbose_and_config_flags_exits_zero() {
+  expect_equal(cli.exit_ok, cli.route(["pokerface", "--verbose", "--config", "/tmp/f.yaml", "version"]))
+}
+
+def test_config_equals_form_exits_zero() {
+  expect_equal(cli.exit_ok, cli.route(["pokerface", "--config=/tmp/f.yaml", "version"]))
+}
+
+def test_no_arguments_is_usage_error() {
+  expect_equal(cli.exit_usage, cli.route(["pokerface"]))
+}
+
+def test_unknown_command_exits_two() {
+  expect_equal(cli.exit_usage, cli.route(["pokerface", "frobnicate"]))
+}
+
+def test_unknown_option_exits_two() {
+  expect_equal(cli.exit_usage, cli.route(["pokerface", "version", "--wat"]))
+}
+
+def test_unknown_short_option_exits_two() {
+  expect_equal(cli.exit_usage, cli.route(["pokerface", "-x"]))
+}
+
+def test_missing_config_value_exits_two() {
+  expect_equal(cli.exit_usage, cli.route(["pokerface", "--config"]))
+}
+
+def test_unimplemented_commands_report_not_implemented() {
+  expect_equal(cli.exit_failure, cli.route(["pokerface", "resolve"]))
+  expect_equal(cli.exit_failure, cli.route(["pokerface", "pull"]))
+  expect_equal(cli.exit_failure, cli.route(["pokerface", "build"]))
+  expect_equal(cli.exit_failure, cli.route(["pokerface", "config"]))
+  expect_equal(cli.exit_failure, cli.route(["pokerface", "cache"]))
+}
+
+def test_help_text_names_all_commands() {
+  const text = cli.help_text()
+  expect_true(text.index_of("resolve") >= 0)
+  expect_true(text.index_of("pull") >= 0)
+  expect_true(text.index_of("build") >= 0)
+  expect_true(text.index_of("config") >= 0)
+  expect_true(text.index_of("cache") >= 0)
+  expect_true(text.index_of("version") >= 0)
+}
+
+def test_help_text_names_all_global_flags() {
+  const text = cli.help_text()
+  expect_true(text.index_of("--config") >= 0)
+  expect_true(text.index_of("--verbose") >= 0)
+  expect_true(text.index_of("--json") >= 0)
+}

@@ -1,7 +1,5 @@
-// pokerface, scaffolded by `emo new` — run it with `emo run main.emo`.
+// pokerface — CLI entry point: route argv and exit with the command's code.
 
-def greet(whom String) String {
-  return "Hello, ${whom}!"
-}
+require "os"
 
-println(greet("world"))
+os._exit(src.cli.route(os.argv()))

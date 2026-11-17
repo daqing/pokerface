@@ -70,7 +70,7 @@
 
 | 状态 | ID | 任务 | 依赖 | 预估 |
 | --- | --- | --- | --- | --- |
-| [ ] | T1.1 | CLI 骨架与命令路由 | 无 | 1-2h |
+| [x] | T1.1 | CLI 骨架与命令路由 | 无 | 1-2h |
 | [ ] | T1.2 | Emo 运行时能力验证与依赖锁定 | T1.1 | 2h |
 | [ ] | T1.3 | 仓库引用解析 | T1.1 | 1-2h |
 | [ ] | T1.4 | `pokerface.yaml` v0.1 规范与解析 | T1.2 | 2-3h |
@@ -99,6 +99,8 @@
 **验收**：`emo build` 通过；`pokerface --help` 与 `pokerface version` 正常；未知命令退出码为 2；`emo test` 仍通过。
 
 **依赖**：无 · **预估**：1-2h
+
+> **笔记**（2026-11-17，约 1h）：完成。`main.emo` 是薄入口（`src.cli.route(os.argv())` + `os._exit`）；`src/cli.emo` 承载命令路由、帮助文本、`Flags` 类与退出码常量（0 成功 / 1 失败 / 2 用法错误）。未实现的子命令向 stderr 输出“未实现”提示并退出 1；`version` 支持 `--json`；无参数、未知命令/未知选项均退出 2。踩坑：本地模块按路径引用（是 `src.cli` 而不是 `cli`）；解析后未使用的局部变量会在 C 层报 `-Wunused-but-set-variable`，所以解析出的参数通过 `Flags` 传入 handler。后续：T1.8 读取 `Flags.config`，T1.16 接通 verbose 日志与完整退出码表，T4.10 把 `docs/cli.md` 扩成完整参考。
 
 #### T1.2 Emo 运行时能力验证与依赖锁定
 

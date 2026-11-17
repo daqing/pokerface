@@ -1,5 +1,0 @@
-// Tests for main.emo's greet — run them with `emo test`.
-
-def test_greet() {
-  expect_equal("Hello, world!", main.greet("world"))
-}

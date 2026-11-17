@@ -1,0 +1,132 @@
+// pokerface CLI skeleton (T1.1): command routing, help text, and exit codes.
+require "os"
+
+// 0 success, 1 command failure, 2 usage error. T1.16 (docs/spec/errors.md)
+// grows this into the full, stable table.
+const exit_ok = 0
+const exit_failure = 1
+const exit_usage = 2
+
+const version = "0.1.0"
+
+class Flags {
+  def init(config String, verbose Bool, json Bool) {
+    self.config = config
+    self.verbose = verbose
+    self.json = json
+  }
+}
+
+def eprint(text String) {
+  const (R.ok, _) = os.write(2, text)
+}
+
+def help_text() String {
+  return (
+    "pokerface " + version + " — distribute container images through Git\n"
+    + "\n"
+    + "Usage:\n"
+    + "  pokerface [global flags] <command> [args]\n"
+    + "\n"
+    + "Commands:\n"
+    + "  resolve    Print the resolution chain of a repository reference\n"
+    + "  pull       Fetch an image, verify it, and import it into the local runtime\n"
+    + "  build      Build and push the image described by pokerface.yaml\n"
+    + "  config     Show the effective configuration\n"
+    + "  cache      Inspect and manage the local cache\n"
+    + "  version    Print the version\n"
+    + "\n"
+    + "Global flags:\n"
+    + "  --config <path>   Configuration file path\n"
+    + "  --verbose         Verbose logging\n"
+    + "  --json            Machine-readable output where supported\n"
+    + "  -h, --help        Show this help\n"
+    + "\n"
+    + "Most commands are not implemented yet; see docs/TASKS.md for the plan.\n"
+  )
+}
+
+def usage_text() String {
+  return (
+    "usage: pokerface [--config <path>] [--verbose] [--json] <command> [args]\n"
+    + "run `pokerface --help` for the command list\n"
+  )
+}
+
+def run_version(flags Flags) Int64 {
+  if flags.json {
+    println("{\"name\": \"pokerface\", \"version\": \"" + version + "\"}")
+  } else {
+    println("pokerface " + version)
+  }
+  return exit_ok
+}
+
+def not_implemented(name String, flags Flags) Int64 {
+  eprint("pokerface: " + name + " is not implemented yet; see docs/TASKS.md\n")
+  if flags.verbose {
+    eprint("pokerface: verbose logging is not wired up yet (planned for T1.16)\n")
+  }
+  return exit_failure
+}
+
+def route(argv Array[String]) Int64 {
+  var config = ""
+  var verbose = false
+  var json = false
+  var want_help = false
+  var command = ""
+  var rest = []
+  var i = 1
+  while i < argv.length() {
+    const arg = argv[i]
+    case arg {
+      "--help" then { want_help = true }
+      "-h" then { want_help = true }
+      "--verbose" then { verbose = true }
+      "--json" then { json = true }
+      "--config" then {
+        if i + 1 >= argv.length() {
+          eprint("pokerface: --config expects a path argument\n")
+          return exit_usage
+        }
+        i = i + 1
+        config = argv[i]
+      }
+      _ when arg.starts_with("--config=") then {
+        config = arg.substring(9, arg.length() - 9)
+      }
+      _ when arg.starts_with("-") then {
+        eprint("pokerface: unknown option " + arg + "; run `pokerface --help` for usage\n")
+        return exit_usage
+      }
+      _ when command == "" then { command = arg }
+      _ then { rest = rest.append(arg) }
+    }
+    i = i + 1
+  }
+
+  if want_help {
+    println(help_text())
+    return exit_ok
+  }
+
+  if command == "" {
+    eprint(usage_text())
+    return exit_usage
+  }
+
+  const flags = Flags.new(config, verbose, json)
+  case command {
+    "version" then { return run_version(flags) }
+    "resolve" then { return not_implemented(command, flags) }
+    "pull" then { return not_implemented(command, flags) }
+    "build" then { return not_implemented(command, flags) }
+    "config" then { return not_implemented(command, flags) }
+    "cache" then { return not_implemented(command, flags) }
+    _ then {
+      eprint("pokerface: unknown command \"" + command + "\"; run `pokerface --help` for the command list\n")
+      return exit_usage
+    }
+  }
+}

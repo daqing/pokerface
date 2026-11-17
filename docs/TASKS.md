@@ -70,7 +70,7 @@ Exit criteria:
 
 | Status | ID | Task | Depends on | Estimate |
 | --- | --- | --- | --- | --- |
-| [ ] | T1.1 | CLI skeleton and command routing | none | 1-2h |
+| [x] | T1.1 | CLI skeleton and command routing | none | 1-2h |
 | [ ] | T1.2 | Verify Emo runtime capabilities and pin dependencies | T1.1 | 2h |
 | [ ] | T1.3 | Parse repository references | T1.1 | 1-2h |
 | [ ] | T1.4 | `pokerface.yaml` v0.1 spec and parser | T1.2 | 2-3h |
@@ -99,6 +99,8 @@ Exit criteria:
 **Acceptance**: `emo build` passes; `pokerface --help` and `pokerface version` work; an unknown command exits with code 2; `emo test` still passes.
 
 **Depends on**: none · **Estimate**: 1-2h
+
+> **Notes** (2026-11-17, ~1h): Done. `main.emo` is a thin entry point (`src.cli.route(os.argv())` + `os._exit`); `src/cli.emo` holds routing, help text, a `Flags` class, and the exit-code constants (0 ok / 1 failure / 2 usage). Unimplemented commands print "not implemented yet" to stderr and exit 1; `version` supports `--json`; no-args and unknown command/option exit 2. Gotchas: local modules are addressed by path (`src.cli`, not `cli`), and parsed-but-unused locals surface as C-level `-Wunused-but-set-variable` warnings, so parsed flags flow into handlers through `Flags`. Follow-ups: T1.8 reads `Flags.config`, T1.16 wires verbose logging and the full exit-code table, T4.10 turns `docs/cli.md` into the full reference.
 
 #### T1.2 Verify Emo Runtime Capabilities and Pin Dependencies
 
