@@ -1,0 +1,115 @@
+// T1.2 runtime capability spike — run it with `emo run spike/runtime.emo`.
+// Exercises the capabilities the M1 client relies on: HTTPS GET, the http
+// client's no-redirect rule, subprocess capture, and SHA-256. The network
+// checks reach example.com and github.com only — never registry-1.docker.io.
+require "os"
+require "crypto"
+require "http"
+
+const sha256_abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+def git_version() String {
+  const (R.ok, fds) = os.pipe()
+  const read_fd = fds[0]
+  const write_fd = fds[1]
+  const (R.ok, pid) = os.fork()
+  if pid == 0 {
+    const (R.ok, _) = os.dup2(write_fd, 1)
+    os.close(read_fd)
+    os.execvp("git", ["git", "--version"])
+    os._exit(127)
+  }
+  os.close(write_fd)
+  var out = ""
+  while true {
+    const (R.ok, chunk) = os.read(read_fd, 4096)
+    if chunk == "" {
+      break
+    }
+    out = out + chunk
+  }
+  os.close(read_fd)
+  const w = os.waitpid(pid)
+  if os.wait_exited(w[1]) {
+    if os.wait_exit_code(w[1]) == 0 {
+      return out.trim()
+    }
+  }
+  return ""
+}
+
+def check_sha256() (Bool, String) {
+  const hex = crypto.hex_encode(crypto.sha2.sha256("abc".to_bytes()))
+  return (hex == sha256_abc, hex)
+}
+
+def check_git_subprocess() (Bool, String) {
+  const out = git_version()
+  return (out.starts_with("git version"), out)
+}
+
+def check_https_get() (Bool, String) {
+  case http.get("https://example.com/") {
+    (R.ok, resp) then {
+      const detail = "status " + resp.status.to_string() + ", " + resp.body.length().to_string() + " bytes, content-type " + resp.header("Content-Type")
+      return (resp.status == 200, detail)
+    }
+    (R.error, why) then { return (false, why) }
+  }
+}
+
+def check_redirect_not_followed() (Bool, String) {
+  case http.get("http://github.com/") {
+    (R.ok, resp) then {
+      const loc = resp.header("Location")
+      const detail = "status " + resp.status.to_string() + ", location " + loc
+      return (resp.status == 301 && loc.starts_with("https://"), detail)
+    }
+    (R.error, why) then { return (false, why) }
+  }
+}
+
+def run_spike() Int64 {
+  var failures = 0
+
+  const (sha_ok, sha_detail) = check_sha256()
+  if sha_ok {
+    println("ok   sha256 — " + sha_detail)
+  } else {
+    println("FAIL sha256 — " + sha_detail)
+    failures = failures + 1
+  }
+
+  const (git_ok, git_detail) = check_git_subprocess()
+  if git_ok {
+    println("ok   git subprocess — " + git_detail)
+  } else {
+    println("FAIL git subprocess — " + git_detail)
+    failures = failures + 1
+  }
+
+  const (https_ok, https_detail) = check_https_get()
+  if https_ok {
+    println("ok   https get — " + https_detail)
+  } else {
+    println("FAIL https get — " + https_detail)
+    failures = failures + 1
+  }
+
+  const (redir_ok, redir_detail) = check_redirect_not_followed()
+  if redir_ok {
+    println("ok   redirect not followed — " + redir_detail)
+  } else {
+    println("FAIL redirect not followed — " + redir_detail)
+    failures = failures + 1
+  }
+
+  if failures == 0 {
+    println("spike: all checks passed")
+    return 0
+  }
+  println("spike: " + failures.to_string() + " check(s) failed")
+  return 1
+}
+
+os._exit(run_spike())

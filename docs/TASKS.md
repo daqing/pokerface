@@ -71,7 +71,7 @@ Exit criteria:
 | Status | ID | Task | Depends on | Estimate |
 | --- | --- | --- | --- | --- |
 | [x] | T1.1 | CLI skeleton and command routing | none | 1-2h |
-| [ ] | T1.2 | Verify Emo runtime capabilities and pin dependencies | T1.1 | 2h |
+| [x] | T1.2 | Verify Emo runtime capabilities and pin dependencies | T1.1 | 2h |
 | [ ] | T1.3 | Parse repository references | T1.1 | 1-2h |
 | [ ] | T1.4 | `pokerface.yaml` v0.1 spec and parser | T1.2 | 2-3h |
 | [ ] | T1.5 | `pokerface.lock.yaml` v0.1 spec and parser | T1.2 | 2h |
@@ -111,6 +111,8 @@ Exit criteria:
 **Acceptance**: `emo build` and `emo test` pass; the spike completes an HTTPS GET, a `git --version` subprocess, and a SHA-256 hash; the notes record a plan for large downloads and redirects (use `net` for streaming in T1.11 if necessary).
 
 **Depends on**: T1.1 · **Estimate**: 2h
+
+> **Notes** (2026-11-17, ~1.5h): Done. All targeted capabilities verified — SHA-256 (RFC vector), subprocess fork/execvp/waitpid with pipe capture, HTTPS GET, YAML/JSON codecs, file IO, temp directories; `emo test` 25/25. Key finding: `http` indeed never follows redirects (301 returned as-is) and buffers whole bodies — T1.10 keeps `http` for manifests/tokens, T1.11 streams blobs through `net` with manual 307 handling. Gotcha with downstream impact: a bare `.` YAML scalar decodes as `YamlFloat` (encode renders `0.0`), which hits `pokerface.yaml`'s `context: .` — T1.4 must quote it or reject float contexts. Full details in `docs/notes/runtime-capabilities.md`.
 
 #### T1.3 Parse Repository References
 

@@ -71,7 +71,7 @@
 | 状态 | ID | 任务 | 依赖 | 预估 |
 | --- | --- | --- | --- | --- |
 | [x] | T1.1 | CLI 骨架与命令路由 | 无 | 1-2h |
-| [ ] | T1.2 | Emo 运行时能力验证与依赖锁定 | T1.1 | 2h |
+| [x] | T1.2 | Emo 运行时能力验证与依赖锁定 | T1.1 | 2h |
 | [ ] | T1.3 | 仓库引用解析 | T1.1 | 1-2h |
 | [ ] | T1.4 | `pokerface.yaml` v0.1 规范与解析 | T1.2 | 2-3h |
 | [ ] | T1.5 | `pokerface.lock.yaml` v0.1 规范与解析 | T1.2 | 2h |
@@ -111,6 +111,8 @@
 **验收**：`emo build` + `emo test` 通过；验证程序能完成一次 HTTPS GET、一次 `git --version` 子进程、一次 SHA-256；笔记中记录大文件下载与重定向的应对方案（必要时在 T1.11 基于 `net` 自行流式下载）。
 
 **依赖**：T1.1 · **预估**：2h
+
+> **笔记**（2026-11-17，约 1.5h）：完成。目标能力全部验证通过——SHA-256（RFC 向量）、子进程 fork/execvp/waitpid 加管道捕获、HTTPS GET、YAML/JSON 编解码、文件 IO、临时目录；`emo test` 25/25。关键结论：`http` 确实不跟随重定向（301 原样返回）且整个 body 进内存——T1.10 用 `http` 处理 manifest/token，T1.11 改用 `net` 流式下载 blob 并手动处理 307。影响后续任务的踩坑：裸 `.` 的 YAML 标量会解析成 `YamlFloat`（编码回去变 `0.0`），正好命中 `pokerface.yaml` 的 `context: .`——T1.4 必须要求加引号或拒绝浮点 context。详见 `docs/notes/runtime-capabilities.md`。
 
 #### T1.3 仓库引用解析
 

@@ -1,0 +1,154 @@
+// T1.2 runtime capability tests — offline checks for the capabilities the
+// M1 client relies on. Run with `emo test`; the network-facing checks live
+// in spike/runtime.emo.
+
+const sha256_abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
+def test_sha256_known_vector() {
+  const hex = crypto.hex_encode(crypto.sha2.sha256("abc".to_bytes()))
+  expect_equal(sha256_abc, hex)
+}
+
+def test_sha256_hex_roundtrip() {
+  const digest = crypto.sha2.sha256("pokerface".to_bytes())
+  const (R.ok, back) = crypto.hex_decode(crypto.hex_encode(digest))
+  expect_true(crypto.constant_time_compare(digest, back))
+}
+
+def test_sha256_is_length_32() {
+  const digest = crypto.sha2.sha256("".to_bytes())
+  expect_equal(32, digest.length())
+}
+
+def test_yaml_decode_and_encode() {
+  // Note: a bare `.` scalar resolves as a float per the core schema, so the
+  // sample uses a plain word for context. See docs/notes/runtime-capabilities.md.
+  const text = "version: 1\nimage: registry.example.com/acme/app\nbuild:\n  context: src\n  dockerfile: Dockerfile\n"
+  const (R.ok, doc) = yaml.decode(text)
+  expect_equal(1, doc.get("version").as_int())
+  expect_equal("registry.example.com/acme/app", doc.get("image").as_string())
+  expect_equal("src", doc.get("build").get("context").as_string())
+  const encoded = yaml.encode(doc)
+  expect_true(encoded.index_of("image: registry.example.com/acme/app") >= 0)
+}
+
+def test_yaml_decode_error_is_a_value() {
+  case yaml.decode("image: [unterminated") {
+    (R.ok, _) then { expect_fail("yaml decode should reject malformed input") }
+    (R.error, why) then { expect_true(why.starts_with("yaml:")) }
+  }
+}
+
+def test_json_roundtrip() {
+  const (R.ok, doc) = json.decode("{\"name\":\"pokerface\",\"n\":7,\"tags\":[\"latest\",\"sha-01234567\"]}")
+  expect_equal("pokerface", doc.get("name").as_string())
+  expect_equal(7, doc.get("n").as_int())
+  const tags = doc.get("tags")
+  if tags.is(json.JsonArray) {
+    expect_equal(2, tags.items().length())
+  } else {
+    expect_fail("tags should decode as a JSON array")
+  }
+  const encoded = json.encode(doc)
+  expect_true(encoded.index_of("sha-01234567") >= 0)
+}
+
+def test_file_write_and_read() {
+  const path = capability_probe_path()
+  const (R.ok, n) = file.write(path, "pokerface probe\n")
+  expect_equal(16, n)
+  const (R.ok, body) = file.read(path)
+  expect_equal("pokerface probe\n", body)
+  os.unlink(path)
+}
+
+def test_subprocess_git_version() {
+  const out = run_subprocess("git", ["git", "--version"])
+  expect_true(out.starts_with("git version"))
+}
+
+def test_subprocess_missing_binary_exits_127() {
+  expect_equal(127, run_subprocess_status("pokerface-definitely-not-a-binary", ["pokerface-definitely-not-a-binary"]))
+}
+
+def test_temp_directory_lifecycle() {
+  const dir = temp_base() + "pokerface-capabilities-" + os.getpid().to_string()
+  const (R.ok, _) = os.mkdir(dir)
+  const (R.ok, entries) = os.list_dir(temp_base())
+  expect_true(has_entry(entries, "pokerface-capabilities-" + os.getpid().to_string()))
+  os.rmdir(dir)
+}
+
+def run_subprocess(file String, argv Array[String]) String {
+  const w = run_subprocess_raw(file, argv)
+  if os.wait_exited(w[1]) {
+    if os.wait_exit_code(w[1]) == 0 {
+      return w[0].trim()
+    }
+  }
+  return ""
+}
+
+def run_subprocess_status(file String, argv Array[String]) Int64 {
+  const w = run_subprocess_raw(file, argv)
+  if os.wait_exited(w[1]) {
+    return os.wait_exit_code(w[1])
+  }
+  return 0 - 1
+}
+
+def run_subprocess_raw(file String, argv Array[String]) (String, Int64) {
+  const (R.ok, fds) = os.pipe()
+  const read_fd = fds[0]
+  const write_fd = fds[1]
+  const (R.ok, pid) = os.fork()
+  if pid == 0 {
+    const (R.ok, _) = os.dup2(write_fd, 1)
+    os.close(read_fd)
+    os.execvp(file, argv)
+    os._exit(127)
+  }
+  os.close(write_fd)
+  var out = ""
+  while true {
+    const (R.ok, chunk) = os.read(read_fd, 4096)
+    if chunk == "" {
+      break
+    }
+    out = out + chunk
+  }
+  os.close(read_fd)
+  const w = os.waitpid(pid)
+  return (out, w[1])
+}
+
+def capability_probe_path() String {
+  return temp_base() + "pokerface-capabilities-" + os.getpid().to_string() + ".tmp"
+}
+
+def temp_base() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def has_entry(entries Array[String], name String) Bool {
+  var i = 0
+  while i < entries.length() {
+    if entries[i] == name {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
