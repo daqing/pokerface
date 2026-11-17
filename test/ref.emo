@@ -1,0 +1,99 @@
+// T1.3 table-driven tests for src/ref.emo — run with `emo test`.
+
+const ref_parser = src.ref
+
+def test_valid_references() {
+  const cases = valid_cases()
+  var i = 0
+  while i < cases.length() {
+    const (input, want_host, want_owner, want_repo, want_url, want_ref) = cases[i]
+    expect_valid(input, want_host, want_owner, want_repo, want_url, want_ref)
+    i = i + 1
+  }
+}
+
+def test_invalid_references() {
+  const cases = invalid_cases()
+  var i = 0
+  while i < cases.length() {
+    const (input, field) = cases[i]
+    expect_invalid(input, field)
+    i = i + 1
+  }
+}
+
+def test_default_ref_is_latest() {
+  const (R.ok, r) = ref_parser.parse("github.com/acme/app")
+  expect_equal("latest", r.ref)
+}
+
+def expect_valid(input String, want_host String, want_owner String, want_repo String, want_url String, want_ref String) {
+  case ref_parser.parse(input) {
+    (R.ok, r) then {
+      expect_equal(want_host, r.host)
+      expect_equal(want_owner, r.owner)
+      expect_equal(want_repo, r.repo)
+      expect_equal(want_url, r.git_url)
+      expect_equal(want_ref, r.ref)
+    }
+    (R.error, why) then {
+      expect_fail("expected '" + input + "' to parse, got: " + why)
+    }
+  }
+}
+
+def expect_invalid(input String, field String) {
+  case ref_parser.parse(input) {
+    (R.ok, _) then {
+      expect_fail("expected '" + input + "' to be rejected")
+    }
+    (R.error, why) then {
+      expect_true(why.index_of(field) >= 0)
+    }
+  }
+}
+
+def valid_cases() Array[(String, String, String, String, String, String)] {
+  return [
+    ("github.com/acme/app", "github.com", "acme", "app", "https://github.com/acme/app.git", "latest"),
+    ("github.com/acme/app:latest", "github.com", "acme", "app", "https://github.com/acme/app.git", "latest"),
+    ("https://github.com/acme/app.git:v1.2.0", "github.com", "acme", "app", "https://github.com/acme/app.git", "v1.2.0"),
+    ("https://github.com/acme/app:v1.2.0", "github.com", "acme", "app", "https://github.com/acme/app.git", "v1.2.0"),
+    ("git@github.com:acme/app.git:main", "github.com", "acme", "app", "https://github.com/acme/app.git", "main"),
+    ("git@github.com:acme/app", "github.com", "acme", "app", "https://github.com/acme/app.git", "latest"),
+    ("gitea.example.com:3000/acme/app", "gitea.example.com:3000", "acme", "app", "https://gitea.example.com:3000/acme/app.git", "latest"),
+    ("https://gitea.example.com:3000/acme/app:main", "gitea.example.com:3000", "acme", "app", "https://gitea.example.com:3000/acme/app.git", "main"),
+    ("127.0.0.1:5000/acme/app", "127.0.0.1:5000", "acme", "app", "https://127.0.0.1:5000/acme/app.git", "latest"),
+    ("github.com/acme/app:0123456789abcdef0123456789abcdef01234567", "github.com", "acme", "app", "https://github.com/acme/app.git", "0123456789abcdef0123456789abcdef01234567"),
+    ("github.com/acme/app:sha-01234567", "github.com", "acme", "app", "https://github.com/acme/app.git", "sha-01234567"),
+    ("  github.com/acme/app:v1.0  ", "github.com", "acme", "app", "https://github.com/acme/app.git", "v1.0")
+  ]
+}
+
+def invalid_cases() Array[(String, String)] {
+  return [
+    ("", "empty"),
+    ("   ", "empty"),
+    (":tag", "host"),
+    ("github.com/acme/app:", "ref"),
+    ("github.com/acme/app:bad ref", "ref"),
+    ("github.com/acme/app:..bad", "ref"),
+    ("github.com/acme/app.git:x..y", "ref"),
+    ("github.com/acme/app:bad:ref", "ref"),
+    ("http://github.com/acme/app", "scheme"),
+    ("ftp://github.com/acme/app", "host"),
+    ("git@github.com-acme/app", "host"),
+    ("https://", "owner"),
+    ("https://github.com", "owner"),
+    ("https:///acme/app", "host"),
+    ("github.com/acme", "owner"),
+    ("github.com/acme/oss/app", "owner"),
+    ("github.com//app", "owner"),
+    ("github.com/acme/", "repo"),
+    ("github.com/acme:3000/app", "owner"),
+    ("github.com/acme/.git", "repo"),
+    ("github.com:latest/app", "host"),
+    ("https://user:pass@github.com/acme/app", "credentials"),
+    ("github.com/acme/app/", "owner")
+  ]
+}

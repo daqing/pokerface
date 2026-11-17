@@ -1,0 +1,167 @@
+// T1.3: parse a pokerface repository reference into its normalized parts.
+// Syntax (decision D3): <host>/<owner>/<repo>[:<ref>] with default ref
+// "latest"; the https:// and git@ forms are accepted and .git suffixes are
+// stripped. Pure parsing — no network calls; git refname rules beyond the
+// character set stay with T1.6's resolution.
+
+const default_ref = "latest"
+const ref_charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_+"
+const digits = "0123456789"
+
+class Reference {
+  def init(host String, owner String, repo String, git_url String, ref String) {
+    self.host = host
+    self.owner = owner
+    self.repo = repo
+    self.git_url = git_url
+    self.ref = ref
+  }
+}
+
+// The last ":" that is not followed by a "/" separates the ref; a colon
+// earlier in the string is a host port. Refs containing "/" are out of scope
+// for this syntax and surface as a repo error.
+def parse(input String) (R, Reference) {
+  const s = input.trim()
+  if s == "" {
+    return (R.error, "invalid reference: the reference is empty")
+  }
+
+  var body = s
+  var ref = default_ref
+  const colon = last_index_of(s, ":")
+  if colon >= 0 {
+    const suffix = s.substring(colon + 1, s.length() - colon - 1)
+    if suffix == "" {
+      return (R.error, "invalid reference: ref is empty after ':'")
+    }
+    if suffix.index_of("/") < 0 {
+      if !valid_ref(suffix) {
+        return (R.error, "invalid reference: ref '" + suffix + "' has characters outside [A-Za-z0-9._+-]")
+      }
+      ref = suffix
+      body = s.substring(0, colon)
+    }
+  }
+
+  var host = ""
+  var path = ""
+  if body.starts_with("https://") {
+    const rest = body.substring(8, body.length() - 8)
+    const slash = rest.index_of("/")
+    if slash < 0 {
+      return (R.error, "invalid reference: missing owner/repo after the host")
+    }
+    host = rest.substring(0, slash)
+    path = rest.substring(slash + 1, rest.length() - slash - 1)
+  } else {
+    if body.starts_with("http://") {
+      return (R.error, "invalid reference: unsupported scheme http:// (use https:// or the git@ form)")
+    }
+    if body.starts_with("git@") {
+      const rest = body.substring(4, body.length() - 4)
+      const sep = rest.index_of(":")
+      if sep < 0 {
+        return (R.error, "invalid reference: git@ form expects git@<host>:<owner>/<repo>")
+      }
+      host = rest.substring(0, sep)
+      path = rest.substring(sep + 1, rest.length() - sep - 1)
+    } else {
+      const slash = body.index_of("/")
+      if slash < 0 {
+        return (R.error, "invalid reference: missing owner/repo (expected <host>/<owner>/<repo>)")
+      }
+      host = body.substring(0, slash)
+      path = body.substring(slash + 1, body.length() - slash - 1)
+    }
+  }
+
+  if host == "" {
+    return (R.error, "invalid reference: host is empty")
+  }
+  if host.index_of("@") >= 0 {
+    return (R.error, "invalid reference: credentials in the URL are not supported (host '" + host + "')")
+  }
+  const port_at = host.index_of(":")
+  if port_at >= 0 {
+    const port = host.substring(port_at + 1, host.length() - port_at - 1)
+    if !all_digits(port) {
+      return (R.error, "invalid reference: invalid host '" + host + "' (expected <host> or <host>:<port>)")
+    }
+  }
+
+  if path == "" {
+    return (R.error, "invalid reference: owner/repo missing after host '" + host + "'")
+  }
+  const parts = path.split("/")
+  if parts.length() != 2 {
+    return (R.error, "invalid reference: expected <owner>/<repo> after host '" + host + "', got " + parts.length().to_string() + " path segments")
+  }
+  const owner = parts[0]
+  var repo = parts[1]
+
+  if owner == "" {
+    return (R.error, "invalid reference: owner is empty")
+  }
+  if owner.index_of(":") >= 0 {
+    return (R.error, "invalid reference: owner '" + owner + "' must not contain ':'")
+  }
+  if repo == "" {
+    return (R.error, "invalid reference: repo is empty")
+  }
+  if repo.index_of(":") >= 0 {
+    return (R.error, "invalid reference: repo '" + repo + "' must not contain ':'")
+  }
+  if repo.length() > 4 && last_index_of(repo, ".git") == repo.length() - 4 {
+    repo = repo.substring(0, repo.length() - 4)
+  }
+  if repo == "" {
+    return (R.error, "invalid reference: repo is empty after stripping '.git'")
+  }
+  if repo.starts_with(".") {
+    return (R.error, "invalid reference: repo '" + repo + "' must not start with '.'")
+  }
+
+  const git_url = "https://" + host + "/" + owner + "/" + repo + ".git"
+  return (R.ok, Reference.new(host, owner, repo, git_url, ref))
+}
+
+def valid_ref(ref String) Bool {
+  if ref.starts_with(".") {
+    return false
+  }
+  if ref.index_of("..") >= 0 {
+    return false
+  }
+  return all_chars_in(ref, ref_charset)
+}
+
+def all_chars_in(s String, allowed String) Bool {
+  var i = 0
+  while i < s.length() {
+    if allowed.index_of(s.substring(i, 1)) < 0 {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+def all_digits(s String) Bool {
+  if s == "" {
+    return false
+  }
+  return all_chars_in(s, digits)
+}
+
+def last_index_of(s String, needle String) Int64 {
+  var last = 0 - 1
+  var i = 0
+  while i <= s.length() - needle.length() {
+    if s.substring(i, needle.length()) == needle {
+      last = i
+    }
+    i = i + 1
+  }
+  return last
+}

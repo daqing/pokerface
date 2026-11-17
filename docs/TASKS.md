@@ -72,7 +72,7 @@ Exit criteria:
 | --- | --- | --- | --- | --- |
 | [x] | T1.1 | CLI skeleton and command routing | none | 1-2h |
 | [x] | T1.2 | Verify Emo runtime capabilities and pin dependencies | T1.1 | 2h |
-| [ ] | T1.3 | Parse repository references | T1.1 | 1-2h |
+| [x] | T1.3 | Parse repository references | T1.1 | 1-2h |
 | [ ] | T1.4 | `pokerface.yaml` v0.1 spec and parser | T1.2 | 2-3h |
 | [ ] | T1.5 | `pokerface.lock.yaml` v0.1 spec and parser | T1.2 | 2h |
 | [ ] | T1.6 | Git ref resolution: tag / branch / commit | T1.3 | 2-3h |
@@ -123,6 +123,8 @@ Exit criteria:
 **Acceptance**: Cover valid and invalid inputs, `.git` suffixes, ports, and the default tag. Make no network calls. Error messages identify the offending field.
 
 **Depends on**: T1.1 · **Estimate**: 1-2h
+
+> **Notes** (2026-11-18, ~1h): Done. `src/ref.emo` parses all three D3 forms with zero requires; the ref separates at the last `:` not followed by `/`, so `host:port` and `:ref` coexist, and `git_url` always normalizes to `https://<host>[:<port>]/<owner>/<repo>.git`. 12 valid + 23 invalid table cases (35 total) in `test/ref.emo`; the invalid table asserts the error names the offending field. Gotchas: a class may not share its module's name case-insensitively — `class Ref` inside `src/ref.emo` made the bare `Ref` in the signature resolve differently from `Ref.new`, so the class is `Reference`; arrays take no trailing comma. Follow-ups: full git refname rules (leading `.`, `.lock`, `@{`) move to T1.6; subgroup paths (`gitlab.com/g/s/p`) are rejected by design in v0.1.
 
 #### T1.4 `pokerface.yaml` v0.1 Spec and Parser
 

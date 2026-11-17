@@ -42,3 +42,24 @@ Flags are parsed before the first positional argument; the value form
 | 2    | Usage error: unknown command or option, missing `--config` value, no command |
 
 T1.16 (`docs/spec/errors.md`) turns this into the full, stable table.
+
+## Repository reference syntax
+
+A repository reference names a Git repository and an optional ref (decision
+D3). The parser (`src/ref.emo`, task T1.3) accepts three forms:
+
+```text
+github.com/acme/app:latest                  # bare form
+https://github.com/acme/app.git:v1.2.0      # https:// form
+git@github.com:acme/app.git:main            # git@ form
+```
+
+- The ref defaults to `latest`. It separates at the last `:` that is not
+  followed by a `/`; an earlier `:` is a host port
+  (`gitea.example.com:3000/acme/app`).
+- The `.git` suffix is stripped from the repo, whatever the input form.
+- The normalized result carries `host`, `owner`, `repo`, `git_url`, and
+  `ref`; `git_url` is always `https://<host>[:<port>]/<owner>/<repo>.git`.
+- `http://` and URL credentials are rejected. Refs containing `/` and path
+  shapes other than `<owner>/<repo>` after the host are rejected with an
+  error naming the offending field.
