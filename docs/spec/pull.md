@@ -34,7 +34,7 @@ manifest source, blob counts, and the layout path. `--json` emits:
 
 | Stage | Failure | Behavior |
 | --- | --- | --- |
-| Git resolution / lock read | any | **Hard error**, exit 1. Never falls back to a stale cache; the same-commit mirror read stays offline-friendly. |
+| Git resolution / lock read | any | **Hard error** (Git 3 / metadata 4 / network 6 by category). Never falls back to a stale cache; the same-commit mirror read stays offline-friendly. |
 | Manifest | network / 5xx | Fall back to the cached manifest for the same `(image, reference, platform)`, after re-verifying its digest against the lock. A warning names the original error. |
 | Manifest | digest mismatch | The cached manifest is still usable only if it matches the lock; otherwise hard error. |
 | Blob | transient | Retried per blob by T1.11 (backoff, Range resume), verified before it enters the cache/layout. A cached blob that verifies is never re-downloaded. |

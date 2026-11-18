@@ -1,0 +1,243 @@
+// T1.16 table-driven tests for the error model and verbose logger — run with
+// `emo test`.
+
+const err_mod = src.errors
+
+require "json"
+
+def expect_kind(message String, kind String) {
+  const actual = err_mod.classify(message)
+  if actual != kind {
+    expect_fail("classify('" + message + "'): expected " + kind + ", got " + actual)
+  }
+}
+
+def expect_code(kind String, code Int64) {
+  expect_equal(code, err_mod.exit_code(kind))
+}
+
+// ---------------------------------------------------------------------------
+// Classification
+
+def test_classify_usage() {
+  expect_kind("unknown option --wat", err_mod.kind_usage)
+  expect_kind("unknown command \"frobnicate\"", err_mod.kind_usage)
+  expect_kind("pull expects a repository reference argument", err_mod.kind_usage)
+  expect_kind("pull takes exactly one repository reference, got 2", err_mod.kind_usage)
+  expect_kind("invalid platform 'bogus' (expected <os>/<arch>)", err_mod.kind_usage)
+  expect_kind("tag 'nope' is not in the lock (available: latest)", err_mod.kind_usage)
+  expect_kind("the lock lists several tags (v1, v2); pass --tag", err_mod.kind_usage)
+  expect_kind("cache ls takes no arguments", err_mod.kind_usage)
+}
+
+def test_classify_git() {
+  expect_kind("git: 'git' exited with code 128: fatal: couldn't find remote ref", err_mod.kind_git)
+  expect_kind("git cache: cannot initialize the bare mirror: fatal", err_mod.kind_git)
+  expect_kind("git cache: repository has no pokerface.lock.yaml at commit ...", err_mod.kind_metadata)
+}
+
+def test_classify_metadata() {
+  expect_kind("pokerface.lock.yaml: version: missing required field", err_mod.kind_metadata)
+  expect_kind("pokerface.lock.yaml: invalid YAML — yaml: expected mapping", err_mod.kind_metadata)
+  expect_kind("config: /x/config.yaml: not found (--config): os: ...", err_mod.kind_metadata)
+  expect_kind("git cache: repo has no pokerface.lock.yaml at commit abc", err_mod.kind_metadata)
+  expect_kind("registry: manifest not found (404 MANIFEST_UNKNOWN)", err_mod.kind_metadata)
+  expect_kind("registry: unexpected redirect (status 307 to https://cdn/x?sig=abc) — redirects are never followed", err_mod.kind_metadata)
+  expect_kind("registry: index lists no linux/arm64 manifest (available: linux/amd64)", err_mod.kind_metadata)
+  expect_kind("offline: no usable cached manifest for registry/app (no cached manifest)", err_mod.kind_metadata)
+  expect_kind("cache: refusing to remove /tmp/x: not a pokerface cache", err_mod.kind_metadata)
+  expect_kind("pokerface: pull: image 'x' must be <registry-host>/<repository>", err_mod.kind_metadata)
+}
+
+def test_classify_auth() {
+  expect_kind("registry: manifest request is unauthorized (401) after authentication", err_mod.kind_auth)
+  expect_kind("registry: token endpoint returned status 401", err_mod.kind_auth)
+  expect_kind("registry: token response carries neither token nor access_token", err_mod.kind_auth)
+  expect_kind("blob: https://reg/v2/app/blobs/sha256:aa answered status 403", err_mod.kind_auth)
+}
+
+def test_classify_network() {
+  expect_kind("registry: manifest request failed: connection refused", err_mod.kind_network)
+  expect_kind("registry: registry error (status 503)", err_mod.kind_network)
+  expect_kind("git cache: cannot fetch https://github.com/a/b.git into the mirror: fatal: unable to access", err_mod.kind_network)
+  expect_kind("blob: giving up on https://cdn/x after 4 attempts: blob: body read failed: the connection to cdn closed after 10 of 20 bytes", err_mod.kind_network)
+  expect_kind("blob: cannot connect to cdn.example.com:443: timed out", err_mod.kind_network)
+}
+
+def test_classify_integrity() {
+  expect_kind("blob: digest mismatch for https://cdn/x — expected sha256:aa, got sha256:bb", err_mod.kind_integrity)
+  expect_kind("blob: size mismatch for https://cdn/x — expected 10 bytes, got 9", err_mod.kind_integrity)
+  expect_kind("pull: manifest digest mismatch — the lock pins sha256:aa, the registry served sha256:bb", err_mod.kind_integrity)
+  expect_kind("oci: missing blob sha256:aa (manifest: layers[0]): no downloaded file was provided", err_mod.kind_integrity)
+  expect_kind("oci: oci-layout: unsupported imageLayoutVersion '9.9.9'", err_mod.kind_integrity)
+  expect_kind("cached manifest is corrupted (metadata says sha256:aa, body hashes to sha256:bb)", err_mod.kind_integrity)
+}
+
+def test_classify_runtime() {
+  expect_kind("runtime: importing into docker requires skopeo. Install it and retry", err_mod.kind_runtime)
+  expect_kind("runtime: cannot reach the container runtime while trying to import into docker; start Docker", err_mod.kind_runtime)
+  expect_kind("runtime: blob: digest mismatch should still be runtime because of the prefix", err_mod.kind_runtime)
+}
+
+def test_classify_failure() {
+  expect_kind("something completely unexpected", err_mod.kind_failure)
+}
+
+// ---------------------------------------------------------------------------
+// Exit codes and hints
+
+def test_exit_code_table() {
+  expect_code(err_mod.kind_usage, 2)
+  expect_code(err_mod.kind_git, 3)
+  expect_code(err_mod.kind_metadata, 4)
+  expect_code(err_mod.kind_auth, 5)
+  expect_code(err_mod.kind_network, 6)
+  expect_code(err_mod.kind_integrity, 7)
+  expect_code(err_mod.kind_runtime, 8)
+  expect_code(err_mod.kind_failure, 1)
+  expect_code("not-a-kind", 1)
+}
+
+def test_every_hint_is_actionable() {
+  const kinds = [
+    err_mod.kind_usage,
+    err_mod.kind_git,
+    err_mod.kind_metadata,
+    err_mod.kind_auth,
+    err_mod.kind_network,
+    err_mod.kind_integrity,
+    err_mod.kind_runtime,
+    err_mod.kind_failure
+  ]
+  var i = 0
+  while i < kinds.length() {
+    const hint = err_mod.hint_for(kinds[i])
+    if hint.length() < 10 {
+      expect_fail("hint for " + kinds[i] + " is too short: '" + hint + "'")
+    }
+    i = i + 1
+  }
+}
+
+def test_from_message_sets_kind_and_hint() {
+  const e = err_mod.from_message("blob: digest mismatch for https://cdn/x")
+  expect_equal(err_mod.kind_integrity, e.kind)
+  expect_true(e.hint.index_of("cache verify") >= 0)
+}
+
+def test_error_json_is_valid_and_escaped() {
+  const e = err_mod.AppError.new(err_mod.kind_integrity, "bad \"quoted\"\nvalue", "retry")
+  const text = err_mod.error_json(e)
+  case json.decode(text) {
+    (R.error, why) then { expect_fail("error_json is not valid JSON: " + why) }
+    (R.ok, doc) then {
+      case src.oci.member(doc, "error") {
+        (R.error, why) then { expect_fail("missing error object: " + why) }
+        (R.ok, inner) then {
+          case src.oci.member_string(inner, "kind") {
+            (R.ok, kind) then { expect_equal(err_mod.kind_integrity, kind) }
+            (R.error, why) then { expect_fail(why) }
+          }
+          case src.oci.member_string(inner, "message") {
+            (R.ok, message) then { expect_equal("bad \"quoted\"\nvalue", message) }
+            (R.error, why) then { expect_fail(why) }
+          }
+          case src.oci.member_string(inner, "hint") {
+            (R.ok, hint) then { expect_equal("retry", hint) }
+            (R.error, why) then { expect_fail(why) }
+          }
+          case src.oci.member(inner, "exit_code") {
+            (R.ok, code) then { expect_equal(7, code.as_int()) }
+            (R.error, why) then { expect_fail(why) }
+          }
+        }
+      }
+    }
+  }
+}
+
+def test_error_json_redacts_urls() {
+  const e = err_mod.AppError.new(err_mod.kind_network, "cannot connect to https://cdn.example.com/x?sig=secret", "retry")
+  const text = err_mod.error_json(e)
+  expect_true(text.index_of("sig=secret") < 0)
+  expect_true(text.index_of("?<redacted>") >= 0)
+}
+
+// ---------------------------------------------------------------------------
+// Redaction
+
+def test_redact_url() {
+  const url = err_mod.redact_url("https://cdn.example.com/blob?sig=abc&token=def")
+  expect_true(url.index_of("sig=") < 0)
+  expect_true(url.index_of("token=") < 0)
+  expect_true(url.index_of("?<redacted>") >= 0)
+  const userinfo = err_mod.redact_url("https://user:pass@host.example.com/x?q=1")
+  expect_true(userinfo.index_of("user:pass") < 0)
+  expect_true(userinfo.index_of("<redacted>@") >= 0)
+  expect_true(userinfo.index_of("?<redacted>") >= 0)
+  expect_equal("https://plain.example.com/x", err_mod.redact_url("https://plain.example.com/x"))
+}
+
+def test_redact_text() {
+  const text = err_mod.redact_text("fetch failed: cannot connect to https://cdn/x?sig=secret: reset")
+  expect_true(text.index_of("sig=secret") < 0)
+  expect_true(text.index_of("?<redacted>") >= 0)
+  expect_true(text.index_of("reset") >= 0)
+}
+
+def test_redact_header() {
+  expect_equal("<redacted>", err_mod.redact_header("Authorization", "Bearer tok-123"))
+  expect_equal("<redacted>", err_mod.redact_header("proxy-authorization", "Basic abc"))
+  expect_equal("<redacted>", err_mod.redact_header("Cookie", "session=abc"))
+  expect_equal("application/json", err_mod.redact_header("Accept", "application/json"))
+}
+
+def test_redact_command() {
+  const argv = ["skopeo", "copy", "oci:/tmp/x:latest", "docker-daemon:app:latest"]
+  expect_equal("skopeo copy oci:/tmp/x:latest docker-daemon:app:latest", err_mod.redact_command(argv))
+  const with_url = err_mod.redact_command(["curl", "https://cdn/x?sig=secret"])
+  expect_true(with_url.index_of("sig=secret") < 0)
+  expect_true(with_url.index_of("?<redacted>") >= 0)
+}
+
+// ---------------------------------------------------------------------------
+// Logger
+
+def test_logger_is_quiet_by_default() {
+  const sink = err_mod.BufferSink.new()
+  const logger = err_mod.Logger.new(false, sink)
+  logger.detail("step")
+  logger.request("GET", "https://reg/v2/", [("Authorization", "Bearer tok-123")])
+  logger.command(["git", "ls-remote", "https://github.com/a/b.git"])
+  expect_equal("", sink.output())
+  expect_true(!logger.enabled())
+}
+
+def test_logger_verbose_redacts_secrets() {
+  const sink = err_mod.BufferSink.new()
+  const logger = err_mod.Logger.new(true, sink)
+  logger.request("GET", "https://reg.example.com/v2/?service=reg&scope=repository:acme/app:pull", [
+    ("Authorization", "Bearer tok-123"),
+    ("Accept", "application/vnd.oci.image.manifest.v1+json")
+  ])
+  logger.request("GET", "https://cdn.example.com/blob?sig=abc", [])
+  logger.command(["skopeo", "copy", "oci:/tmp/layout:latest", "docker-daemon:app:latest"])
+  logger.detail("fetched https://cdn.example.com/blob?sig=abc")
+  const text = sink.output()
+  expect_true(logger.enabled())
+  expect_true(text.index_of("tok-123") < 0)
+  expect_true(text.index_of("scope=") < 0)
+  expect_true(text.index_of("service=") < 0)
+  expect_true(text.index_of("sig=abc") < 0)
+  expect_true(text.index_of("Authorization: <redacted>") >= 0)
+  expect_true(text.index_of("https://cdn.example.com/blob?<redacted>") >= 0)
+  expect_true(text.index_of("exec skopeo copy oci:/tmp/layout:latest") >= 0)
+}
+
+def test_report_returns_category_codes() {
+  expect_equal(2, err_mod.usage_report("pull", "unknown option --wat", false))
+  expect_equal(7, err_mod.report("pull", "blob: digest mismatch for https://cdn/x?sig=secret", false))
+  expect_equal(4, err_mod.report("pull", "offline: no usable cached manifest", false))
+  expect_equal(8, err_mod.report("pull", "runtime: no container runtime found", false))
+  expect_equal(7, err_mod.report_kind("cache verify", err_mod.kind_integrity, "3 cache issue(s) remain after verification", false))
+}

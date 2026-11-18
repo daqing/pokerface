@@ -564,7 +564,18 @@ def test_cache_command_routing_and_exit_codes() {
   cache_mkdir(foreign)
   cache_write(foreign + "/keep.txt", "keep")
   const foreign_env = cache_env(foreign)
-  expect_equal(src.common.exit_failure, cache_cmd.run(cache_flags(), ["ls"], foreign_env))
-  expect_equal(src.common.exit_failure, cache_cmd.run(cache_flags(), ["rm"], foreign_env))
+  expect_equal(src.common.exit_metadata, cache_cmd.run(cache_flags(), ["ls"], foreign_env))
+  expect_equal(src.common.exit_metadata, cache_cmd.run(cache_flags(), ["rm"], foreign_env))
   expect_equal("keep", cache_read(foreign + "/keep.txt"))
+}
+
+def test_cache_verify_exits_with_integrity_code() {
+  const root = cache_root_for("command-verify")
+  cache_ensure(root)
+  const path = root + "/blobs/sha256/" + repeat_char("d", 64)
+  cache_write(path, "corrupt bytes")
+  expect_equal(src.common.exit_integrity, cache_cmd.run(cache_flags(), ["verify", "--check"], cache_env(root)))
+  expect_true(cache_exists(path))
+  expect_equal(src.common.exit_ok, cache_cmd.run(cache_flags(), ["verify"], cache_env(root)))
+  expect_true(!cache_exists(path))
 }

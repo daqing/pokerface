@@ -94,8 +94,7 @@ class BlobOutcome {
 def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) Int64 {
   case parse_args(rest) {
     (R.error, why) then {
-      src.common.eprint("pokerface: pull: " + why + "\n")
-      return src.common.exit_usage
+      return src.errors.usage_report("pull", why, flags.json)
     }
     (R.ok, opts) then { return run_with(flags, opts, env, src.git.RealRunner.new()) }
   }
@@ -106,54 +105,44 @@ def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) 
 def run_with(flags src.common.Flags, opts PullOptions, env src.settings.EnvSource, runtime_runner src.git.CommandRunner) Int64 {
   case src.ref.parse(opts.reference) {
     (R.error, why) then {
-      src.common.eprint("pokerface: pull: " + why + "\n")
-      return src.common.exit_usage
+      return src.errors.usage_report("pull", why, flags.json)
     }
     (R.ok, parsed) then {
       case src.settings.load(src.git.RealRunner.new(), env, flags.config) {
         (R.error, why) then {
-          src.common.eprint("pokerface: pull: " + why + "\n")
-          return src.common.exit_failure
+          return src.errors.report("pull", why, flags.json)
         }
         (R.ok, settings) then {
+          const logger = src.errors.Logger.new(flags.verbose, src.errors.StderrSink.new())
           print_warnings(settings.warnings)
-          if flags.verbose {
-            src.common.eprint(src.settings.summary(settings) + "\n")
-          }
+          logger.detail(src.settings.summary(settings))
           case src.commands.resolve.resolution_with_settings(flags, parsed, settings, opts.offline) {
             (R.error, why) then {
-              src.common.eprint("pokerface: pull: " + why + "\n")
-              return src.common.exit_failure
+              return src.errors.report("pull", why, flags.json)
             }
             (R.ok, resolved) then {
               case choose_tag(resolved.tags, opts.tag, parsed.ref) {
                 (R.error, why) then {
-                  src.common.eprint("pokerface: pull: " + why + "\n")
-                  return src.common.exit_usage
+                  return src.errors.usage_report("pull", why, flags.json)
                 }
                 (R.ok, tag) then {
                   case choose_platform(resolved.platforms, opts.platform) {
                     (R.error, why) then {
-                      src.common.eprint("pokerface: pull: " + why + "\n")
-                      return src.common.exit_usage
+                      return src.errors.usage_report("pull", why, flags.json)
                     }
                     (R.ok, platform) then {
                       const cache_root = src.cache.root_of(settings)
                       if cache_root == "" {
-                        src.common.eprint("pokerface: pull: no cache directory is available (set POKERFACE_CACHE_DIR or HOME)\n")
-                        return src.common.exit_failure
+                        return src.errors.report_kind("pull", src.errors.kind_metadata, "no cache directory is available (set POKERFACE_CACHE_DIR or HOME)", flags.json)
                       }
                       const reference_digest = referenced_digest(resolved, platform)
                       const expected_manifest_digest = expected_digest(resolved, reference_digest)
                       const deps = PullDeps.new(settings.registry_url, settings.registry_token, runtime_runner, flags.verbose)
                       const req = PullRequest.new(resolved.image, tag, platform, reference_digest, expected_manifest_digest, cache_root, opts.keep_temp, opts.offline)
-                      if flags.verbose {
-                        src.common.eprint("pull: " + resolved.display_ref + " -> commit " + resolved.commit + ", " + resolved.image + ":" + tag + " (" + platform + ")\n")
-                      }
+                      logger.detail("pull: " + resolved.display_ref + " -> commit " + resolved.commit + ", " + resolved.image + ":" + tag + " (" + platform + ")")
                       case pull_image(deps, req) {
                         (R.error, why) then {
-                          src.common.eprint("pokerface: pull: " + why + "\n")
-                          return src.common.exit_failure
+                          return src.errors.report("pull", why, flags.json)
                         }
                         (R.ok, outcome) then {
                           enforce_cache_limits(cache_root, settings, flags.verbose)
@@ -424,38 +413,42 @@ def pull_into(deps PullDeps, req PullRequest, layout_dir String) (R, PullOutcome
     (R.error, why) then { return (R.error, why) }
     (R.ok, target) then {
       const (base, repo) = target
-      const client = src.registry.Client.new(base, deps.registry_token, src.registry.HttpTransport.new(), pull_manifest_timeout)
+      const logger = src.errors.Logger.new(deps.verbose, src.errors.StderrSink.new())
+      const transport = src.registry.LoggingTransport.new(src.registry.HttpTransport.new(), logger)
+      const client = src.registry.Client.new(base, deps.registry_token, transport, pull_manifest_timeout)
       const key = src.cache.manifest_key(req.image, req.reference_digest, req.platform)
       case fetch_manifest_with_cache(client, repo, req, key, deps.verbose) {
         (R.error, why) then { return (R.error, why) }
         (R.ok, manifest) then {
-          if deps.verbose {
+          if logger.enabled() {
             var source = "registry"
             if manifest.from_cache {
               source = "cache"
             }
-            src.common.eprint("pull: manifest " + manifest.digest + " from " + source + "\n")
+            logger.detail("pull: manifest " + manifest.digest + " from " + source)
           }
-          case ensure_blobs(client, base, repo, manifest.body, req.cache_root, req.offline, deps.verbose) {
+          case ensure_blobs(client, base, repo, manifest.body, req.cache_root, req.offline, deps.verbose, logger) {
             (R.error, why) then { return (R.error, why) }
             (R.ok, blobs) then {
-              if deps.verbose {
-                src.common.eprint("pull: blobs " + blobs.downloaded.to_string() + " downloaded, " + blobs.cached.to_string() + " cached\n")
-              }
+              logger.detail("pull: blobs " + blobs.downloaded.to_string() + " downloaded, " + blobs.cached.to_string() + " cached")
               const spec = src.oci.LayoutSpec.new(manifest.media_type, manifest.body, manifest.digest, req.tag, blobs.sources)
               case src.oci.assemble(layout_dir, spec) {
                 (R.error, why) then { return (R.error, why) }
                 (R.ok, layout) then {
-                  if deps.verbose {
-                    src.common.eprint("pull: layout " + layout.manifest_digest + " ready at " + layout_dir + "\n")
-                  }
+                  logger.detail("pull: layout " + layout.manifest_digest + " ready at " + layout_dir)
                   const import_req = src.runtime.ImportRequest.new(req.image, req.tag, layout_dir, req.keep_temp)
                   case src.runtime.prepare(deps.runtime_runner, "", import_req) {
                     (R.error, why) then { return (R.error, why) }
                     (R.ok, plan) then {
+                      var step = 0
+                      while step < plan.import_steps.length() {
+                        logger.command(plan.import_steps[step].argv)
+                        step = step + 1
+                      }
                       case src.runtime.execute(deps.runtime_runner, plan, pull_import_timeout) {
                         (R.error, why) then { return (R.error, why) }
                         (R.ok, imported) then {
+                          logger.detail("pull: imported " + imported.ref + " into " + imported.runtime)
                           return (R.ok, PullOutcome.new(
                             req.image,
                             req.tag,
@@ -504,7 +497,7 @@ def fetch_manifest_with_cache(client src.registry.Client, repo String, req PullR
     (R.error, why) then {
       case src.cache.read_manifest(req.cache_root, key, req.reference_digest, req.expected_manifest_digest, req.platform) {
         (R.ok, cached) then {
-          src.common.eprint("pokerface: warning: manifest fetch failed (" + why + "); using cached manifest " + cached.digest + "\n")
+          src.common.eprint("pokerface: warning: manifest fetch failed (" + src.errors.redact_text(why) + "); using cached manifest " + cached.digest + "\n")
           return (R.ok, from_cached(cached))
         }
         (R.error, cache_why) then {
@@ -590,7 +583,7 @@ def split_platform(platform String) (R, (String, String)) {
 // ---------------------------------------------------------------------------
 // Blob stage and its content-addressed cache.
 
-def ensure_blobs(client src.registry.Client, base String, repo String, manifest_body String, cache_root String, offline Bool, verbose Bool) (R, BlobOutcome) {
+def ensure_blobs(client src.registry.Client, base String, repo String, manifest_body String, cache_root String, offline Bool, verbose Bool, logger src.errors.Logger) (R, BlobOutcome) {
   case src.oci.parse_manifest(manifest_body) {
     (R.error, why) then { return (R.error, why) }
     (R.ok, manifest) then {
@@ -606,7 +599,7 @@ def ensure_blobs(client src.registry.Client, base String, repo String, manifest_
         // ignored — cached blobs still let the pull finish.
         const (_, _) = client.probe()
       }
-      const transport = src.blob.RegistryBlobTransport.new(client.token())
+      const transport = src.blob.RegistryBlobTransport.new(client.token(), logger)
       var sources = []
       var downloaded = 0
       var cached = 0

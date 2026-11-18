@@ -29,19 +29,32 @@ Flags are parsed before the first positional argument; the value form
 | Flag             | Effect                                                     |
 | ---------------- | ---------------------------------------------------------- |
 | `--config <path>` | Configuration file path (see docs/spec/config.md)          |
-| `--verbose`       | Verbose logging (wired up in T1.16)                       |
+| `--verbose`       | Verbose logging: settings summary, redacted HTTP requests, import commands (see docs/spec/errors.md) |
 | `--json`          | Machine-readable output (`version`, `resolve`, `pull`, `cache ls`/`rm`/`verify`) |
 | `-h`, `--help`    | Show the help text and exit 0                             |
 
 ## Exit codes
 
-| Code | Meaning                                                                |
-| ---- | ---------------------------------------------------------------------- |
-| 0    | Success                                                                 |
-| 1    | Command failure, including "not implemented yet"                        |
-| 2    | Usage error: unknown command or option, missing `--config` value, no command |
+| Code | Kind | Meaning |
+| ---- | --- | --- |
+| 0 | success | The command completed. |
+| 1 | failure | Unclassified failure, including "not implemented yet". |
+| 2 | usage | Unknown command/option, missing argument, invalid `--tag`/`--platform`, tag/platform not in the lock. |
+| 3 | git | Git ref resolution / mirror operation failed. |
+| 4 | metadata | Lock, config, offline cache miss, registry 404, or a directory that is not a pokerface cache. |
+| 5 | authentication | Registry 401/403 or token-flow failure. |
+| 6 | network | Connect/timeout/fetch failure, 5xx, or give-up-after-retries. |
+| 7 | integrity | Digest/size mismatch, truncated transfer, corrupt cache entry, unsupported layout version. |
+| 8 | runtime | No container runtime, missing skopeo, unreachable daemon, or socket permission failure. |
 
-T1.16 (`docs/spec/errors.md`) turns this into the full, stable table.
+Human errors print one line plus a `hint:` remediation line on stderr. With
+`--json`, failures print a single JSON object on stderr (stdout stays clean):
+
+```json
+{"error": {"kind": "network", "message": "…", "hint": "…", "exit_code": 6}}
+```
+
+Full model: `docs/spec/errors.md`.
 
 ## Repository reference syntax
 
@@ -154,8 +167,9 @@ runtime import`. Behavior:
 ```
 
 Exit codes: 0 success; 2 for a missing/malformed reference or an invalid
-option value (unknown tag/platform); 1 for Git, manifest, blob, layout, or
-import failures. Full behavior: `docs/spec/pull.md`.
+option value (unknown tag/platform); otherwise the category code from
+`docs/spec/errors.md` (Git 3, metadata 4, authentication 5, network 6,
+integrity 7, runtime 8).
 
 ### The `cache` command (T1.15)
 
@@ -180,7 +194,8 @@ pokerface cache rm [--all | --git | --manifests | --blobs | --refs]
   data plus the configured limits.
 - `verify` checks blobs, manifest envelopes, ref maps, and Git mirrors
   (`git fsck`). It **repairs by default** — corrupt entries and temp debris
-  are evicted; `--check` only reports and exits 1 if anything is wrong.
+  are evicted; `--check` only reports and exits with the integrity code (7)
+  while issues remain.
 - `rm` clears the selected sections (default: all) and recreates them empty.
   It never removes the cache root, the marker, or anything outside the known
   section directories, and refuses a directory that is not a pokerface cache.

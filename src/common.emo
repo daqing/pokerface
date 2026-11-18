@@ -5,11 +5,17 @@
 
 require "os"
 
-// 0 success, 1 command failure, 2 usage error. T1.16 (docs/spec/errors.md)
-// grows this into the full, stable table.
+// Stable exit codes (T1.16). 0 success, 1 unclassified failure, 2 usage;
+// 3-8 are the fixed categories from docs/spec/errors.md.
 const exit_ok = 0
 const exit_failure = 1
 const exit_usage = 2
+const exit_git = 3
+const exit_metadata = 4
+const exit_auth = 5
+const exit_network = 6
+const exit_integrity = 7
+const exit_runtime = 8
 
 const version = "0.1.0"
 

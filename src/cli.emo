@@ -7,6 +7,12 @@ require "os"
 const exit_ok = src.common.exit_ok
 const exit_failure = src.common.exit_failure
 const exit_usage = src.common.exit_usage
+const exit_git = src.common.exit_git
+const exit_metadata = src.common.exit_metadata
+const exit_auth = src.common.exit_auth
+const exit_network = src.common.exit_network
+const exit_integrity = src.common.exit_integrity
+const exit_runtime = src.common.exit_runtime
 const version = src.common.version
 
 def eprint(text String) {
@@ -55,11 +61,7 @@ def run_version(flags src.common.Flags) Int64 {
 }
 
 def not_implemented(name String, flags src.common.Flags) Int64 {
-  eprint("pokerface: " + name + " is not implemented yet; see docs/TASKS.md\n")
-  if flags.verbose {
-    eprint("pokerface: verbose logging is not wired up yet (planned for T1.16)\n")
-  }
-  return exit_failure
+  return src.errors.report("", name + " is not implemented yet; see docs/TASKS.md", flags.json)
 }
 
 def route(argv Array[String]) Int64 {
@@ -79,8 +81,7 @@ def route(argv Array[String]) Int64 {
       "--json" then { json = true }
       "--config" then {
         if i + 1 >= argv.length() {
-          eprint("pokerface: --config expects a path argument\n")
-          return exit_usage
+          return src.errors.usage_report("", "--config expects a path argument", json)
         }
         i = i + 1
         config = argv[i]
@@ -95,8 +96,7 @@ def route(argv Array[String]) Int64 {
         if command == "pull" || command == "cache" {
           rest = rest.append(arg)
         } else {
-          eprint("pokerface: unknown option " + arg + "; run `pokerface --help` for usage\n")
-          return exit_usage
+          return src.errors.usage_report("", "unknown option " + arg, json)
         }
       }
       _ when command == "" then { command = arg }
@@ -124,8 +124,7 @@ def route(argv Array[String]) Int64 {
     "config" then { return not_implemented(command, flags) }
     "cache" then { return src.commands.cache.run(flags, rest, src.settings.RealEnv.new()) }
     _ then {
-      eprint("pokerface: unknown command \"" + command + "\"; run `pokerface --help` for the command list\n")
-      return exit_usage
+      return src.errors.usage_report("", "unknown command \"" + command + "\"", json)
     }
   }
 }

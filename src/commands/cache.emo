@@ -9,8 +9,7 @@ const cache_all_sections = ["git", "manifests", "blobs", "refs"]
 
 def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) Int64 {
   if rest.length() == 0 {
-    src.common.eprint("pokerface: cache expects ls, rm, or verify\n")
-    return src.common.exit_usage
+    return src.errors.usage_report("cache", "expects ls, rm, or verify", flags.json)
   }
   const sub = rest[0]
   const args = tail(rest)
@@ -19,8 +18,7 @@ def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) 
     "rm" then { return run_rm(flags, args, env) }
     "verify" then { return run_verify(flags, args, env) }
     _ then {
-      src.common.eprint("pokerface: cache: unknown subcommand '" + sub + "' (expected ls, rm, or verify)\n")
-      return src.common.exit_usage
+      return src.errors.usage_report("cache", "unknown subcommand '" + sub + "' (expected ls, rm, or verify)", flags.json)
     }
   }
 }
@@ -53,20 +51,17 @@ def load_root(flags src.common.Flags, env src.settings.EnvSource) (R, (String, s
 
 def run_ls(flags src.common.Flags, args Array[String], env src.settings.EnvSource) Int64 {
   if args.length() > 0 {
-    src.common.eprint("pokerface: cache ls takes no arguments\n")
-    return src.common.exit_usage
+    return src.errors.usage_report("cache ls", "takes no arguments", flags.json)
   }
   case load_root(flags, env) {
     (R.error, why) then {
-      src.common.eprint("pokerface: cache ls: " + why + "\n")
-      return src.common.exit_failure
+      return src.errors.report("cache ls", why, flags.json)
     }
     (R.ok, pair) then {
       const (root, settings) = pair
       case src.cache.ls(src.git.RealRunner.new(), root) {
         (R.error, why) then {
-          src.common.eprint("pokerface: cache ls: " + why + "\n")
-          return src.common.exit_failure
+          return src.errors.report("cache ls", why, flags.json)
         }
         (R.ok, stats) then {
           if flags.json {
@@ -129,21 +124,18 @@ def stats_json(stats src.cache.CacheStats, settings src.settings.AppSettings) St
 def run_rm(flags src.common.Flags, args Array[String], env src.settings.EnvSource) Int64 {
   case parse_rm_sections(args) {
     (R.error, why) then {
-      src.common.eprint("pokerface: cache rm: " + why + "\n")
-      return src.common.exit_usage
+      return src.errors.usage_report("cache rm", why, flags.json)
     }
     (R.ok, sections) then {
       case load_root(flags, env) {
         (R.error, why) then {
-          src.common.eprint("pokerface: cache rm: " + why + "\n")
-          return src.common.exit_failure
+          return src.errors.report("cache rm", why, flags.json)
         }
         (R.ok, pair) then {
           const (root, _) = pair
           case src.cache.remove(src.git.RealRunner.new(), root, sections) {
             (R.error, why) then {
-              src.common.eprint("pokerface: cache rm: " + why + "\n")
-              return src.common.exit_failure
+              return src.errors.report("cache rm", why, flags.json)
             }
             (R.ok, report) then {
               if flags.json {
@@ -200,21 +192,18 @@ def remove_json(root String, report src.cache.RemoveReport) String {
 def run_verify(flags src.common.Flags, args Array[String], env src.settings.EnvSource) Int64 {
   case parse_verify_mode(args) {
     (R.error, why) then {
-      src.common.eprint("pokerface: cache verify: " + why + "\n")
-      return src.common.exit_usage
+      return src.errors.usage_report("cache verify", why, flags.json)
     }
     (R.ok, fix) then {
       case load_root(flags, env) {
         (R.error, why) then {
-          src.common.eprint("pokerface: cache verify: " + why + "\n")
-          return src.common.exit_failure
+          return src.errors.report("cache verify", why, flags.json)
         }
         (R.ok, pair) then {
           const (root, _) = pair
           case src.cache.verify(src.git.RealRunner.new(), root, fix) {
             (R.error, why) then {
-              src.common.eprint("pokerface: cache verify: " + why + "\n")
-              return src.common.exit_failure
+              return src.errors.report("cache verify", why, flags.json)
             }
             (R.ok, report) then {
               if flags.json {
@@ -223,7 +212,7 @@ def run_verify(flags src.common.Flags, args Array[String], env src.settings.EnvS
                 print_verify_report(root, report, fix)
               }
               if report.issues > report.evicted {
-                return src.common.exit_failure
+                return src.errors.report_kind("cache verify", src.errors.kind_integrity, report.issues.to_string() + " cache issue(s) remain after verification", flags.json)
               }
               return src.common.exit_ok
             }

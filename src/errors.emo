@@ -1,0 +1,383 @@
+// T1.16: the stable error model, exit codes, and verbose logger. Errors are
+// classified into fixed kinds; each kind has one exit code, one default
+// remediation, and a JSON shape. Logging is silent unless --verbose, and the
+// logger redacts Authorization-style headers, URL userinfo, and query strings
+// (presigned URLs) before anything reaches the sink. Spec:
+// docs/spec/errors.md.
+
+require "os"
+
+const kind_failure = "failure"
+const kind_usage = "usage"
+const kind_git = "git"
+const kind_metadata = "metadata"
+const kind_auth = "authentication"
+const kind_network = "network"
+const kind_integrity = "integrity"
+const kind_runtime = "runtime"
+
+class AppError {
+  def init(kind String, message String, hint String) {
+    self.kind = kind
+    self.message = message
+    self.hint = hint
+  }
+}
+
+def exit_code(kind String) Int64 {
+  case kind {
+    "usage" then { return src.common.exit_usage }
+    "git" then { return src.common.exit_git }
+    "metadata" then { return src.common.exit_metadata }
+    "authentication" then { return src.common.exit_auth }
+    "network" then { return src.common.exit_network }
+    "integrity" then { return src.common.exit_integrity }
+    "runtime" then { return src.common.exit_runtime }
+    _ then { return src.common.exit_failure }
+  }
+}
+
+def hint_for(kind String) String {
+  case kind {
+    "usage" then { return "Run `pokerface --help` (or `pokerface <command> --help`) for usage." }
+    "git" then { return "Check the repository URL and your Git access (network, SSH key, or token)." }
+    "metadata" then { return "Check the repository's pokerface.lock.yaml and your configuration; `pokerface cache verify` checks the local cache." }
+    "authentication" then { return "Provide a registry token: set POKERFACE_REGISTRY_TOKEN or configure registry.token." }
+    "network" then { return "Check connectivity and retry; if the image was pulled before, add --offline to use the cache." }
+    "integrity" then { return "Retry; if it persists, run `pokerface cache verify` and check the source image and lock digest." }
+    "runtime" then { return "Install or start Docker, Podman, or containerd; importing requires skopeo (see `pokerface --help` for the runtime note)." }
+    _ then { return "Run with --verbose for request and command detail, then retry." }
+  }
+}
+
+// Order matters: a recognized prefix or a content-specific phrase wins before
+// the broader fallbacks.
+def classify(message String) String {
+  const m = message.lower()
+  if m.starts_with("runtime:") {
+    return kind_runtime
+  }
+  if is_usage(m) {
+    return kind_usage
+  }
+  if is_integrity(m) {
+    return kind_integrity
+  }
+  if is_network(m) {
+    return kind_network
+  }
+  if is_auth(m) {
+    return kind_auth
+  }
+  // Lock/config problems are metadata even though the read went through Git;
+  // the metadata-file check therefore precedes the generic git prefix.
+  if is_metadata_file(m) {
+    return kind_metadata
+  }
+  if m.starts_with("git:") || m.starts_with("git cache:") {
+    return kind_git
+  }
+  if is_metadata(m) {
+    return kind_metadata
+  }
+  return kind_failure
+}
+
+def is_usage(m String) Bool {
+  return (
+    has(m, "unknown command")
+    || has(m, "unknown option")
+    || has(m, "unknown subcommand")
+    || has(m, "expects")
+    || has(m, "takes exactly")
+    || has(m, "takes no arguments")
+    || has(m, "repository reference argument")
+    || has(m, "invalid platform")
+    || has(m, "not in the lock")
+    || has(m, "pass --tag")
+    || has(m, "is not a valid OCI tag")
+    || has(m, "missing --")
+  )
+}
+
+def is_integrity(m String) Bool {
+  return (
+    has(m, "digest mismatch")
+    || has(m, "size mismatch")
+    || has(m, "checksum")
+    || has(m, "corrupted")
+    || has(m, "truncated")
+    || has(m, "does not match")
+    || has(m, "missing blob")
+    || has(m, "mismatched manifest")
+    || has(m, "not an OCI image layout")
+    || has(m, "is not an OCI image layout")
+    || has(m, "unsupported imagelayoutversion")
+  )
+}
+
+def is_network(m String) Bool {
+  return (
+    has(m, "cannot connect")
+    || has(m, "connection refused")
+    || has(m, "connection to")
+    || has(m, "closed after")
+    || has(m, "timed out")
+    || has(m, "timeout")
+    || has(m, "cannot fetch")
+    || has(m, "giving up")
+    || has(m, "unexpected eof")
+    || has(m, "no such host")
+    || has(m, "network is unreachable")
+    || has(m, "temporarily unavailable")
+    || has(m, "status 5")
+    || has(m, "broken pipe")
+  )
+}
+
+def is_auth(m String) Bool {
+  return (
+    has(m, "unauthorized")
+    || has(m, "401")
+    || has(m, "403")
+    || has(m, "authentication")
+    || has(m, "not authorized")
+    || has(m, "token request")
+    || has(m, "token endpoint")
+    || has(m, "token response")
+    || has(m, "credentials")
+  )
+}
+
+def is_metadata_file(m String) Bool {
+  return (
+    has(m, "pokerface.lock.yaml")
+    || has(m, "lock yaml")
+    || has(m, "config:")
+  )
+}
+
+def is_metadata(m String) Bool {
+  return (
+    has(m, "not valid json")
+    || has(m, "unknown field")
+    || has(m, "not found")
+    || has(m, "404")
+    || has(m, "redirect")
+    || has(m, "index lists no")
+    || has(m, "cache")
+    || has(m, "offline")
+    || has(m, "no cache")
+    || has(m, "registry:")
+    || has(m, "blob:")
+    || has(m, "oci:")
+    || has(m, "pull:")
+  )
+}
+
+def has(text String, needle String) Bool {
+  return text.index_of(needle) >= 0
+}
+
+def from_message(message String) AppError {
+  const kind = classify(message)
+  return AppError.new(kind, message, hint_for(kind))
+}
+
+// The command-boundary reporter: prints one human line plus a hint (or one
+// JSON object on stderr) and answers the category's exit code.
+def report(prefix String, message String, json_mode Bool) Int64 {
+  return report_error(prefix, from_message(message), json_mode)
+}
+
+// For errors whose category the caller knows better than the classifier.
+def report_kind(prefix String, kind String, message String, json_mode Bool) Int64 {
+  return report_error(prefix, AppError.new(kind, message, hint_for(kind)), json_mode)
+}
+
+def usage_report(prefix String, message String, json_mode Bool) Int64 {
+  return report_kind(prefix, kind_usage, message, json_mode)
+}
+
+def report_error(prefix String, error AppError, json_mode Bool) Int64 {
+  const message = redact_text(error.message)
+  if json_mode {
+    const safe = AppError.new(error.kind, message, error.hint)
+    src.common.eprint(error_json(safe) + "\n")
+  } else {
+    src.common.eprint(error_line(prefix, message) + "\n")
+    src.common.eprint("hint: " + error.hint + "\n")
+  }
+  return exit_code(error.kind)
+}
+
+def error_line(prefix String, message String) String {
+  if prefix == "" {
+    return "pokerface: " + message
+  }
+  return "pokerface: " + prefix + ": " + message
+}
+
+def error_json(error AppError) String {
+  return (
+    "{\"error\": {\"kind\": \"" + error.kind + "\""
+    + ", \"message\": \"" + json_escape(redact_text(error.message)) + "\""
+    + ", \"hint\": \"" + json_escape(error.hint) + "\""
+    + ", \"exit_code\": " + exit_code(error.kind).to_string() + "}}"
+  )
+}
+
+def json_escape(text String) String {
+  var out = ""
+  var i = 0
+  while i < text.length() {
+    const c = text.substring(i, 1)
+    case c {
+      "\"" then { out = out + "\\\"" }
+      "\\" then { out = out + "\\\\" }
+      "\n" then { out = out + "\\n" }
+      "\r" then { out = out + "\\r" }
+      "\t" then { out = out + "\\t" }
+      _ then { out = out + c }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Verbose logging. Everything goes through a sink so tests can capture it;
+// the production sink is stderr. Secrets are redacted before the write.
+
+interface LogSink {
+  def write(text String) Void
+}
+
+class StderrSink {
+  def init() {
+  }
+
+  def write(text String) {
+    src.common.eprint(text)
+  }
+}
+
+class BufferSink {
+  def init() {
+    self.text = Box.new("")
+  }
+
+  def write(text String) {
+    self.text.replace(self.text.read() + text)
+  }
+
+  def output() String {
+    return self.text.read()
+  }
+}
+
+class Logger {
+  def init(verbose Bool, sink LogSink) {
+    self.verbose = verbose
+    self.sink = sink
+  }
+
+  def enabled() Bool {
+    return self.verbose
+  }
+
+  def detail(message String) {
+    if self.verbose {
+      self.sink.write("pokerface: " + redact_text(message) + "\n")
+    }
+  }
+
+  def request(method String, url String, headers Array[(String, String)]) {
+    if self.verbose {
+      self.sink.write("pokerface: http " + method + " " + redact_url(url) + "\n")
+      var i = 0
+      while i < headers.length() {
+        const (name, value) = headers[i]
+        self.sink.write("pokerface:   " + name + ": " + redact_header(name, value) + "\n")
+        i = i + 1
+      }
+    }
+  }
+
+  def command(argv Array[String]) {
+    if self.verbose {
+      self.sink.write("pokerface: exec " + redact_command(argv) + "\n")
+    }
+  }
+}
+
+def redact_header(name String, value String) String {
+  const n = name.lower()
+  if n == "authorization" || n == "proxy-authorization" || n == "cookie" || n == "set-cookie" {
+    return "<redacted>"
+  }
+  return value
+}
+
+// A presigned URL carries its signature in the query; userinfo carries
+// credentials. Both are replaced before the URL is rendered.
+def redact_url(url String) String {
+  var out = url
+  const scheme = out.index_of("://")
+  if scheme >= 0 {
+    const after = out.substring(scheme + 3, out.length() - scheme - 3)
+    const at = after.index_of("@")
+    const slash = after.index_of("/")
+    if at >= 0 && (slash < 0 || at < slash) {
+      out = out.substring(0, scheme + 3) + "<redacted>@" + after.substring(at + 1, after.length() - at - 1)
+    }
+  }
+  const q = out.index_of("?")
+  if q >= 0 {
+    out = out.substring(0, q) + "?<redacted>"
+  }
+  return out
+}
+
+def redact_command(argv Array[String]) String {
+  var out = ""
+  var i = 0
+  while i < argv.length() {
+    if i > 0 {
+      out = out + " "
+    }
+    var arg = argv[i]
+    if arg.index_of("://") >= 0 {
+      arg = redact_url(arg)
+    }
+    out = out + arg
+    i = i + 1
+  }
+  return out
+}
+
+// Error/warning text can carry a URL (a redirect Location, a fetch target);
+// redact every URL-shaped token so a presigned query never reaches output.
+def redact_text(text String) String {
+  var out = ""
+  var token = ""
+  var i = 0
+  while i < text.length() {
+    const c = text.substring(i, 1)
+    if c == " " || c == "\n" || c == "\t" {
+      out = out + redact_token(token) + c
+      token = ""
+    } else {
+      token = token + c
+    }
+    i = i + 1
+  }
+  return out + redact_token(token)
+}
+
+def redact_token(token String) String {
+  if token.index_of("://") >= 0 {
+    return redact_url(token)
+  }
+  return token
+}

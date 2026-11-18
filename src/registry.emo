@@ -54,6 +54,21 @@ class HttpTransport {
   }
 }
 
+// Verbose request logging without leaking secrets: the logger redacts
+// Authorization-style headers and URL query strings (the token endpoint's
+// service/scope and any presigned URL) before writing.
+class LoggingTransport {
+  def init(inner Transport, logger src.errors.Logger) {
+    self.inner = inner
+    self.logger = logger
+  }
+
+  def request(method String, url String, headers Array[(String, String)], body String, timeout Float64) (R, Response) {
+    self.logger.request(method, url, headers)
+    return self.inner.request(method, url, headers, body, timeout)
+  }
+}
+
 class MockRoute {
   // mode: "any" matches every request to the URL; "none" requires the request
   // to carry no Authorization header; "contains" requires it to carry one

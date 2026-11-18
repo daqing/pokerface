@@ -59,11 +59,17 @@ class HttpBlobTransport {
 // token rides on the first request only: a 307 then points at a presigned
 // CDN URL, which must never receive it.
 class RegistryBlobTransport {
-  def init(token String) {
+  def init(token String, logger src.errors.Logger) {
     self.token = token
+    self.logger = logger
   }
 
   def open(url String, range_start Int64, timeout Float64) (R, BlobOpen) {
+    var headers = []
+    if self.token != "" {
+      headers = [("Authorization", "Bearer " + self.token)]
+    }
+    self.logger.request("GET", url, headers)
     return open_blob_url(url, range_start, timeout, 0, self.token)
   }
 }

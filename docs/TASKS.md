@@ -85,7 +85,7 @@ Exit criteria:
 | [x] | T1.13 | Runtime import adapter | T1.12 | 3h |
 | [x] | T1.14 | Wire up the `pull` command and failure fallbacks | T1.9-T1.13 | 3h |
 | [x] | T1.15 | Local cache and offline mode | T1.7, T1.14 | 2-3h |
-| [ ] | T1.16 | Error model, exit codes, and logging | T1.1 | 2h |
+| [x] | T1.16 | Error model, exit codes, and logging | T1.1 | 2h |
 | [ ] | T1.17 | M1 test baseline, E2E script, and spec docs | T1.1-T1.16 | 2-3h |
 
 ### 4.3 Task Details
@@ -312,6 +312,8 @@ images:
 **Acceptance**: Usage, Git, metadata, authentication, network, integrity, and runtime errors each have a fixed exit code; error output includes actionable remediation; `--verbose` redacts tokens, Authorization headers, and presigned URL query strings.
 
 **Depends on**: T1.1 · **Estimate**: 2h
+
+> **Notes** (2026-11-18, ~2h): Done. `src/errors.emo` defines the stable model: kinds `failure/usage/git/metadata/authentication/network/integrity/runtime` with exit codes 1, 2, 3, 4, 5, 6, 7, 8 (`src/common.emo` holds the constants). Commands report through `errors.report` / `usage_report` / `report_kind`, which print one human line plus a `hint:` remediation line, or — with `--json` — one error object on stderr while stdout stays reserved for results. Classification lowercases the message and checks in a deliberate order: `runtime:` prefix, usage phrases, integrity, network, authentication, lock/config metadata (before the generic `git:` prefix, so a missing lock read via Git is metadata), `git:`/`git cache:`, broader metadata, then `failure`. `Logger` writes only with `--verbose`, through an injectable `LogSink` (`StderrSink` production, `BufferSink` tests): redacts `Authorization`/`Proxy-Authorization`/`Cookie`/`Set-Cookie` values, URL userinfo and query strings (presigned signatures, token `service`/`scope`), URL-shaped tokens in free text, and URL arguments in logged commands; bodies are never logged. Wiring: pull logs settings/step detail, registry requests via a new `registry.LoggingTransport`, blob GETs via the logger passed to `RegistryBlobTransport`, and import argv; `cache verify` now exits with the integrity code (7) while issues remain. Tests: 20 table-driven cases in `test/error_model.emo` (classification, codes, hints, JSON escaping/redaction, sink capture, report codes), 1 cache-command integrity case, and updated resolve/cache exit-code assertions; `emo test` 220/220. Manually verified: an offline cache miss prints a metadata hint and exits 4, `--json` emits the error object on stderr, `cache rm` on a foreign directory exits 4 with its sentinel intact, an unknown option exits 2, `cache verify --check` on a corrupt blob exits 7 and the repair exits 0, and a real verbose pull logged redacted manifest/blob requests and the skopeo command with no secrets. Docs: `docs/spec/errors.md`, `docs/cli.md`, `docs/spec/cache.md`, `docs/spec/pull.md`. Gotchas: `case` patterns must be literals — a `const` name is a binding pattern, so the exit/hint tables use string literals; interface methods must declare a return type (`def write(text String) Void`); the classifier's order is the contract (runtime prefix first, lock/config before Git); error JSON goes to stderr so `--json` pipelines never mistake an error for data; redaction happens in both `report_error`/`error_json` and the logger, so no path prints an unredacted URL.
 
 #### T1.17 M1 Test Baseline, E2E Script, and Spec Docs
 

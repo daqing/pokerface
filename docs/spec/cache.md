@@ -95,8 +95,9 @@ Verifies every entry:
   `git fsck --no-progress --no-dangling`.
 
 By default it **repairs**: every problem is evicted. `--check` only reports,
-and exits 1 when any issue remains. Exit 0 means no issues remain; a failed
-eviction keeps the exit code at 1. `--json` reports `checked`, `issues`,
+and exits with the integrity code (7) when any issue remains. Exit 0 means no
+issues remain; a failed eviction also keeps the code at 7. `--json` reports
+`checked`, `issues`,
 `evicted`, and the issue notes.
 
 ### `cache rm [--all | --git | --manifests | --blobs | --refs]`

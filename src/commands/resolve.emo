@@ -26,31 +26,26 @@ class ResolveResult {
 
 def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) Int64 {
   if rest.length() == 0 {
-    src.common.eprint("pokerface: resolve expects a repository reference argument\n")
-    return src.common.exit_usage
+    return src.errors.usage_report("resolve", "expects a repository reference argument", flags.json)
   }
   if rest.length() > 1 {
-    src.common.eprint("pokerface: resolve takes exactly one repository reference, got " + rest.length().to_string() + "\n")
-    return src.common.exit_usage
+    return src.errors.usage_report("resolve", "takes exactly one repository reference, got " + rest.length().to_string(), flags.json)
   }
 
   const display_ref = rest[0]
   case src.ref.parse(display_ref) {
     (R.error, why) then {
-      src.common.eprint("pokerface: resolve: " + why + "\n")
-      return src.common.exit_usage
+      return src.errors.usage_report("resolve", why, flags.json)
     }
     (R.ok, parsed) then {
       case src.settings.load(src.git.RealRunner.new(), env, flags.config) {
         (R.error, why) then {
-          src.common.eprint("pokerface: resolve: " + why + "\n")
-          return src.common.exit_failure
+          return src.errors.report("resolve", why, flags.json)
         }
         (R.ok, settings) then {
           case resolution_with_settings(flags, parsed, settings, false) {
             (R.error, why) then {
-              src.common.eprint("pokerface: resolve: " + why + "\n")
-              return src.common.exit_failure
+              return src.errors.report("resolve", why, flags.json)
             }
             (R.ok, result) then {
               print_result(result, flags)

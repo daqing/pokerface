@@ -85,7 +85,7 @@
 | [x] | T1.13 | 运行时导入适配 | T1.12 | 3h |
 | [x] | T1.14 | `pull` 命令串联与失败回退 | T1.9-T1.13 | 3h |
 | [x] | T1.15 | 本地缓存与离线模式 | T1.7、T1.14 | 2-3h |
-| [ ] | T1.16 | 错误模型、退出码与日志 | T1.1 | 2h |
+| [x] | T1.16 | 错误模型、退出码与日志 | T1.1 | 2h |
 | [ ] | T1.17 | M1 测试基线、E2E 脚本与规范文档 | T1.1-T1.16 | 2-3h |
 
 ### 4.3 任务详情
@@ -312,6 +312,8 @@ images:
 **验收**：用法错误、Git 错误、元数据错误、认证错误、网络错误、完整性错误、运行时错误各有固定退出码；错误输出包含可执行的修复建议；`--verbose` 下 token、Authorization header、预签名 URL 查询串被脱敏。
 
 **依赖**：T1.1 · **预估**：2h
+
+> **备注**（2026-11-18，约 2h）：完成。`src/errors.emo` 定义稳定模型：种类 `failure/usage/git/metadata/authentication/network/integrity/runtime`，退出码 1、2、3、4、5、6、7、8（常量在 `src/common.emo`）。命令通过 `errors.report` / `usage_report` / `report_kind` 上报：人类输出一行错误加一行 `hint:` 修复建议；`--json` 时在 **stderr** 输出单个错误对象，stdout 只留给正常结果。分类器先把消息转小写，再按刻意设计的顺序判断：`runtime:` 前缀、用法短语、完整性、网络、认证、锁/配置元数据（先于通用 `git:` 前缀，因此经 Git 读取的锁缺失归为 metadata）、`git:`/`git cache:`、更宽的元数据短语，最后 `failure`。`Logger` 只在 `--verbose` 时通过可注入的 `LogSink`（生产用 `StderrSink`，测试用 `BufferSink`）输出，并脱敏 `Authorization`/`Proxy-Authorization`/`Cookie`/`Set-Cookie` 值、URL userinfo 与查询串（预签名、token 的 `service`/`scope`）、自由文本中的 URL，以及命令参数中的 URL；body 永不记录。接线：pull 记录 settings/步骤细节、通过新 `registry.LoggingTransport` 记录 registry 请求、通过传给 `RegistryBlobTransport` 的 logger 记录 Blob GET、并记录导入 argv；`cache verify` 在仍有问题时以完整性码 7 退出。测试：`test/error_model.emo` 20 个表驱动用例（分类、退出码、hint、JSON 转义/脱敏、sink 捕获、report 返回码），`test/cache_cmd.emo` 1 个完整性退出码用例，以及更新后的 resolve/cache 断言；`emo test` 220/220。手工验证：离线缓存缺失输出 metadata hint 并退出 4；`--json` 在 stderr 输出错误对象；外部目录 `cache rm` 退出 4 且哨兵完好；未知选项退出 2；损坏缓存 `verify --check` 退出 7、修复后退出 0；真实 verbose pull 打印了脱敏后的 manifest/blob 请求与 skopeo 命令，无任何 secret。文档：`docs/spec/errors.md`、`docs/cli.md`、`docs/spec/cache.md`、`docs/spec/pull.md`。踩坑：`case` 模式必须是字面量——`const` 名字是绑定模式，所以退出码/hint 表用字符串字面量；接口方法必须声明返回类型（`def write(text String) Void`）；分类顺序就是契约（runtime 前缀最先，锁/配置先于 Git）；错误 JSON 走 stderr，避免 `--json` 管道把错误当数据；脱敏同时发生在 `report_error`/`error_json` 与 logger，任何输出路径都不会出现未脱敏 URL。
 
 #### T1.17 M1 测试基线、E2E 脚本与规范文档
 

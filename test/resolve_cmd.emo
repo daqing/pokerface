@@ -148,18 +148,18 @@ def test_resolve_end_to_end() {
   expect_equal(src.common.exit_ok, res.run(test_flags(), [origin], env))
 }
 
-def test_resolve_bad_ref_is_failure() {
+def test_resolve_bad_ref_is_git_error() {
   const pair = make_origin("badref")
   const (origin, head) = pair
   const cache = work_dir("badref-cache")
   const env = ResolveFakeEnv.new(Map.new(("POKERFACE_CACHE_DIR", cache)))
-  expect_equal(src.common.exit_failure, res.run(test_flags(), [origin + ":no-such-ref"], env))
+  expect_equal(src.common.exit_git, res.run(test_flags(), [origin + ":no-such-ref"], env))
 }
 
 def test_config_error_beats_git() {
   const pair = make_origin("cfgerr")
   const (origin, head) = pair
-  expect_equal(src.common.exit_failure, res.run(test_flags_bad_config(), [origin + ":main"], empty_env()))
+  expect_equal(src.common.exit_metadata, res.run(test_flags_bad_config(), [origin + ":main"], empty_env()))
 }
 
 def test_lock_without_manifest_digest_serves_index_digest() {
