@@ -1,0 +1,366 @@
+// T2.18 tests for metrics and observability — run with `emo test`.
+//
+// The counter math and the Prometheus rendering run against the fake-free
+// parts; the SQLite bumps live in the compiled db_selftest. The router legs
+// pin /metrics as public with auth enabled and the route_kind grouping.
+
+const metrics = registry.metrics
+
+require "httpd"
+require "json"
+
+// ---------------------------------------------------------------------------
+// Buckets.
+
+def test_bucket_edges() {
+  expect_equal("0.005", metrics.bucket_of(5))
+  expect_equal("0.005", metrics.bucket_of(0))
+  expect_equal("0.010", metrics.bucket_of(6))
+  expect_equal("0.100", metrics.bucket_of(100))
+  expect_equal("1.000", metrics.bucket_of(1000))
+  expect_equal("+Inf", metrics.bucket_of(10001))
+}
+
+// ---------------------------------------------------------------------------
+// The Prometheus rendering.
+
+// The Prometheus rendering reads a real database, so its counting and
+// cumulative-bucket checks live in the compiled db_selftest; the /metrics
+// route here pins the endpoint's shape through the sink.
+
+// ---------------------------------------------------------------------------
+// The route grouping.
+
+def test_route_kinds() {
+  expect_equal("auth", router_route_kind("/token", "GET"))
+  expect_equal("upload", router_route_kind("/v2/acme/app/blobs/uploads/", "POST"))
+  expect_equal("upload", router_route_kind("/v2/acme/app/blobs/uploads/sess-1", "PATCH"))
+  expect_equal("blob", router_route_kind("/v2/acme/app/blobs/sha256:1111111111111111111111111111111111111111111111111111111111111111", "GET"))
+  expect_equal("manifest", router_route_kind("/v2/acme/app/manifests/latest", "GET"))
+  expect_equal("manifest", router_route_kind("/v2/acme/app/manifests/v1", "PUT"))
+  expect_equal("tags", router_route_kind("/v2/acme/app/tags/list", "GET"))
+  expect_equal("metadata", router_route_kind("/api/v1/resolve", "GET"))
+  expect_equal("health", router_route_kind("/healthz", "GET"))
+  expect_equal("health", router_route_kind("/metrics", "GET"))
+  expect_equal("other", router_route_kind("/nope", "GET"))
+}
+
+// ---------------------------------------------------------------------------
+// The router: /metrics is public and text/plain.
+
+class MetricsRouterDb {
+  def init() {
+  }
+
+  def ping() Bool {
+    return true
+  }
+
+  def path() String {
+    return "/tmp/fake.db"
+  }
+}
+
+class MetricsRouterHealth {
+  def init() {
+  }
+
+  def probe() (R, String) {
+    return (R.ok, "fs:/tmp/fake")
+  }
+}
+
+class MetricsRouterLinks {
+  def init() {
+  }
+
+  def linked(repository String, digest String) (R, registry.blobs.BlobLink) {
+    return (R.ok, registry.blobs.absent_link())
+  }
+}
+
+class MetricsRouterManifests {
+  def init() {
+  }
+
+  def lookup(repository String, reference String) (R, registry.manifests.ManifestPayload) {
+    return (R.ok, registry.manifests.absent_payload())
+  }
+}
+
+class MetricsRouterWriter {
+  def init() {
+  }
+
+  def put(repository String, media_type String, body String) (R, String) {
+    return (R.ok, "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+  }
+
+  def tag(repository String, tag String, digest String) (R, Bool) {
+    return (R.ok, true)
+  }
+}
+
+class MetricsRouterUploads {
+  def init() {
+  }
+
+  def start(repository String) (R, String) {
+    return (R.ok, "sess-1")
+  }
+
+  def lookup(id String) (R, registry.uploads.UploadSession) {
+    return (R.ok, registry.uploads.absent_session())
+  }
+
+  def append(id String, body String, start Int64, ranged Bool) (R, Int64) {
+    return (R.error, "fake: append")
+  }
+
+  def complete(id String, digest String, size Int64) (R, Bool) {
+    return (R.ok, true)
+  }
+
+  def cancel(id String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def part_path(id String) (R, String) {
+    return (R.ok, "/tmp/fake-part")
+  }
+}
+
+class MetricsRouterStore {
+  def init() {
+  }
+
+  def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, 0, true))
+  }
+
+  def put_file(digest String, source String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put_file")
+  }
+
+  def get(digest String) (R, String) {
+    return (R.error, registry.blobstore.not_found(digest))
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    return (R.error, "fake: range")
+  }
+
+  def head(digest String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, -1, false))
+  }
+
+  def delete(digest String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def presign_get(digest String, ttl_seconds Int64) String {
+    return ""
+  }
+}
+
+class MetricsRouterTags {
+  def init() {
+  }
+
+  def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
+    return (R.ok, registry.tags.TagPage.new(true, [], false))
+  }
+}
+
+class MetricsRouterSink {
+  def init() {
+    self.records = Box.new(0)
+    self.last = Box.new("")
+  }
+
+  def record(stats registry.metrics.RequestStats) Void {
+    self.records.replace(self.records.read() + 1)
+    self.last.replace(stats.route_kind + " " + stats.status.to_string())
+  }
+
+  def render() String {
+    return "# TYPE pokerface_requests_total counter\npokerface_requests_total 0\n"
+  }
+
+  def record_count() Int64 {
+    return self.records.read()
+  }
+}
+
+def metrics_config(auth_enabled Bool) registry.config.RegistryConfig {
+  return registry.config.RegistryConfig.new(
+    registry.config.RegistryListen.new("127.0.0.1", 5000),
+    "/tmp/pf-metrics-router",
+    "/tmp/pf-metrics-router/registry.db",
+    registry.config.RegistryStore.new("fs", "/tmp/pf-metrics-router/blobs", registry.config.default_s3()),
+    registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
+    "/tmp/pf-metrics-router/shutdown",
+    "<test>",
+    registry.config.RegistryAuth.new(auth_enabled, "http://127.0.0.1:5000/token", "pokerface-registry", "pokerface-registry", 3600,
+      [registry.config.AuthUser.new("alice", "wonderland")], "metrics-test-key"),
+    registry.config.ObservabilityConfig.new(false, true)
+  )
+}
+
+def metrics_service(auth_enabled Bool, sink MetricsRouterSink) registry.router.Service {
+  return registry.router.Service.new(metrics_config(auth_enabled), MetricsRouterDb.new(), MetricsRouterHealth.new(), MetricsRouterStore.new(), MetricsRouterLinks.new(), MetricsRouterManifests.new(), MetricsRouterUploads.new(), MetricsRouterWriter.new(), MetricsRouterTags.new(), sink)
+}
+
+def plain_request(method String, path String) httpd.Request {
+  return httpd.Request.new(
+    method: method,
+    target: path,
+    path: path,
+    query: Map.new(),
+    proto: "HTTP/1.1",
+    headers: [],
+    body: "",
+    params: Map.new()
+  )
+}
+
+def router_route_kind(path String, method String) String {
+  return router_route_kind_via_handle(path, method)
+}
+
+// route_kind is reached through the sink: one request records one stat whose
+// route_kind the counting fake captures.
+def router_route_kind_via_handle(path String, method String) String {
+  const sink = MetricsRouterSink.new()
+  const service = metrics_service(false, sink)
+  registry.router.handle(plain_request(method, path), service)
+  return sink.last.read().split(" ")[0]
+}
+
+def test_the_metrics_endpoint_is_public_and_text() {
+  const sink = MetricsRouterSink.new()
+  const service = metrics_service(true, sink)
+  const response = registry.router.handle(plain_request("GET", "/metrics"), service)
+  expect_equal(200, response.status)
+  expect_true(header_value(response.headers, "content-type").index_of("text/plain") >= 0)
+  expect_true(response.body.index_of("# TYPE pokerface_requests_total counter") >= 0)
+  // POST is refused.
+  const post = registry.router.handle(plain_request("POST", "/metrics"), service)
+  expect_equal(405, post.status)
+}
+
+def test_every_request_is_recorded() {
+  const sink = MetricsRouterSink.new()
+  const service = metrics_service(true, sink)
+  registry.router.handle(plain_request("GET", "/v2/"), service)
+  registry.router.handle(plain_request("GET", "/metrics"), service)
+  registry.router.handle(plain_request("GET", "/healthz"), service)
+  expect_equal(3, sink.record_count())
+}
+
+def test_auth_failures_record_with_their_route() {
+  const sink = MetricsRouterSink.new()
+  const service = metrics_service(true, sink)
+  const response = registry.router.handle(plain_request("GET", "/v2/acme/app/manifests/latest"), service)
+  expect_equal(401, response.status)
+  expect_equal(1, sink.record_count())
+  expect_true(sink.last.read().index_of("manifest 401") >= 0)
+  expect_true(sink.last.read().split(" ")[1].to_int64() >= 400)
+}
+
+// ---------------------------------------------------------------------------
+// Config: the observability section.
+
+class ObsFakeEnv {
+  def init(values Map[String, String]) {
+    self.values = values
+  }
+
+  def getenv(name String) (R, String) {
+    if self.values.has(name) {
+      return (R.ok, self.values.get(name))
+    }
+    return (R.error, "not set")
+  }
+}
+
+def obs_tmp_base() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base + "pokerface-registry-obs-" + os.getpid().to_string() + "-"
+}
+
+def obs_write(path String, text String) {
+  case file.write(path, text) {
+    (R.error, why) then { expect_fail("cannot write " + path + ": " + why) }
+    (R.ok, _) then { expect_true(true) }
+  }
+}
+
+def test_observability_config_defaults_and_overrides() {
+  const base = obs_tmp_base()
+  const path = base + "obs.yaml"
+  obs_write(path, "listen:\n  host: 127.0.0.1\n  port: 5001\ndata_dir: " + base + "data\n")
+  case registry.config.load(ObsFakeEnv.new(Map.new(("POKERFACE_REGISTRY_CONFIG", path))), "") {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, config) then {
+      expect_true(config.observability.access_log)
+      expect_true(config.observability.metrics)
+    }
+  }
+  const off_path = base + "obs-off.yaml"
+  obs_write(off_path, "listen:\n  host: 127.0.0.1\n  port: 5001\ndata_dir: " + base + "data\nobservability:\n  access_log: false\n  metrics: false\n")
+  case registry.config.load(ObsFakeEnv.new(Map.new(("POKERFACE_REGISTRY_CONFIG", off_path))), "") {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, config) then {
+      expect_true(!config.observability.access_log)
+      expect_true(!config.observability.metrics)
+    }
+  }
+  const env = Map.new(("POKERFACE_REGISTRY_CONFIG", path), ("POKERFACE_REGISTRY_ACCESS_LOG", "false"), ("POKERFACE_REGISTRY_METRICS", "false"))
+  case registry.config.load(ObsFakeEnv.new(env), "") {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, config) then {
+      expect_true(!config.observability.access_log)
+      expect_true(!config.observability.metrics)
+    }
+  }
+  const unknown_path = base + "obs-unknown.yaml"
+  obs_write(unknown_path, "listen:\n  host: 127.0.0.1\n  port: 5001\ndata_dir: " + base + "data\nobservability:\n  level: debug\n")
+  case registry.config.load(ObsFakeEnv.new(Map.new(("POKERFACE_REGISTRY_CONFIG", unknown_path))), "") {
+    (R.error, why) then { expect_true(why.index_of("observability.level") >= 0) }
+    (R.ok, _) then { expect_fail("an unknown observability field loaded") }
+  }
+}
+
+def test_the_summary_reports_the_switches() {
+  const config = metrics_config(false)
+  const text = registry.config.summary(config)
+  expect_true(text.index_of("access_log=off") >= 0)
+  expect_true(text.index_of("metrics=on") >= 0)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers.
+
+def header_value(headers Array[(String, String)], name String) String {
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == name.lower() {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}

@@ -312,7 +312,8 @@ def test_the_router_dispatches_blob_routes() {
     registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
     "/tmp/pf-blobs-router/shutdown",
     "<test>",
-    registry.config.default_auth())
+    registry.config.default_auth(),
+    registry.config.ObservabilityConfig.new(false, false))
   const service = registry.router.Service.new(
     config,
     BlobFakeDb.new(),
@@ -321,7 +322,8 @@ def test_the_router_dispatches_blob_routes() {
     FakeLinks.new(true, 5, ""),
     BlobFakeManifests.new(),
     BlobFakeUploads.new(), BlobFakeWriter.new(),
-    BlobFakeTags.new())
+    BlobFakeTags.new(),
+    BlobFakeMetricsSink.new())
   const response = registry.router.handle(make_request("GET", "/v2/acme/app/blobs/" + digest_value), service)
   expect_equal(200, response.status)
   expect_equal("hello", response.body)
@@ -408,5 +410,17 @@ class BlobFakeTags {
 
   def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
     return (R.ok, registry.tags.TagPage.new(true, [], false))
+  }
+}
+
+class BlobFakeMetricsSink {
+  def init() {
+  }
+
+  def record(stats registry.metrics.RequestStats) Void {
+  }
+
+  def render() String {
+    return "# TYPE pokerface_requests_total counter\npokerface_requests_total 0\n"
   }
 }

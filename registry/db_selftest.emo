@@ -94,6 +94,7 @@ def main() Int64 {
   check_manifest_store(report, db, path)
   check_blob_links(report, db, path)
   check_manifest_writer(report, db, path)
+  check_metrics(report, path)
   check_upload_sessions(report, db, path)
   check_uploads(report, db)
   check_cascades(report, db)
@@ -116,8 +117,8 @@ def main() Int64 {
 }
 
 def check_migrations(report Report, db registry.db.Database) {
-  report.number(db.schema_version(), 2, "fresh database records schema version 2")
-  report.number(db.applied_versions().length(), 2, "a fresh database has two migration rows")
+  report.number(db.schema_version(), 3, "fresh database records schema version 3")
+  report.number(db.applied_versions().length(), 3, "a fresh database has three migration rows")
   report.check(db.ping(), "ping answers on a fresh database")
   report.text(db.pragma_text("journal_mode"), "wal", "journal mode is WAL")
   report.number(db.pragma_int("busy_timeout"), 5000, "busy timeout is 5000 ms")
@@ -240,6 +241,51 @@ def check_blob_links(report Report, db registry.db.Database, path String) {
     (R.ok, link) then { report.check(!link.found, "an unknown repository has no links") }
     (R.error, why) then { report.check(false, "unknown-repository lookup failed: " + why) }
   }
+}
+
+// The T2.18 metrics: bumps accumulate with UPSERTs, and the Prometheus
+// rendering counts buckets cumulatively with a seconds-shaped sum.
+def check_metrics(report Report, path String) {
+  const db = registry.db.connect(path)
+  db.bump_metrics([
+    ("requests_total", 12),
+    ("errors_total", 2),
+    ("upload_bytes_total", 4096),
+    ("download_bytes_total", 1024),
+    ("latency_bucket|0.050", 8),
+    ("latency_bucket|0.100", 3),
+    ("latency_bucket|+Inf", 1),
+    ("latency_sum_ms", 1234),
+    ("latency_count", 12)
+  ])
+  db.bump_metrics([
+    ("requests_total", 1),
+    ("errors_total", 1),
+    ("latency_bucket|0.050", 1),
+    ("latency_sum_ms", 20),
+    ("latency_count", 1)
+  ])
+  db.close()
+  const text = registry.metrics.render_from_db(path)
+  report.check(text.index_of("# TYPE pokerface_requests_total counter") >= 0, "the exposition carries the counter TYPE")
+  report.check(text.index_of("pokerface_requests_total 13") >= 0, "requests accumulate across bumps")
+  report.check(text.index_of("pokerface_errors_total 3") >= 0, "errors accumulate")
+  report.check(text.index_of("pokerface_upload_bytes_total 4096") >= 0, "upload bytes round-trip")
+  report.check(text.index_of("pokerface_download_bytes_total 1024") >= 0, "download bytes round-trip")
+  report.check(text.index_of("pokerface_request_latency_seconds_bucket{le=\"0.005\"} 0") >= 0, "empty buckets render as zero")
+  report.check(text.index_of("pokerface_request_latency_seconds_bucket{le=\"0.050\"} 9") >= 0, "buckets accumulate over the edges")
+  report.check(text.index_of("pokerface_request_latency_seconds_bucket{le=\"0.100\"} 12") >= 0, "later buckets include earlier counts")
+  report.check(text.index_of("pokerface_request_latency_seconds_bucket{le=\"+Inf\"} 13") >= 0, "the infinite bucket equals the count")
+  report.check(text.index_of("pokerface_request_latency_seconds_sum 1.254") >= 0, "the sum renders in seconds")
+  report.check(text.index_of("pokerface_request_latency_seconds_count 13") >= 0, "the count matches the requests")
+  const fresh_path = path + "-fresh"
+  registry.db.open(fresh_path).close()
+  const fresh = registry.metrics.render_from_db(fresh_path)
+  report.check(fresh.index_of("pokerface_requests_total 0") >= 0, "a fresh store renders zeros")
+  report.check(fresh.index_of("le=\"10.000\"") >= 0, "every bucket edge is present")
+  const (_, _) = os.unlink(fresh_path)
+  const (_, _) = os.unlink(fresh_path + "-wal")
+  const (_, _) = os.unlink(fresh_path + "-shm")
 }
 
 // The T2.10/T2.11 upload-session wrapper: start, chunked appends with offset
@@ -491,8 +537,8 @@ def check_cascades(report Report, db registry.db.Database) {
 }
 
 def check_restart(report Report, db registry.db.Database) {
-  report.number(db.schema_version(), 2, "reopening keeps schema version 2")
-  report.number(db.applied_versions().length(), 2, "reopening does not re-run the migrations")
+  report.number(db.schema_version(), 3, "reopening keeps schema version 3")
+  report.number(db.applied_versions().length(), 3, "reopening does not re-run the migrations")
   report.check(db.ping(), "the reopened database answers")
   report.number(db.repository_id("acme/app"), 0, "data stays deleted across a restart")
   report.check(db.ensure_repository("acme/app") > 0, "the reopened database accepts writes")

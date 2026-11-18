@@ -483,13 +483,13 @@ def res_config(auth_enabled Bool) registry.config.RegistryConfig {
     "/tmp/pf-resolve-router/shutdown",
     "<test>",
     registry.config.RegistryAuth.new(auth_enabled, "http://127.0.0.1:5000/token", "pokerface-registry", "pokerface-registry", 3600,
-      [registry.config.AuthUser.new("alice", "wonderland")], "resolve-test-key")
-  )
+      [registry.config.AuthUser.new("alice", "wonderland")], "resolve-test-key"),
+    registry.config.ObservabilityConfig.new(false, false))
 }
 
 def res_service(auth_enabled Bool) registry.router.Service {
   const body = manifest_with_revision("0123abcd")
-  return registry.router.Service.new(res_config(auth_enabled), ResFakeDb.new(), ResFakeHealth.new(), ResFakeStore.new(), ResFakeLinks.new(), ResFakeManifests.new(manifest_payload(body)), ResFakeUploads.new(), ResFakeWriter.new(), ResFakeTags.new())
+  return registry.router.Service.new(res_config(auth_enabled), ResFakeDb.new(), ResFakeHealth.new(), ResFakeStore.new(), ResFakeLinks.new(), ResFakeManifests.new(manifest_payload(body)), ResFakeUploads.new(), ResFakeWriter.new(), ResFakeTags.new(), ResFakeMetricsSink.new())
 }
 
 def bearer_request(query Map[String, String], token String) httpd.Request {
@@ -545,5 +545,17 @@ class ResFakeTags {
 
   def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
     return (R.ok, registry.tags.TagPage.new(true, [], false))
+  }
+}
+
+class ResFakeMetricsSink {
+  def init() {
+  }
+
+  def record(stats registry.metrics.RequestStats) Void {
+  }
+
+  def render() String {
+    return "# TYPE pokerface_requests_total counter\npokerface_requests_total 0\n"
   }
 }

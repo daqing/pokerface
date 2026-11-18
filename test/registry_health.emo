@@ -35,7 +35,8 @@ def make_config(data_dir String, store_root String, backend String) registry.con
     registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
     data_dir + "/registry.shutdown",
     "<test>",
-    registry.config.default_auth())
+    registry.config.default_auth(),
+    registry.config.default_observability())
 }
 
 class FakeDb {

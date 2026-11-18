@@ -80,7 +80,8 @@ def expect_config_ok(result (R, registry.config.RegistryConfig), label String) r
         registry.config.RegistryLimits.new(0, 0, 0, 0),
         "",
         "",
-    registry.config.default_auth())
+    registry.config.default_auth(),
+    registry.config.default_observability())
     }
   }
 }

@@ -423,12 +423,12 @@ def tags_config(auth_enabled Bool) registry.config.RegistryConfig {
     "/tmp/pf-tags-router/shutdown",
     "<test>",
     registry.config.RegistryAuth.new(auth_enabled, "http://127.0.0.1:5000/token", "pokerface-registry", "pokerface-registry", 3600,
-      [registry.config.AuthUser.new("alice", "wonderland")], "tags-test-key")
-  )
+      [registry.config.AuthUser.new("alice", "wonderland")], "tags-test-key"),
+    registry.config.ObservabilityConfig.new(false, false))
 }
 
 def tags_service(auth_enabled Bool) registry.router.Service {
-  return registry.router.Service.new(tags_config(auth_enabled), TagsFakeDb.new(), TagsFakeHealth.new(), TagsFakeStore.new(), TagsFakeLinks.new(), TagsFakeManifests.new(), TagsFakeUploads.new(), TagsFakeWriter.new(), FakeTagList.new(true, ["v1", "v2"]))
+  return registry.router.Service.new(tags_config(auth_enabled), TagsFakeDb.new(), TagsFakeHealth.new(), TagsFakeStore.new(), TagsFakeLinks.new(), TagsFakeManifests.new(), TagsFakeUploads.new(), TagsFakeWriter.new(), FakeTagList.new(true, ["v1", "v2"]), TagsFakeMetricsSink.new())
 }
 
 def tags_bearer(query Map[String, String], token String) httpd.Request {
@@ -475,4 +475,16 @@ def test_the_listing_is_open_without_auth() {
   const response = registry.router.handle(tags_bearer(Map.new(), ""), service)
   expect_equal(200, response.status)
   expect_equal("acme/app", field_of(response.body, "name"))
+}
+
+class TagsFakeMetricsSink {
+  def init() {
+  }
+
+  def record(stats registry.metrics.RequestStats) Void {
+  }
+
+  def render() String {
+    return "# TYPE pokerface_requests_total counter\npokerface_requests_total 0\n"
+  }
 }

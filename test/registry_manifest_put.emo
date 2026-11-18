@@ -460,7 +460,8 @@ def test_the_router_dispatches_manifest_put() {
         registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
         "/tmp/pf-put-router/shutdown",
         "<test>",
-    registry.config.default_auth())
+    registry.config.default_auth(),
+    registry.config.ObservabilityConfig.new(false, false))
       const links = FakeLinks.new([config_digest(), layer_digest()], "")
       const service = registry.router.Service.new(
         config,
@@ -471,7 +472,8 @@ def test_the_router_dispatches_manifest_put() {
         FakeStore.new([]),
         PutFakeUploads.new(),
         FakeWriter.new(),
-    PutFakeTags.new())
+    PutFakeTags.new(),
+    PutFakeMetricsSink.new())
       const body = manifest_body()
       const response = registry.router.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, body), service)
       expect_equal(201, response.status)
@@ -555,5 +557,17 @@ class PutFakeTags {
 
   def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
     return (R.ok, registry.tags.TagPage.new(true, [], false))
+  }
+}
+
+class PutFakeMetricsSink {
+  def init() {
+  }
+
+  def record(stats registry.metrics.RequestStats) Void {
+  }
+
+  def render() String {
+    return "# TYPE pokerface_requests_total counter\npokerface_requests_total 0\n"
   }
 }

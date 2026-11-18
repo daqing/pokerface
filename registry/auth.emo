@@ -319,7 +319,7 @@ def read_access(items json.JsonArray) Array[String] {
 // What the request needs: ("public", "", "") skips auth, ("probe", "", "")
 // wants any verified token, ("repository", name, action) wants a scope.
 def required_access(path String, method String) (String, String, String) {
-  if path == "/healthz" || path == "/readyz" || path == "/token" {
+  if path == "/healthz" || path == "/readyz" || path == "/token" || path == "/metrics" {
     return ("public", "", "")
   }
   if path == "/v2" || path == "/v2/" {

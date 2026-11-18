@@ -590,6 +590,8 @@ images:
 
 #### T2.19 协议冒烟与一致性测试
 
+> **备注**（2026-11-19，约 2.5h）：已完成。`registry/metrics.emo` + migration 3：计数器存 SQLite（`metrics(name, value)`），因为 httpd 一连接一进程——每个请求在**响应构建之后**用一个短事务以 UPSERT 累加自己的系列（数据库失败不会让已成功的请求失败），`/metrics` 渲染 Prometheus 文本格式：请求总数、错误数（4xx+5xx）、上传/下载字节、以及标准边界的延迟直方图（累计桶、`_sum` 以秒、`_count`）；全新存储渲染全零但完整的文档。路由器为每个请求输出一条 slog JSON 访问日志（ts、请求 id——与响应头 `X-Request-Id` 相同、方法、路径、状态、耗时、字节数；**绝不**记录查询串、请求头或 body，token 与预签名签名无从泄露），每次认证失败输出一条 `warn` 审计记录（`event=auth_failure` + 原因；原因描述状态而非凭据）。新增 `observability:` 配置段（access_log / metrics，默认开启），支持 `POKERFACE_REGISTRY_ACCESS_LOG` / `_METRICS` 环境变量覆盖、摘要开关与严格未知字段检查。`/metrics` 公开（只有计数）且仅 GET。metrics 沉淀为接口（`Sink`：record + render），解释器测试跑 fake，`DbSink` 走 sqlite3。测试：`test/registry_metrics.emo` 9 例（桶边界、路由分组、端点公开/文本/405 形态、逐请求记录、认证失败记录、配置默认/env/未知字段/摘要开关）+ db_selftest 13 项（跨 bump 的 UPSERT 累计、累计桶、秒形 sum、全新存储全零、每个桶边界齐全）；`emo test` 488/488，db selftest 135/135。实测：四个请求得到 `pokerface_requests_total 4` / `errors_total 2` / `download_bytes_total 96`，访问日志逐行可解析，开启认证的实例写出 `auth_failure` 审计记录。踩坑：又是 E3009——sqlite 相关路径（record 与 render）必须藏在 Sink 接口后解释器才能跑；`(R, …)` 错误槽静态为 String（与早前 gate 重构同一约束）；slog 的 `level_info`/`format_json` 是函数而非常量。
+
 **目标**：用真实客户端验证 Registry：`oras` 或 `skopeo` 推送、`pokerface pull` 拉取、预签名 Blob 下载、认证负向用例；形成可重复的冒烟脚本。
 
 **交付**：`scripts/e2e-m2.sh`、测试镜像 fixture、测试说明。

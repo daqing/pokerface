@@ -1,0 +1,184 @@
+// T2.18: Prometheus metrics backed by SQLite. httpd runs one process per
+// connection, so in-memory counters cannot aggregate — every request bumps
+// counter rows with UPSERTs in one short transaction (T2.18's migration 3),
+// and `/metrics` renders the series in the Prometheus text exposition
+// format: requests total, error total, upload/download bytes, and a latency
+// histogram with the standard bucket edges plus sum and count.
+//
+// Counter names carry the registry prefix; values are integers counted in
+// bytes/milliseconds, with the histogram rendered in seconds. A metrics
+// write is best effort and happens after the response is built — a failing
+// database must not fail a request that already succeeded.
+// Spec: docs/spec/registry-metrics.md.
+
+require "json"
+
+const prefix = "pokerface_"
+const bucket_edges_ms = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
+
+// The metrics sink: request processes bump counters through it. The SQLite
+// implementation is c-target only, so the router tests run against fakes
+// (the sqlite3 package refuses interpreted foreign calls).
+interface Sink {
+  def record(stats RequestStats) Void
+  def render() String
+}
+
+class RequestStats {
+  def init(route_kind String, method String, status Int64, bytes_in Int64, bytes_out Int64, duration_ms Int64) {
+    self.route_kind = route_kind
+    self.method = method
+    self.status = status
+    self.bytes_in = bytes_in
+    self.bytes_out = bytes_out
+    self.duration_ms = duration_ms
+  }
+}
+
+class DbSink {
+  def init(db_path String) {
+    self.db_path = db_path
+  }
+
+  def db_path() String {
+    return self.db_path
+  }
+
+  def render() String {
+    return render_from_db(self.db_path)
+  }
+
+  // The counter bumps for one request, applied atomically.
+  def record(stats RequestStats) {
+      const db = registry.db.connect(self.db_path)
+    var entries = [
+      ("requests_total", 1)
+    ]
+    if stats.status >= 400 {
+      entries = entries.append(("errors_total", 1))
+    }
+    if is_upload(stats.route_kind, stats.method) {
+      entries = entries.append(("upload_bytes_total", stats.bytes_in))
+    }
+    if is_download(stats.route_kind, stats.method) {
+      entries = entries.append(("download_bytes_total", stats.bytes_out))
+    }
+    entries = entries.append(("latency_bucket|" + bucket_of(stats.duration_ms), 1))
+    entries = entries.append(("latency_sum_ms", stats.duration_ms))
+    entries = entries.append(("latency_count", 1))
+    db.bump_metrics(entries)
+    db.close()
+  }
+}
+
+def is_upload(route_kind String, method String) Bool {
+  if route_kind == "upload" {
+    return true
+  }
+  return route_kind == "manifest" && method == "PUT"
+}
+
+def is_download(route_kind String, method String) Bool {
+  if route_kind == "blob" {
+    return method == "GET" || method == "HEAD"
+  }
+  return route_kind == "manifest" && (method == "GET" || method == "HEAD")
+}
+
+// The histogram edge covering the duration, as the `le=` label value.
+def bucket_of(duration_ms Int64) String {
+  var i = 0
+  while i < bucket_edges_ms.length() {
+    if duration_ms <= bucket_edges_ms[i] {
+      return bucket_label(bucket_edges_ms[i])
+    }
+    i = i + 1
+  }
+  return "+Inf"
+}
+
+// Prometheus `le` labels are seconds with up to three decimals.
+def bucket_label(edge_ms Int64) String {
+  var whole = edge_ms / 1000
+  var frac = edge_ms % 1000
+  var text = whole.to_string() + "."
+  if frac < 100 {
+    text = text + "0"
+  }
+  if frac < 10 {
+    text = text + "0"
+  }
+  return text + frac.to_string()
+}
+
+// The Prometheus text exposition: one HELP/TYPE pair per family, the
+// histogram's every bucket present (zeros included) plus +Inf, sum, and
+// count — the shape a scraper needs even on a fresh process.
+def render_from_db(db_path String) String {
+  const db = registry.db.connect(db_path)
+  const series = db.list_metrics()
+  db.close()
+  var values = Map.new()
+  var i = 0
+  while i < series.length() {
+    const (name, value) = series[i]
+    values.set(name, value)
+    i = i + 1
+  }
+  var out = ""
+  out = out + "# HELP " + prefix + "requests_total Total HTTP requests.\n"
+  out = out + "# TYPE " + prefix + "requests_total counter\n"
+  out = out + prefix + "requests_total " + counter_text(values, "requests_total") + "\n"
+  out = out + "# HELP " + prefix + "errors_total HTTP requests answered with 4xx or 5xx.\n"
+  out = out + "# TYPE " + prefix + "errors_total counter\n"
+  out = out + prefix + "errors_total " + counter_text(values, "errors_total") + "\n"
+  out = out + "# HELP " + prefix + "upload_bytes_total Request body bytes accepted (uploads and manifest PUTs).\n"
+  out = out + "# TYPE " + prefix + "upload_bytes_total counter\n"
+  out = out + prefix + "upload_bytes_total " + counter_text(values, "upload_bytes_total") + "\n"
+  out = out + "# HELP " + prefix + "download_bytes_total Response body bytes served (blob and manifest reads).\n"
+  out = out + "# TYPE " + prefix + "download_bytes_total counter\n"
+  out = out + prefix + "download_bytes_total " + counter_text(values, "download_bytes_total") + "\n"
+  out = out + "# HELP " + prefix + "request_latency_seconds Request handling latency.\n"
+  out = out + "# TYPE " + prefix + "request_latency_seconds histogram\n"
+  var cumulative = 0
+  var j = 0
+  while j < bucket_edges_ms.length() {
+    const label = bucket_label(bucket_edges_ms[j])
+    const raw = counter_text(values, "latency_bucket|" + label)
+    cumulative = cumulative + raw.to_int64()
+    out = out + prefix + "request_latency_seconds_bucket{le=\"" + label + "\"} " + cumulative.to_string() + "\n"
+    j = j + 1
+  }
+  const infinite = counter_text(values, "latency_bucket|+Inf")
+  cumulative = cumulative + infinite.to_int64()
+  out = out + prefix + "request_latency_seconds_bucket{le=\"+Inf\"} " + cumulative.to_string() + "\n"
+  out = out + prefix + "request_latency_seconds_sum " + latency_sum_text(values) + "\n"
+  out = out + prefix + "request_latency_seconds_count " + counter_text(values, "latency_count") + "\n"
+  return out
+}
+
+// A missing series renders as 0 — a fresh process exports a valid document.
+def counter_text(values Map[String, Int64], name String) String {
+  if values.has(name) {
+    return values.get(name).to_string()
+  }
+  return "0"
+}
+
+// The latency sum rides milliseconds internally and renders as seconds.
+def latency_sum_text(values Map[String, Int64]) String {
+  if values.has("latency_sum_ms") {
+    const ms = values.get("latency_sum_ms")
+    var whole = ms / 1000
+    var frac = ms % 1000
+    var text = whole.to_string() + "."
+    if frac < 100 {
+      text = text + "0"
+    }
+    if frac < 10 {
+      text = text + "0"
+    }
+    return text + frac.to_string()
+  }
+  return "0.000"
+}

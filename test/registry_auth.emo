@@ -517,12 +517,12 @@ def auth_config() registry.config.RegistryConfig {
     registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
     "/tmp/pf-auth-router/shutdown",
     "<test>",
-    auth_settings()
-  )
+    auth_settings(),
+    registry.config.ObservabilityConfig.new(false, false))
 }
 
 def auth_service() registry.router.Service {
-  return registry.router.Service.new(auth_config(), AuthFakeDb.new(), AuthFakeHealth.new(), AuthFakeStore.new(), AuthFakeLinks.new(), AuthFakeManifests.new(), AuthFakeUploads.new(), AuthFakeWriter.new(), AuthFakeTags.new())
+  return registry.router.Service.new(auth_config(), AuthFakeDb.new(), AuthFakeHealth.new(), AuthFakeStore.new(), AuthFakeLinks.new(), AuthFakeManifests.new(), AuthFakeUploads.new(), AuthFakeWriter.new(), AuthFakeTags.new(), AuthFakeMetricsSink.new())
 }
 
 // The router gates with the real clock, so these mint at now.
@@ -767,5 +767,17 @@ class AuthFakeTags {
 
   def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
     return (R.ok, registry.tags.TagPage.new(true, [], false))
+  }
+}
+
+class AuthFakeMetricsSink {
+  def init() {
+  }
+
+  def record(stats registry.metrics.RequestStats) Void {
+  }
+
+  def render() String {
+    return "# TYPE pokerface_requests_total counter\npokerface_requests_total 0\n"
   }
 }

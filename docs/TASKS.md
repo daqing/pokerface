@@ -363,7 +363,7 @@ Exit criteria:
 | [x] | T2.15 | Cache headers, ETag, and CDN behavior | T2.8, T2.9 | 2h |
 | [x] | T2.16 | Tag listing and pagination | T2.12 | 2h |
 | [ ] | T2.17 | Deployment: registry + MinIO + Caddy | T2.6, T2.14 | 3h |
-| [ ] | T2.18 | Observability and audit logging | T2.1 | 2-3h |
+| [x] | T2.18 | Observability and audit logging | T2.1 | 2-3h |
 | [ ] | T2.19 | Protocol smoke and conformance tests | T2.1-T2.18 | 3h |
 
 ### 5.3 Task Details
@@ -589,6 +589,8 @@ Suggested tables:
 **Depends on**: T2.1 · **Estimate**: 2-3h
 
 #### T2.19 Protocol Smoke and Conformance Tests
+
+> **Notes** (2026-11-19, ~2.5h): Done. `registry/metrics.emo` + migration 3: counters live in SQLite (`metrics(name, value)`) because httpd runs one process per connection — each request bumps its series with UPSERTs in one short transaction **after** the response is built (a failing database cannot fail a request that already succeeded), and `/metrics` renders the Prometheus text format: requests total, errors (4xx+5xx), upload/download bytes, and a latency histogram over the standard edges with cumulative buckets, `_sum` (seconds), and `_count`; a fresh store renders a full zeros document. The router emits one slog JSON access line per request (ts, request id — the same one the response header echoes, method, path, status, duration, byte counts; never the query, headers, or bodies, so no token or presigned signature can leak) and a `warn` audit record per authentication failure (`event=auth_failure` + reason; reasons name states, not credentials). New `observability:` config section (access_log / metrics, both default on) with `POKERFACE_REGISTRY_ACCESS_LOG` / `_METRICS` env overrides, summary switches, and strict unknown-field checks. `/metrics` is public (counts only) and GET-only. The metrics sink is an interface (`Sink`: record + render) so the interpreter tests run against fakes while `DbSink` rides sqlite3. Tests: 9 in `test/registry_metrics.emo` (bucket edges, route grouping, the endpoint's public/text/405 shape, per-request recording, auth-failure recording, config defaults/env/unknown/summary) + 13 db_selftest checks (UPSERT accumulation across bumps, cumulative buckets, the seconds-shaped sum, fresh-store zeros, every edge present); `emo test` 488/488, db selftest 135/135. Manually verified: four requests produce `pokerface_requests_total 4` / `errors_total 2` / `download_bytes_total 96`, every access line parses as JSON, and an auth-enabled instance writes `auth_failure` audit records. Gotchas: E3009 again — the sqlite-backed paths (record and render) must sit behind the Sink interface for the interpreter; `(R, …)` error slots are Strings, shaping the earlier gate refactor the same way; slog's `level_info`/`format_json` are FUNCTIONS, not constants.
 
 **Goal**: Validate the registry with real clients: push with `oras` or `skopeo`, pull with `pokerface`, download presigned blobs, and exercise negative auth cases; turn this into a repeatable smoke script.
 

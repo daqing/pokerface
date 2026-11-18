@@ -39,7 +39,8 @@ def make_config(name String) registry.config.RegistryConfig {
     registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
     data + "/registry.shutdown",
     "<test>",
-    registry.config.default_auth())
+    registry.config.default_auth(),
+    registry.config.ObservabilityConfig.new(false, false))
 }
 
 class ApiFakeDb {
@@ -180,7 +181,7 @@ def make_request_with(method String, path String, headers Array[(String, String)
 }
 
 def make_service(name String) registry.router.Service {
-  return registry.router.Service.new(make_config(name), ApiFakeDb.new(true), ApiFakeBlob.new(true), ApiFakeBlobStore.new(), ApiFakeBlobLinks.new(), ApiFakeManifests.new(), ApiFakeUploads.new(), ApiFakeWriter.new(), ApiFakeTags.new())
+  return registry.router.Service.new(make_config(name), ApiFakeDb.new(true), ApiFakeBlob.new(true), ApiFakeBlobStore.new(), ApiFakeBlobLinks.new(), ApiFakeManifests.new(), ApiFakeUploads.new(), ApiFakeWriter.new(), ApiFakeTags.new(), ApiFakeMetricsSink.new())
 }
 
 def route(method String, path String) httpd.Response {
@@ -369,5 +370,17 @@ class ApiFakeTags {
 
   def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
     return (R.ok, registry.tags.TagPage.new(true, [], false))
+  }
+}
+
+class ApiFakeMetricsSink {
+  def init() {
+  }
+
+  def record(stats registry.metrics.RequestStats) Void {
+  }
+
+  def render() String {
+    return "# TYPE pokerface_requests_total counter\npokerface_requests_total 0\n"
   }
 }

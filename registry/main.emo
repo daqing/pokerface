@@ -108,7 +108,8 @@ def serve(config registry.config.RegistryConfig, blob_health registry.blobstore.
       const blob_links = registry.blobs.DbBlobLinks.new(config.db_path)
       const uploads = registry.uploads.DbUploadSessions.new(config.db_path, config.data_dir + "/uploads")
       const tags = registry.tags.DbTagList.new(config.db_path)
-      const service = registry.router.Service.new(config, db_health, blob_health, blob_store, blob_links, manifests, uploads, manifests, tags)
+      const metrics = registry.metrics.DbSink.new(config.db_path)
+      const service = registry.router.Service.new(config, db_health, blob_health, blob_store, blob_links, manifests, uploads, manifests, tags, metrics)
       const handler = -> (req httpd.Request) {
         return registry.router.handle(req, service)
       }

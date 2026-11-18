@@ -71,7 +71,7 @@ def default_s3() S3Settings {
 }
 
 class RegistryConfig {
-  def init(listen RegistryListen, data_dir String, db_path String, store RegistryStore, limits RegistryLimits, shutdown_file String, config_path String, auth RegistryAuth) {
+  def init(listen RegistryListen, data_dir String, db_path String, store RegistryStore, limits RegistryLimits, shutdown_file String, config_path String, auth RegistryAuth, observability ObservabilityConfig) {
     self.listen = listen
     self.data_dir = data_dir
     self.db_path = db_path
@@ -80,6 +80,7 @@ class RegistryConfig {
     self.shutdown_file = shutdown_file
     self.config_path = config_path
     self.auth = auth
+    self.observability = observability
   }
 }
 
@@ -110,6 +111,19 @@ def default_auth() RegistryAuth {
   return RegistryAuth.new(false, "", default_auth_service, default_auth_issuer, default_token_ttl, [], "")
 }
 
+// T2.18: what the service logs and exports. Both default on; an operator can
+// silence either without a rebuild.
+class ObservabilityConfig {
+  def init(access_log Bool, metrics Bool) {
+    self.access_log = access_log
+    self.metrics = metrics
+  }
+}
+
+def default_observability() ObservabilityConfig {
+  return ObservabilityConfig.new(true, true)
+}
+
 def cfg_error(path String, message String) String {
   return "registry: " + path + ": " + message
 }
@@ -123,7 +137,8 @@ def defaults(config_path String) RegistryConfig {
     RegistryLimits.new(default_max_body_bytes, default_max_header_bytes, default_read_timeout, default_idle_timeout),
     "",
     config_path,
-    default_auth()
+    default_auth(),
+    default_observability()
   )
 }
 
@@ -221,8 +236,14 @@ def from_yaml(doc yaml.Yaml, path String) (R, RegistryConfig) {
             (R.ok, auth) then { config = with_auth(config, auth) }
           }
         }
+        "observability" then {
+          case parse_observability(value, path) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, obs) then { config = with_observability(config, obs) }
+          }
+        }
         _ then {
-          return (R.error, cfg_error(path, key + ": unknown field (known: listen, data_dir, db_path, store, limits, shutdown_file, auth)"))
+          return (R.error, cfg_error(path, key + ": unknown field (known: listen, data_dir, db_path, store, limits, shutdown_file, auth, observability)"))
         }
       }
       i = i + 1
@@ -687,7 +708,30 @@ def apply_env(config RegistryConfig, env src.settings.EnvSource) (R, RegistryCon
     }
     (R.error, _) then { }
   }
-  const merged = RegistryConfig.new(listen, data_dir, db_path, store, limits, shutdown_file, config.config_path, auth)
+  var observability = config.observability
+  case env.getenv("POKERFACE_REGISTRY_ACCESS_LOG") {
+    (R.ok, v) then {
+      if v != "" {
+        case parse_bool_env("POKERFACE_REGISTRY_ACCESS_LOG", v) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, b) then { observability = ObservabilityConfig.new(b, observability.metrics) }
+        }
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_METRICS") {
+    (R.ok, v) then {
+      if v != "" {
+        case parse_bool_env("POKERFACE_REGISTRY_METRICS", v) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, b) then { observability = ObservabilityConfig.new(observability.access_log, b) }
+        }
+      }
+    }
+    (R.error, _) then { }
+  }
+  const merged = RegistryConfig.new(listen, data_dir, db_path, store, limits, shutdown_file, config.config_path, auth, observability)
   return validate(merged)
 }
 
@@ -801,7 +845,7 @@ def validate(config RegistryConfig) (R, RegistryConfig) {
   if realm != config.auth.realm {
     auth = RegistryAuth.new(config.auth.enabled, realm, config.auth.service, config.auth.issuer, config.auth.token_ttl, config.auth.users, config.auth.signing_key)
   }
-  return (R.ok, RegistryConfig.new(config.listen, config.data_dir, db_path, config.store, config.limits, shutdown_file, config.config_path, auth))
+  return (R.ok, RegistryConfig.new(config.listen, config.data_dir, db_path, config.store, config.limits, shutdown_file, config.config_path, auth, config.observability))
 }
 
 // The auth section: strict fields, the users list, and secret-file reads.
@@ -986,7 +1030,43 @@ def trim_secret(text String) String {
 }
 
 def with_auth(config RegistryConfig, auth RegistryAuth) RegistryConfig {
-  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path, auth)
+  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path, auth, config.observability)
+}
+
+def parse_observability(value yaml.Yaml, path String) (R, ObservabilityConfig) {
+  if value.is(yaml.YamlObject) {
+    var access_log = true
+    var metrics = true
+    const entries = value.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, v) = entries[i]
+      case key {
+        "access_log" then {
+          case bool_value(v, path, "observability.access_log") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, b) then { access_log = b }
+          }
+        }
+        "metrics" then {
+          case bool_value(v, path, "observability.metrics") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, b) then { metrics = b }
+          }
+        }
+        _ then {
+          return (R.error, cfg_error(path, "observability." + key + ": unknown field (known: access_log, metrics)"))
+        }
+      }
+      i = i + 1
+    }
+    return (R.ok, ObservabilityConfig.new(access_log, metrics))
+  }
+  return (R.error, cfg_error(path, "observability: expected a mapping"))
+}
+
+def with_observability(config RegistryConfig, observability ObservabilityConfig) RegistryConfig {
+  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path, config.auth, observability)
 }
 
 def validate_s3(s3 S3Settings, path String) (R, Bool) {
@@ -1038,27 +1118,27 @@ def in_array(items Array[String], wanted String) Bool {
 
 // Small rebuilders keep RegistryConfig immutable without a mutable builder.
 def with_listen(config RegistryConfig, listen RegistryListen) RegistryConfig {
-  return RegistryConfig.new(listen, config.data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path, config.auth)
+  return RegistryConfig.new(listen, config.data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path, config.auth, config.observability)
 }
 
 def with_data_dir(config RegistryConfig, data_dir String) RegistryConfig {
-  return RegistryConfig.new(config.listen, data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path, config.auth)
+  return RegistryConfig.new(config.listen, data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path, config.auth, config.observability)
 }
 
 def with_db_path(config RegistryConfig, db_path String) RegistryConfig {
-  return RegistryConfig.new(config.listen, config.data_dir, db_path, config.store, config.limits, config.shutdown_file, config.config_path, config.auth)
+  return RegistryConfig.new(config.listen, config.data_dir, db_path, config.store, config.limits, config.shutdown_file, config.config_path, config.auth, config.observability)
 }
 
 def with_store(config RegistryConfig, store RegistryStore) RegistryConfig {
-  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, store, config.limits, config.shutdown_file, config.config_path, config.auth)
+  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, store, config.limits, config.shutdown_file, config.config_path, config.auth, config.observability)
 }
 
 def with_limits(config RegistryConfig, limits RegistryLimits) RegistryConfig {
-  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, limits, config.shutdown_file, config.config_path, config.auth)
+  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, limits, config.shutdown_file, config.config_path, config.auth, config.observability)
 }
 
 def with_shutdown_file(config RegistryConfig, shutdown_file String) RegistryConfig {
-  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, config.limits, shutdown_file, config.config_path, config.auth)
+  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, config.limits, shutdown_file, config.config_path, config.auth, config.observability)
 }
 
 // Never renders the S3 secret (or the access key id) — the summary goes to
@@ -1100,5 +1180,14 @@ def summary(config RegistryConfig) String {
     + " idle_timeout=" + config.limits.idle_timeout.to_string()
     + " shutdown_file=" + config.shutdown_file
     + " auth=" + auth_summary(config.auth)
+    + " access_log=" + switch_text(config.observability.access_log)
+    + " metrics=" + switch_text(config.observability.metrics)
   )
+}
+
+def switch_text(on Bool) String {
+  if on {
+    return "on"
+  }
+  return "off"
 }

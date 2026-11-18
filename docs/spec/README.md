@@ -28,6 +28,7 @@
 | [registry-resolve.md](registry-resolve.md) | The /api/v1/resolve metadata endpoint: digest, media type, platforms, revision annotation, pull-scope auth (M2/T2.13). | `registry/resolve.emo` |
 | [registry-cache.md](registry-cache.md) | ETag/If-None-Match, immutable blob caching, short tag-manifest caching, CDN behavior (M2/T2.15). | `registry/cache.emo` |
 | [registry-tags.md](registry-tags.md) | Tag listing in lexical order with n/last pagination and rel=next links (M2/T2.16). | `registry/tags.emo` |
+| [registry-metrics.md](registry-metrics.md) | slog JSON access/audit logs, SQLite-backed Prometheus counters and latency histogram, /metrics (M2/T2.18). | `registry/metrics.emo`, `registry/router.emo` |
 
 ## M1 flow
 

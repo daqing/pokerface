@@ -1206,7 +1206,8 @@ def test_the_router_dispatches_the_upload_methods() {
         registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
         "/tmp/pf-uploads-router/shutdown",
         "<test>",
-    registry.config.default_auth())
+    registry.config.default_auth(),
+    registry.config.ObservabilityConfig.new(false, false))
       const sessions = FakeSessions.new()
       sessions.use_files(tmp_root("router-parts"))
       const links = UploadFakeLinks.new()
@@ -1219,7 +1220,8 @@ def test_the_router_dispatches_the_upload_methods() {
         UploadFakeManifests.new(),
         sessions,
         UploadFakeWriter.new(),
-    UploadFakeTags.new())
+    UploadFakeTags.new(),
+    UploadFakeMetricsSink.new())
       const opened = registry.router.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), service)
       expect_equal(202, opened.status)
       expect_equal("registry/2.0", header_value(opened.headers, "docker-distribution-api-version"))
@@ -1302,5 +1304,17 @@ class UploadFakeTags {
 
   def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
     return (R.ok, registry.tags.TagPage.new(true, [], false))
+  }
+}
+
+class UploadFakeMetricsSink {
+  def init() {
+  }
+
+  def record(stats registry.metrics.RequestStats) Void {
+  }
+
+  def render() String {
+    return "# TYPE pokerface_requests_total counter\npokerface_requests_total 0\n"
   }
 }

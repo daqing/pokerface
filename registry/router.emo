@@ -7,9 +7,11 @@
 // probe, and the health endpoints are checked before the catch-all.
 
 require "httpd"
+require "time"
+require "slog"
 
 class Service {
-  def init(config registry.config.RegistryConfig, db registry.health.DbHealth, blob registry.blobstore.BlobHealth, blob_store registry.blobstore.BlobStore, blob_links registry.blobs.BlobLinks, manifests registry.manifests.ManifestStore, uploads registry.uploads.UploadSessions, manifest_writer registry.manifests.ManifestWriter, tags registry.tags.TagList) {
+  def init(config registry.config.RegistryConfig, db registry.health.DbHealth, blob registry.blobstore.BlobHealth, blob_store registry.blobstore.BlobStore, blob_links registry.blobs.BlobLinks, manifests registry.manifests.ManifestStore, uploads registry.uploads.UploadSessions, manifest_writer registry.manifests.ManifestWriter, tags registry.tags.TagList, metrics registry.metrics.Sink) {
     self.config = config
     self.db = db
     self.blob = blob
@@ -19,11 +21,76 @@ class Service {
     self.uploads = uploads
     self.manifest_writer = manifest_writer
     self.tags = tags
+    self.metrics = metrics
   }
 }
 
+// The structured logger: JSON lines on stdout, one per record. Created per
+// call — the handle is just a name string, and httpd's per-connection
+// processes share nothing anyway.
+def logger_handle() String {
+  return slog.new("registry", slog.level_info(), slog.format_json())
+}
+
 def handle(req httpd.Request, service Service) httpd.Response {
-  return registry.api.decorate(route(req, service), registry.api.request_id(req))
+  const started_ms = time.now().unix_ms()
+  const id = registry.api.request_id(req)
+  const response = registry.api.decorate(route(req, service), id)
+  observe(req, service, response, id, time.now().unix_ms() - started_ms)
+  return response
+}
+
+// T2.18: one slog JSON access line per request (ts, id, method, path,
+// status, durations, byte counts — never the query, headers, or bodies, so
+// no token or presigned signature can leak) plus the metrics bumps, plus an
+// audit line for every authentication failure. Best effort by construction:
+// the handlers answered already, and a failing metrics write would end this
+// connection process only after the response was built.
+def observe(req httpd.Request, service Service, response httpd.Response, id String, duration_ms Int64) {
+  const attrs = Map.new()
+  attrs.set("ts", time.of_ms(time.now().unix_ms()).format_iso())
+  attrs.set("id", id)
+  attrs.set("method", req.method)
+  attrs.set("path", req.path)
+  attrs.set("status", response.status.to_string())
+  attrs.set("duration_ms", duration_ms.to_string())
+  attrs.set("bytes_in", req.body.to_bytes().length().to_string())
+  attrs.set("bytes_out", response.body.to_bytes().length().to_string())
+  if service.config.observability.access_log {
+    slog.info(logger_handle(), "request", attrs)
+  }
+  if service.config.observability.metrics {
+    service.metrics.record(registry.metrics.RequestStats.new(
+      route_kind(req.path, req.method), req.method, response.status,
+      req.body.to_bytes().length(), response.body.to_bytes().length(), duration_ms))
+  }
+}
+
+// The route family the metrics and logs group by: upload, blob, manifest,
+// auth, health, metadata, or other.
+def route_kind(path String, method String) String {
+  if path == "/token" {
+    return "auth"
+  }
+  if registry.uploads.is_route(path) {
+    return "upload"
+  }
+  if registry.blobs.is_route(path) {
+    return "blob"
+  }
+  if registry.manifests.is_route(path) {
+    return "manifest"
+  }
+  if registry.tags.is_route(path) {
+    return "tags"
+  }
+  if registry.resolve.is_route(path) {
+    return "metadata"
+  }
+  if path == "/healthz" || path == "/readyz" || path == "/metrics" {
+    return "health"
+  }
+  return "other"
 }
 
 def route(req httpd.Request, service Service) httpd.Response {
@@ -45,6 +112,7 @@ def route(req httpd.Request, service Service) httpd.Response {
       }
       case registry.auth.check_token(req, service.config.auth, kind, repository, action, registry.db.now_seconds()) {
         (R.error, why) then {
+          audit_auth_failure(req, why)
           return registry.auth.unauthorized(service.config.auth, scope, registry.auth.error_class(why), why)
         }
         (R.ok, _) then { }
@@ -71,10 +139,28 @@ def route(req httpd.Request, service Service) httpd.Response {
     }
     return httpd.response(200, [("Content-Type", "application/json; charset=utf-8")], "{}")
   }
+  if req.path == "/metrics" {
+    if req.method != "GET" {
+      return registry.api.method_not_allowed("GET")
+    }
+    return httpd.response(200, [("Content-Type", "text/plain; version=0.0.4; charset=utf-8")], service.metrics.render())
+  }
   if req.path == "/healthz" || req.path == "/readyz" {
     return registry.health.handle_health(req, service.config, service.db, service.blob)
   }
   return registry.api.not_found(registry.api.code_name_unknown, "unknown route", req.method + " " + req.path)
+}
+
+// The audit trail: one slog JSON line per authentication failure, with the
+// reason (no secrets — the reasons name states, never credentials).
+def audit_auth_failure(req httpd.Request, why String) {
+  const attrs = Map.new()
+  attrs.set("ts", time.of_ms(time.now().unix_ms()).format_iso())
+  attrs.set("event", "auth_failure")
+  attrs.set("method", req.method)
+  attrs.set("path", req.path)
+  attrs.set("reason", why)
+  slog.warn(logger_handle(), "auth failure", attrs)
 }
 
 // The resolve API authenticates against the repository in its query: pull
@@ -85,6 +171,7 @@ def resolve_route(req httpd.Request, service Service) httpd.Response {
       const repository = req.query.get("repository")
       case registry.auth.check_token(req, service.config.auth, "repository", repository, "pull", registry.db.now_seconds()) {
         (R.error, why) then {
+          audit_auth_failure(req, why)
           return registry.auth.unauthorized(service.config.auth,
             "repository:" + repository + ":pull", registry.auth.error_class(why), why)
         }
@@ -93,6 +180,7 @@ def resolve_route(req httpd.Request, service Service) httpd.Response {
     } else {
       case registry.auth.check_token(req, service.config.auth, "probe", "", "", registry.db.now_seconds()) {
         (R.error, why) then {
+          audit_auth_failure(req, why)
           return registry.auth.unauthorized(service.config.auth, "", registry.auth.error_class(why), why)
         }
         (R.ok, _) then { }

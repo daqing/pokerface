@@ -72,6 +72,13 @@ def migrations() Array[Migration] {
     // Sessions created before this migration answer 0.
     Migration.new(2, "upload chunk offsets", [
       "ALTER TABLE uploads ADD COLUMN offset_bytes INTEGER NOT NULL DEFAULT 0"
+    ]),
+    // T2.18: Prometheus counters. One row per series; request processes bump
+    // values with UPSERTs inside one short transaction per request.
+    Migration.new(3, "metrics counters", [
+      "CREATE TABLE IF NOT EXISTS metrics ("
+        + "name TEXT PRIMARY KEY, "
+        + "value INTEGER NOT NULL)"
     ])
   ]
 }
@@ -670,6 +677,38 @@ class Database {
     stmt.step()
     stmt.finalize()
     return self.handle.changes()
+  }
+
+  // Bumps counter series in one transaction (T2.18). An (R, …) answer is
+  // not needed: a metrics write failure must not fail the request — the
+  // caller treats this as best effort and a raise ends the request process,
+  // which httpd replaces with the next connection.
+  def bump_metrics(entries Array[(String, Int64)]) {
+    self.begin()
+    var i = 0
+    while i < entries.length() {
+      const (name, delta) = entries[i]
+      const stmt = self.handle.prepare(
+        "INSERT INTO metrics (name, value) VALUES (?1, ?2) "
+          + "ON CONFLICT(name) DO UPDATE SET value = value + excluded.value")
+      stmt.bind_text(1, name)
+      stmt.bind_int(2, delta)
+      stmt.step()
+      stmt.finalize()
+      i = i + 1
+    }
+    self.commit()
+  }
+
+  // The counter series and their values, name-ordered.
+  def list_metrics() Array[(String, Int64)] {
+    const stmt = self.handle.prepare("SELECT name, value FROM metrics ORDER BY name")
+    var out = []
+    while stmt.step() {
+      out = out.append((stmt.column_text(0), stmt.column_int(1)))
+    }
+    stmt.finalize()
+    return out
   }
 
   // The T2.10 session view: the state plus the repository's NAME ("" / "" for
