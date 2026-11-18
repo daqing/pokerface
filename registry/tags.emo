@@ -1,0 +1,124 @@
+// T2.16: `GET /v2/<name>/tags/list` — the repository's tags in lexical
+// order, with `n` / `last` pagination and a `Link: <…>; rel="next"` header
+// when a page is full and more tags follow. A tag update is visible on the
+// next page request by construction: the query reads the live table.
+//
+// The `last` parameter is a tag VALUE (not an index): the page starts after
+// it, exclusively. `n=0` answers an empty list with no Link. A repository
+// that does not exist answers `404 NAME_UNKNOWN`; an existing repository
+// with no tags answers an empty list. Unknown query parameters are refused
+// and a non-numeric or negative `n` is `400 TAG_INVALID`.
+// Spec: docs/spec/registry-tags.md.
+
+require "httpd"
+require "json"
+
+const route_suffix = "/tags/list"
+const default_page_size = 100
+
+class TagPage {
+  def init(exists Bool, tags Array[String], more Bool) {
+    self.exists = exists
+    self.tags = tags
+    self.more = more
+  }
+}
+
+interface TagList {
+  def page(repository String, last String, limit Int64) (R, TagPage)
+}
+
+// SQLite-backed pages. The database is opened and closed per request —
+// httpd runs one process per connection.
+class DbTagList {
+  def init(db_path String) {
+    self.db_path = db_path
+  }
+
+  def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
+    const db = registry.db.connect(self.db_path)
+    const repository_id = db.repository_id(repository)
+    if repository_id == 0 {
+      db.close()
+      return (R.ok, TagPage.new(false, [], false))
+    }
+    const result = db.list_tags_page(repository_id, last, limit)
+    db.close()
+    const (tags, more) = result
+    return (R.ok, TagPage.new(true, tags, more))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Routing.
+
+def is_route(path String) Bool {
+  if !path.starts_with("/v2/") {
+    return false
+  }
+  return path.index_of(route_suffix) >= 0 && path.index_of(route_suffix) + route_suffix.length() == path.length()
+}
+
+// "/v2/acme/app/tags/list" → "acme/app"; "" when the shape is not ours.
+def split(path String) String {
+  if !path.starts_with("/v2/") {
+    return ""
+  }
+  const at = path.index_of(route_suffix)
+  if at <= 4 {
+    return ""
+  }
+  return path.substring(4, at - 4)
+}
+
+def handle(req httpd.Request, list TagList) httpd.Response {
+  if req.method != "GET" {
+    return registry.api.method_not_allowed("GET")
+  }
+  const repository = split(req.path)
+  if repository == "" {
+    return registry.api.not_found(registry.api.code_name_unknown, "unknown route", req.path)
+  }
+  var limit = default_page_size
+  var asked_for_limit = false
+  if req.query.has("n") {
+    asked_for_limit = true
+    const text = req.query.get("n")
+    if !registry.blobstore.all_digits(text) {
+      return registry.api.bad_request(registry.api.code_tag_invalid, "invalid page size", text)
+    }
+    limit = text.to_int64()
+    if limit < 0 {
+      return registry.api.bad_request(registry.api.code_tag_invalid, "invalid page size", text)
+    }
+  }
+  var last = ""
+  if req.query.has("last") {
+    last = req.query.get("last")
+  }
+  case list.page(repository, last, limit) {
+    (R.error, why) then { return registry.api.server_error("tag listing failed", why) }
+    (R.ok, result) then {
+      if !result.exists {
+        return registry.api.not_found(registry.api.code_name_unknown, "repository name not known", repository)
+      }
+      var tag_values = []
+      var i = 0
+      while i < result.tags.length() {
+        tag_values = tag_values.append(json.string(result.tags[i]))
+        i = i + 1
+      }
+      const body = json.encode(json.object([
+        ("name", json.string(repository)),
+        ("tags", json.array(tag_values))
+      ]))
+      var headers = [("Content-Type", "application/json; charset=utf-8")]
+      if asked_for_limit && result.more && result.tags.length() > 0 {
+        const next_last = result.tags[result.tags.length() - 1]
+        headers = headers.append(("Link", "</v2/" + repository + route_suffix + "?n="
+          + limit.to_string() + "&last=" + next_last + ">; rel=\"next\""))
+      }
+      return httpd.response(200, headers, body)
+    }
+  }
+}

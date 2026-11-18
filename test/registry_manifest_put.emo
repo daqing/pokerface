@@ -470,8 +470,8 @@ def test_the_router_dispatches_manifest_put() {
         links,
         FakeStore.new([]),
         PutFakeUploads.new(),
-        FakeWriter.new()
-      )
+        FakeWriter.new(),
+    PutFakeTags.new())
       const body = manifest_body()
       const response = registry.router.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, body), service)
       expect_equal(201, response.status)
@@ -547,4 +547,13 @@ def tmp_root(name String) String {
     base = base + "/"
   }
   return base + "pokerface-registry-manifest-put-" + os.getpid().to_string() + "-" + name
+}
+
+class PutFakeTags {
+  def init() {
+  }
+
+  def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
+    return (R.ok, registry.tags.TagPage.new(true, [], false))
+  }
 }

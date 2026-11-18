@@ -1218,8 +1218,8 @@ def test_the_router_dispatches_the_upload_methods() {
         links,
         UploadFakeManifests.new(),
         sessions,
-        UploadFakeWriter.new()
-      )
+        UploadFakeWriter.new(),
+    UploadFakeTags.new())
       const opened = registry.router.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), service)
       expect_equal(202, opened.status)
       expect_equal("registry/2.0", header_value(opened.headers, "docker-distribution-api-version"))
@@ -1293,5 +1293,14 @@ class UploadFakeWriter {
 
   def tag(repository String, tag String, digest String) (R, Bool) {
     return (R.ok, true)
+  }
+}
+
+class UploadFakeTags {
+  def init() {
+  }
+
+  def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
+    return (R.ok, registry.tags.TagPage.new(true, [], false))
   }
 }

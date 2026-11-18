@@ -27,6 +27,7 @@
 | [registry-auth.md](registry-auth.md) | Bearer tokens (HS256 JWT), scopes, the /token exchange, WWW-Authenticate challenges, auth config (M2/T2.14). | `registry/auth.emo`, `registry/config.emo` |
 | [registry-resolve.md](registry-resolve.md) | The /api/v1/resolve metadata endpoint: digest, media type, platforms, revision annotation, pull-scope auth (M2/T2.13). | `registry/resolve.emo` |
 | [registry-cache.md](registry-cache.md) | ETag/If-None-Match, immutable blob caching, short tag-manifest caching, CDN behavior (M2/T2.15). | `registry/cache.emo` |
+| [registry-tags.md](registry-tags.md) | Tag listing in lexical order with n/last pagination and rel=next links (M2/T2.16). | `registry/tags.emo` |
 
 ## M1 flow
 

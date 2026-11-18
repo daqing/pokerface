@@ -240,7 +240,7 @@ def test_the_router_dispatches_manifest_routes() {
     "/tmp/pf-manifests-router/shutdown",
     "<test>",
     registry.config.default_auth())
-  const service = registry.router.Service.new(config, ManifestFakeDb.new(), ManifestFakeBlob.new(), ManifestFakeBlobStore.new(), ManifestFakeBlobLinks.new(), store, ManifestFakeUploads.new(), ManifestFakeWriter.new())
+  const service = registry.router.Service.new(config, ManifestFakeDb.new(), ManifestFakeBlob.new(), ManifestFakeBlobStore.new(), ManifestFakeBlobLinks.new(), store, ManifestFakeUploads.new(), ManifestFakeWriter.new(), ManifestFakeTags.new())
   const response = registry.router.handle(make_request("GET", "/v2/acme/app/manifests/latest"), service)
   expect_equal(200, response.status)
   expect_equal(body, response.body)
@@ -351,5 +351,14 @@ class ManifestFakeWriter {
 
   def tag(repository String, tag String, digest String) (R, Bool) {
     return (R.ok, true)
+  }
+}
+
+class ManifestFakeTags {
+  def init() {
+  }
+
+  def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
+    return (R.ok, registry.tags.TagPage.new(true, [], false))
   }
 }

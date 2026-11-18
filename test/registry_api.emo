@@ -180,7 +180,7 @@ def make_request_with(method String, path String, headers Array[(String, String)
 }
 
 def make_service(name String) registry.router.Service {
-  return registry.router.Service.new(make_config(name), ApiFakeDb.new(true), ApiFakeBlob.new(true), ApiFakeBlobStore.new(), ApiFakeBlobLinks.new(), ApiFakeManifests.new(), ApiFakeUploads.new(), ApiFakeWriter.new())
+  return registry.router.Service.new(make_config(name), ApiFakeDb.new(true), ApiFakeBlob.new(true), ApiFakeBlobStore.new(), ApiFakeBlobLinks.new(), ApiFakeManifests.new(), ApiFakeUploads.new(), ApiFakeWriter.new(), ApiFakeTags.new())
 }
 
 def route(method String, path String) httpd.Response {
@@ -283,10 +283,10 @@ def test_method_mismatch_is_405_with_allow_and_an_oci_error() {
 }
 
 def test_unknown_routes_are_oci_404s() {
-  const response = route("GET", "/v2/acme/app/tags/list")
+  const response = route("GET", "/v2/acme/app/unknown/list")
   expect_equal(404, response.status)
   expect_equal(api.code_name_unknown, error_field(response.body, "code"))
-  expect_equal("GET /v2/acme/app/tags/list", error_field(response.body, "detail"))
+  expect_equal("GET /v2/acme/app/unknown/list", error_field(response.body, "detail"))
   expect_true(header_value(response.headers, "content-type").index_of("application/json") >= 0)
   const plain = route("GET", "/nope")
   expect_equal(404, plain.status)
@@ -361,4 +361,13 @@ def test_common_headers_are_added_once() {
   expect_equal("GET", allow)
   expect_equal(1, header_count(response.headers, "x-request-id"))
   expect_equal(1, header_count(response.headers, "docker-distribution-api-version"))
+}
+
+class ApiFakeTags {
+  def init() {
+  }
+
+  def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
+    return (R.ok, registry.tags.TagPage.new(true, [], false))
+  }
 }

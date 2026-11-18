@@ -489,7 +489,7 @@ def res_config(auth_enabled Bool) registry.config.RegistryConfig {
 
 def res_service(auth_enabled Bool) registry.router.Service {
   const body = manifest_with_revision("0123abcd")
-  return registry.router.Service.new(res_config(auth_enabled), ResFakeDb.new(), ResFakeHealth.new(), ResFakeStore.new(), ResFakeLinks.new(), ResFakeManifests.new(manifest_payload(body)), ResFakeUploads.new(), ResFakeWriter.new())
+  return registry.router.Service.new(res_config(auth_enabled), ResFakeDb.new(), ResFakeHealth.new(), ResFakeStore.new(), ResFakeLinks.new(), ResFakeManifests.new(manifest_payload(body)), ResFakeUploads.new(), ResFakeWriter.new(), ResFakeTags.new())
 }
 
 def bearer_request(query Map[String, String], token String) httpd.Request {
@@ -537,4 +537,13 @@ def test_the_router_challenges_resolve_with_auth_enabled() {
   const ok = registry.router.handle(bearer_request(tag_query("acme/app", "v1"), res_token("repository:acme/app:pull")), service)
   expect_equal(200, ok.status)
   expect_equal("0123abcd", field_of(ok.body, "revision"))
+}
+
+class ResFakeTags {
+  def init() {
+  }
+
+  def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
+    return (R.ok, registry.tags.TagPage.new(true, [], false))
+  }
 }

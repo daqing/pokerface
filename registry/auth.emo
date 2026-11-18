@@ -337,6 +337,9 @@ def required_access(path String, method String) (String, String, String) {
   if registry.blobs.is_route(path) {
     return ("repository", blobs_repository(path), "pull")
   }
+  if registry.tags.is_route(path) {
+    return ("repository", tags_repository(path), "pull")
+  }
   return ("public", "", "")
 }
 
@@ -355,6 +358,10 @@ def manifests_repository(path String) String {
 def blobs_repository(path String) String {
   const parts = registry.blobs.split(path)
   return parts[0]
+}
+
+def tags_repository(path String) String {
+  return registry.tags.split(path)
 }
 
 def bearer_token(req httpd.Request) String {

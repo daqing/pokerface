@@ -489,6 +489,34 @@ class Database {
     return out
   }
 
+  // The T2.16 page: tags after `last` (exclusive; "" starts at the first) in
+  // lexical order, at most `limit` of them, and whether more exist — one
+  // extra row is fetched to answer that without a second query.
+  def list_tags_page(repository_id Int64, last String, limit Int64) (Array[String], Bool) {
+    const stmt = self.handle.prepare(
+      "SELECT tag FROM tags WHERE repository_id = ?1 AND tag > ?2 ORDER BY tag LIMIT ?3")
+    stmt.bind_int(1, repository_id)
+    stmt.bind_text(2, last)
+    stmt.bind_int(3, limit + 1)
+    var fetched = []
+    while stmt.step() {
+      fetched = fetched.append(stmt.column_text(0))
+    }
+    stmt.finalize()
+    var more = false
+    if fetched.length() > limit {
+      more = true
+      var out = []
+      var i = 0
+      while i < limit {
+        out = out.append(fetched[i])
+        i = i + 1
+      }
+      return (out, true)
+    }
+    return (fetched, more)
+  }
+
   def delete_tag(repository_id Int64, tag String) Bool {
     const stmt = self.handle.prepare(
       "DELETE FROM tags WHERE repository_id = ?1 AND tag = ?2")

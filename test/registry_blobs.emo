@@ -320,7 +320,8 @@ def test_the_router_dispatches_blob_routes() {
     local_store_exists(),
     FakeLinks.new(true, 5, ""),
     BlobFakeManifests.new(),
-    BlobFakeUploads.new(), BlobFakeWriter.new())
+    BlobFakeUploads.new(), BlobFakeWriter.new(),
+    BlobFakeTags.new())
   const response = registry.router.handle(make_request("GET", "/v2/acme/app/blobs/" + digest_value), service)
   expect_equal(200, response.status)
   expect_equal("hello", response.body)
@@ -398,5 +399,14 @@ class BlobFakeWriter {
 
   def tag(repository String, tag String, digest String) (R, Bool) {
     return (R.ok, true)
+  }
+}
+
+class BlobFakeTags {
+  def init() {
+  }
+
+  def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
+    return (R.ok, registry.tags.TagPage.new(true, [], false))
   }
 }

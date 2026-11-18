@@ -361,7 +361,7 @@ Exit criteria:
 | [x] | T2.13 | Resolve / metadata API | T2.8, T2.12 | 2h |
 | [x] | T2.14 | Authentication and token service | T2.7 | 3-4h |
 | [x] | T2.15 | Cache headers, ETag, and CDN behavior | T2.8, T2.9 | 2h |
-| [ ] | T2.16 | Tag listing and pagination | T2.12 | 2h |
+| [x] | T2.16 | Tag listing and pagination | T2.12 | 2h |
 | [ ] | T2.17 | Deployment: registry + MinIO + Caddy | T2.6, T2.14 | 3h |
 | [ ] | T2.18 | Observability and audit logging | T2.1 | 2-3h |
 | [ ] | T2.19 | Protocol smoke and conformance tests | T2.1-T2.18 | 3h |
@@ -565,6 +565,8 @@ Suggested tables:
 **Acceptance**: An empty repository returns an empty list; pagination boundaries are correct; a missing `last` starts from a sensible position; pull permission is required; the response follows the OCI spec.
 
 **Depends on**: T2.12 · **Estimate**: 2h
+
+> **Notes** (2026-11-19, ~1.5h): Done. New `registry/tags.emo` serves `GET /v2/<name>/tags/list`: the tags in lexical order (`ORDER BY tag` in the new `db.list_tags_page`, which fetches limit+1 rows to answer the more-flag without a second query), `{"name","tags"}` JSON, `n` / `last` pagination where `last` is a tag **value** the page starts after exclusively, and `Link: </v2/<name>/tags/list?n=<n>&last=<last>; rel="next"` on a full page with more tags (relative URI-reference; the last page and any listing without `n` carry no Link). `n=0` answers an empty list with no Link; a non-numeric/negative `n` is 400 `TAG_INVALID`; a missing repository is 404 `NAME_UNKNOWN`; an existing repository without tags answers an empty list; other methods 405. The query reads the live table, so tag updates are visible on the next page by construction. Auth rides the gate: the listing needs `repository:<name>:pull` (added to `required_access`). Service gained `tags TagList` (interface + `DbTagList`), so the seven router-test files gained a tags fake. Tests: 16 in `test/registry_tags.emo` (shapes, full listing, empty/missing repository, page boundaries with the Link format, tail page, `n=0`, invalid `n`, methods, auth 401/pass legs) + 8 db_selftest checks pinning the SQL semantics (lexical order, exclusive `last`, more flag, empty page); `emo test` 481/481, db selftest 122/122. Manually verified over the wire: five tags listed lexically, `?n=2` carries the exact Link, `?n=2&last=v2` answers `v3,v4`. Gotchas: Emo has no string-ordering operators — the fake pages by locating `last` by equality (the SQL handles the general case), and the T2.7 unknown-route example happened to be `/tags/list`, now a real route.
 
 #### T2.17 Deployment: Registry + MinIO + Caddy
 

@@ -361,7 +361,7 @@ images:
 | [x] | T2.13 | 解析 / 元数据 API | T2.8、T2.12 | 2h |
 | [x] | T2.14 | 认证与 Token 服务 | T2.7 | 3-4h |
 | [x] | T2.15 | 缓存头、ETag 与 CDN 行为 | T2.8、T2.9 | 2h |
-| [ ] | T2.16 | Tag 列表与分页 | T2.12 | 2h |
+| [x] | T2.16 | Tag 列表与分页 | T2.12 | 2h |
 | [ ] | T2.17 | 部署编排：Registry + MinIO + Caddy | T2.6、T2.14 | 3h |
 | [ ] | T2.18 | 可观测性与审计 | T2.1 | 2-3h |
 | [ ] | T2.19 | 协议冒烟与一致性测试 | T2.1-T2.18 | 3h |
@@ -565,6 +565,8 @@ images:
 **验收**：空仓库返回空列表；分页边界正确；`last` 不存在时从合理位置开始；需要 pull 权限；响应符合 OCI 规范。
 
 **依赖**：T2.12 · **预估**：2h
+
+> **备注**（2026-11-19，约 1.5h）：已完成。新增 `registry/tags.emo` 提供 `GET /v2/<name>/tags/list`：tag 按字典序（新的 `db.list_tags_page` 用 `ORDER BY tag`，多取一行以回答 more 标志，无需二次查询），返回 `{"name","tags"}` JSON，`n` / `last` 分页中 `last` 是页起点之后**排他**的 tag **值**，满页且还有更多时带 `Link: </v2/<name>/tags/list?n=<n>&last=<last>; rel="next"`（相对 URI 引用；末页与不带 `n` 的全量列表无 Link）。`n=0` 返回空列表且无 Link；非数字/负数 `n` 是 400 `TAG_INVALID`；仓库不存在是 404 `NAME_UNKNOWN`；存在但无 tag 返回空列表；其他方法 405。查询读实时表，tag 更新天然在下一次分页可见。认证走 gate：列表需要 `repository:<name>:pull`（已加入 `required_access`）。Service 增加 `tags TagList`（接口 + `DbTagList`），七个路由测试文件同步加了 tags fake。测试：`test/registry_tags.emo` 16 例（路由形态、全量列表、空/缺失仓库、页边界与 Link 格式、末页、`n=0`、非法 `n`、方法、认证 401/通过分支）+ db_selftest 8 项钉死 SQL 语义（字典序、排他 `last`、more 标志、越过末尾的空页）；`emo test` 481/481，db selftest 122/122。实测：五个 tag 字典序列出，`?n=2` 带精确 Link，`?n=2&last=v2` 返回 `v3,v4`。踩坑：Emo 没有字符串排序运算符——fake 用等值定位 `last` 再切片（通用情形由 SQL 处理）；T2.7 的未知路由示例恰好是 `/tags/list`，如今成了真路由。
 
 #### T2.17 部署编排：Registry + MinIO + Caddy
 

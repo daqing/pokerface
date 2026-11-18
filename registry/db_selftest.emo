@@ -275,6 +275,24 @@ def check_manifest_writer(report Report, db registry.db.Database, path String) {
     (R.ok, _) then { report.text(db.tag_digest(repo, "v1"), digest, "the tag points at the digest") }
     (R.error, why) then { report.check(false, "tag write failed: " + why) }
   }
+  // The T2.16 page query: lexical order, exclusive `last`, the more flag.
+  db.put_tag(repo, "aaa", digest)
+  db.put_tag(repo, "mmm", digest)
+  db.put_tag(repo, "zzz", digest)
+  const page1 = db.list_tags_page(repo, "", 2)
+  report.text(page1[0][0], "aaa", "the first page starts lexically")
+  report.text(page1[0][1], "mmm", "the first page continues lexically")
+  report.check(page1[1], "a full page reports more")
+  const page2 = db.list_tags_page(repo, "mmm", 2)
+  report.text(page2[0][0], "v1", "the page after last skips it")
+  report.text(page2[0][1], "zzz", "the page continues lexically")
+  report.check(!page2[1], "the tail page reports no more")
+  const empty_page = db.list_tags_page(repo, "zzz", 2)
+  report.number(empty_page[0].length(), 0, "a page past the end is empty")
+  report.check(!empty_page[1], "an empty page reports no more")
+  db.delete_tag(repo, "aaa")
+  db.delete_tag(repo, "mmm")
+  db.delete_tag(repo, "zzz")
   var second = ""
   case writer.put("writer/check", "application/vnd.oci.image.index.v1+json", "{\"schemaVersion\":2}") {
     (R.ok, d) then { second = d }

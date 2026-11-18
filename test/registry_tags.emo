@@ -1,0 +1,478 @@
+// T2.16 tests for the tag listing route — run with `emo test`.
+//
+// The page source is a fake, so pagination boundaries, the Link header, and
+// the error paths run in the interpreter; the compiled db_selftest covers
+// the SQL page query (order, exclusivity, the more flag).
+
+const tags = registry.tags
+const api = registry.api
+
+require "httpd"
+require "json"
+
+class FakeTagList {
+  def init(exists Bool, all Array[String]) {
+    self.exists = Box.new(exists)
+    self.all = Box.new(all)
+  }
+
+  def page(repository String, last String, limit Int64) (R, registry.tags.TagPage) {
+    if !self.exists.read() {
+      return (R.ok, registry.tags.TagPage.new(false, [], false))
+    }
+    // The list arrives sorted; `last` is located by equality (Emo has no
+    // string-ordering operators) and the page slices after it.
+    const sorted = self.all.read()
+    var start = 0
+    if last != "" {
+      var i = 0
+      while i < sorted.length() {
+        if sorted[i] == last {
+          start = i + 1
+          break
+        }
+        i = i + 1
+      }
+    }
+    var more = false
+    var out = []
+    var j = 0
+    while j < sorted.length() {
+      if j >= start {
+        if out.length() < limit {
+          out = out.append(sorted[j])
+        } else {
+          more = true
+        }
+      }
+      j = j + 1
+    }
+    return (R.ok, registry.tags.TagPage.new(true, out, more))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers.
+
+def list_request(path String) httpd.Request {
+  return httpd.Request.new(
+    method: "GET",
+    target: path,
+    path: path,
+    query: Map.new(),
+    proto: "HTTP/1.1",
+    headers: [],
+    body: "",
+    params: Map.new()
+  )
+}
+
+def list_request_query(path String, query Map[String, String]) httpd.Request {
+  return httpd.Request.new(
+    method: "GET",
+    target: path,
+    path: path,
+    query: query,
+    proto: "HTTP/1.1",
+    headers: [],
+    body: "",
+    params: Map.new()
+  )
+}
+
+def query_pair(key String, value String) Map[String, String] {
+  const query = Map.new()
+  query.set(key, value)
+  return query
+}
+
+def field_of(body String, name String) String {
+  case json.decode(body) {
+    (R.error, _) then { return "" }
+    (R.ok, doc) then {
+      if doc.is(json.JsonObject) {
+        const entries = doc.entries()
+        var i = 0
+        while i < entries.length() {
+          const (key, value) = entries[i]
+          if key == name && value.is(json.JsonString) {
+            return value.as_string()
+          }
+          i = i + 1
+        }
+      }
+      return ""
+    }
+  }
+}
+
+def tags_of(body String) Array[String] {
+  case json.decode(body) {
+    (R.error, _) then { return [] }
+    (R.ok, doc) then {
+      if doc.is(json.JsonObject) {
+        const entries = doc.entries()
+        var i = 0
+        while i < entries.length() {
+          const (key, value) = entries[i]
+          if key == "tags" {
+            if value.is(json.JsonArray) {
+              const items = value.items()
+              var out = []
+              var j = 0
+              while j < items.length() {
+                if items[j].is(json.JsonString) {
+                  out = out.append(items[j].as_string())
+                }
+                j = j + 1
+              }
+              return out
+            }
+          }
+          i = i + 1
+        }
+      }
+      return []
+    }
+  }
+}
+
+def error_field(body String, field String) String {
+  case json.decode(body) {
+    (R.error, _) then { return "" }
+    (R.ok, doc) then { return scan_errors(doc, field) }
+  }
+}
+
+def scan_errors(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == "errors" {
+        if value.is(json.JsonArray) {
+          const items = value.items()
+          if items.length() > 0 {
+            return scan_member(items[0], field)
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+def scan_member(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == field {
+        if value.is(json.JsonString) {
+          return value.as_string()
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+def header_value(headers Array[(String, String)], name String) String {
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == name.lower() {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+// ---------------------------------------------------------------------------
+// The route shape.
+
+def test_route_shapes() {
+  expect_true(tags.is_route("/v2/acme/app/tags/list"))
+  expect_true(tags.is_route("/v2/acme/team/app/tags/list"))
+  expect_true(!tags.is_route("/v2/acme/app/manifests/latest"))
+  expect_true(!tags.is_route("/v2/acme/app/tags/listx"))
+  expect_equal("acme/team/app", tags.split("/v2/acme/team/app/tags/list"))
+  expect_equal("", tags.split("/v2/acme/app/manifests/latest"))
+}
+
+// ---------------------------------------------------------------------------
+// Listing and pagination.
+
+// The fake preserves its input order; the SQL ORDER BY is pinned in the
+// compiled db_selftest against a real database.
+def test_a_full_listing_passes_the_page_through() {
+  const source = FakeTagList.new(true, ["latest", "v1", "v10", "v2"])
+  const response = tags.handle(list_request("/v2/acme/app/tags/list"), source)
+  expect_equal(200, response.status)
+  expect_equal("acme/app", field_of(response.body, "name"))
+  const values = tags_of(response.body)
+  expect_equal(4, values.length())
+  expect_equal("latest", values[0])
+  expect_equal("v1", values[1])
+  expect_equal("v10", values[2])
+  expect_equal("v2", values[3])
+}
+
+def test_an_empty_repository_answers_an_empty_list() {
+  const response = tags.handle(list_request("/v2/acme/empty/tags/list"), FakeTagList.new(true, []))
+  expect_equal(200, response.status)
+  expect_equal(0, tags_of(response.body).length())
+  expect_equal("", header_value(response.headers, "link"))
+}
+
+def test_a_missing_repository_is_a_404() {
+  const response = tags.handle(list_request("/v2/nope/nope/tags/list"), FakeTagList.new(false, []))
+  expect_equal(404, response.status)
+  expect_equal(api.code_name_unknown, error_field(response.body, "code"))
+}
+
+def test_pagination_pages_after_last() {
+  const source = FakeTagList.new(true, ["a", "b", "c", "d", "e"])
+  const page1 = tags.handle(list_request_query("/v2/acme/app/tags/list", query_pair("n", "2")), source)
+  expect_equal(200, page1.status)
+  expect_equal(2, tags_of(page1.body).length())
+  expect_equal("a", tags_of(page1.body)[0])
+  expect_equal("b", tags_of(page1.body)[1])
+  const link = header_value(page1.headers, "link")
+  expect_true(link.index_of("</v2/acme/app/tags/list?n=2&last=b>") == 0)
+  expect_true(link.index_of("rel=\"next\"") > 0)
+  const page2 = tags.handle(list_request_query("/v2/acme/app/tags/list", query_pair("last", "b")), source)
+  expect_equal(200, page2.status)
+  const rest = tags_of(page2.body)
+  expect_equal(3, rest.length())
+  expect_equal("c", rest[0])
+  // The last full page carries no Link: everything is returned.
+  expect_equal("", header_value(page2.headers, "link"))
+}
+
+def test_pagination_on_the_last_page_has_no_link() {
+  const source = FakeTagList.new(true, ["a", "b", "c", "d", "e"])
+  const page = tags.handle(list_request_query("/v2/acme/app/tags/list?n=2", query_pair("n", "2")), source)
+  expect_true(header_value(page.headers, "link") != "")
+  const last_page = tags.handle(list_request_query("/v2/acme/app/tags/list", query_pair("last", "d")), source)
+  expect_equal(1, tags_of(last_page.body).length())
+  expect_equal("", header_value(last_page.headers, "link"))
+}
+
+def test_n_zero_answers_an_empty_list_without_a_link() {
+  const response = tags.handle(list_request_query("/v2/acme/app/tags/list", query_pair("n", "0")), FakeTagList.new(true, ["a", "b"]))
+  expect_equal(200, response.status)
+  expect_equal(0, tags_of(response.body).length())
+  expect_equal("", header_value(response.headers, "link"))
+}
+
+def test_an_invalid_n_is_a_400() {
+  const negative = tags.handle(list_request_query("/v2/acme/app/tags/list", query_pair("n", "-1")), FakeTagList.new(true, []))
+  expect_equal(400, negative.status)
+  expect_equal(api.code_tag_invalid, error_field(negative.body, "code"))
+  const words = tags.handle(list_request_query("/v2/acme/app/tags/list", query_pair("n", "ten")), FakeTagList.new(true, []))
+  expect_equal(400, words.status)
+}
+
+def test_listing_serves_get_only() {
+  const post = httpd.Request.new(
+    method: "POST",
+    target: "/v2/acme/app/tags/list",
+    path: "/v2/acme/app/tags/list",
+    query: Map.new(),
+    proto: "HTTP/1.1",
+    headers: [],
+    body: "",
+    params: Map.new()
+  )
+  const response = tags.handle(post, FakeTagList.new(true, []))
+  expect_equal(405, response.status)
+  expect_equal("GET", header_value(response.headers, "allow"))
+}
+
+// ---------------------------------------------------------------------------
+// Auth: the listing needs pull on the repository.
+
+class TagsFakeDb {
+  def init() {
+  }
+
+  def ping() Bool {
+    return true
+  }
+
+  def path() String {
+    return "/tmp/fake.db"
+  }
+}
+
+class TagsFakeHealth {
+  def init() {
+  }
+
+  def probe() (R, String) {
+    return (R.ok, "fs:/tmp/fake")
+  }
+}
+
+class TagsFakeLinks {
+  def init() {
+  }
+
+  def linked(repository String, digest String) (R, registry.blobs.BlobLink) {
+    return (R.ok, registry.blobs.absent_link())
+  }
+}
+
+class TagsFakeManifests {
+  def init() {
+  }
+
+  def lookup(repository String, reference String) (R, registry.manifests.ManifestPayload) {
+    return (R.ok, registry.manifests.absent_payload())
+  }
+}
+
+class TagsFakeWriter {
+  def init() {
+  }
+
+  def put(repository String, media_type String, body String) (R, String) {
+    return (R.ok, "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+  }
+
+  def tag(repository String, tag String, digest String) (R, Bool) {
+    return (R.ok, true)
+  }
+}
+
+class TagsFakeUploads {
+  def init() {
+  }
+
+  def start(repository String) (R, String) {
+    return (R.ok, "sess-1")
+  }
+
+  def lookup(id String) (R, registry.uploads.UploadSession) {
+    return (R.ok, registry.uploads.absent_session())
+  }
+
+  def append(id String, body String, start Int64, ranged Bool) (R, Int64) {
+    return (R.error, "fake: append")
+  }
+
+  def complete(id String, digest String, size Int64) (R, Bool) {
+    return (R.ok, true)
+  }
+
+  def cancel(id String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def part_path(id String) (R, String) {
+    return (R.ok, "/tmp/fake-part")
+  }
+}
+
+class TagsFakeStore {
+  def init() {
+  }
+
+  def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, 0, true))
+  }
+
+  def put_file(digest String, source String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put_file")
+  }
+
+  def get(digest String) (R, String) {
+    return (R.error, registry.blobstore.not_found(digest))
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    return (R.error, "fake: range")
+  }
+
+  def head(digest String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, -1, false))
+  }
+
+  def delete(digest String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def presign_get(digest String, ttl_seconds Int64) String {
+    return ""
+  }
+}
+
+def tags_config(auth_enabled Bool) registry.config.RegistryConfig {
+  return registry.config.RegistryConfig.new(
+    registry.config.RegistryListen.new("127.0.0.1", 5000),
+    "/tmp/pf-tags-router",
+    "/tmp/pf-tags-router/registry.db",
+    registry.config.RegistryStore.new("fs", "/tmp/pf-tags-router/blobs", registry.config.default_s3()),
+    registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
+    "/tmp/pf-tags-router/shutdown",
+    "<test>",
+    registry.config.RegistryAuth.new(auth_enabled, "http://127.0.0.1:5000/token", "pokerface-registry", "pokerface-registry", 3600,
+      [registry.config.AuthUser.new("alice", "wonderland")], "tags-test-key")
+  )
+}
+
+def tags_service(auth_enabled Bool) registry.router.Service {
+  return registry.router.Service.new(tags_config(auth_enabled), TagsFakeDb.new(), TagsFakeHealth.new(), TagsFakeStore.new(), TagsFakeLinks.new(), TagsFakeManifests.new(), TagsFakeUploads.new(), TagsFakeWriter.new(), FakeTagList.new(true, ["v1", "v2"]))
+}
+
+def tags_bearer(query Map[String, String], token String) httpd.Request {
+  var headers = []
+  if token != "" {
+    headers = headers.append(("Authorization", "Bearer " + token))
+  }
+  return httpd.Request.new(
+    method: "GET",
+    target: "/v2/acme/app/tags/list",
+    path: "/v2/acme/app/tags/list",
+    query: query,
+    proto: "HTTP/1.1",
+    headers: headers,
+    body: "",
+    params: Map.new()
+  )
+}
+
+def tags_token(scope String) String {
+  const settings = registry.config.RegistryAuth.new(true, "http://127.0.0.1:5000/token", "pokerface-registry", "pokerface-registry", 3600,
+    [registry.config.AuthUser.new("alice", "wonderland")], "tags-test-key")
+  case registry.auth.mint_token(settings, "alice", [scope], registry.db.now_seconds()) {
+    (R.ok, token) then { return token }
+    (R.error, why) then { expect_fail(why) }
+  }
+  return ""
+}
+
+def test_the_listing_needs_pull_when_auth_is_enabled() {
+  const service = tags_service(true)
+  const anonymous = registry.router.handle(tags_bearer(Map.new(), ""), service)
+  expect_equal(401, anonymous.status)
+  expect_true(header_value(anonymous.headers, "www-authenticate").index_of("scope=\"repository:acme/app:pull\"") >= 0)
+  const wrong_repo = registry.router.handle(tags_bearer(Map.new(), tags_token("repository:other/app:pull")), service)
+  expect_equal(401, wrong_repo.status)
+  const ok = registry.router.handle(tags_bearer(Map.new(), tags_token("repository:acme/app:pull")), service)
+  expect_equal(200, ok.status)
+  expect_equal(2, tags_of(ok.body).length())
+}
+
+def test_the_listing_is_open_without_auth() {
+  const service = tags_service(false)
+  const response = registry.router.handle(tags_bearer(Map.new(), ""), service)
+  expect_equal(200, response.status)
+  expect_equal("acme/app", field_of(response.body, "name"))
+}
