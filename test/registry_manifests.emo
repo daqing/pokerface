@@ -240,7 +240,7 @@ def test_the_router_dispatches_manifest_routes() {
     "/tmp/pf-manifests-router/shutdown",
     "<test>"
   )
-  const service = registry.router.Service.new(config, ManifestFakeDb.new(), ManifestFakeBlob.new(), ManifestFakeBlobStore.new(), ManifestFakeBlobLinks.new(), store)
+  const service = registry.router.Service.new(config, ManifestFakeDb.new(), ManifestFakeBlob.new(), ManifestFakeBlobStore.new(), ManifestFakeBlobLinks.new(), store, ManifestFakeUploads.new())
   const response = registry.router.handle(make_request("GET", "/v2/acme/app/manifests/latest"), service)
   expect_equal(200, response.status)
   expect_equal(body, response.body)
@@ -309,5 +309,22 @@ class ManifestFakeBlobLinks {
 
   def linked(repository String, digest String) (R, registry.blobs.BlobLink) {
     return (R.ok, registry.blobs.absent_link())
+  }
+}
+
+class ManifestFakeUploads {
+  def init() {
+  }
+
+  def start(repository String) (R, String) {
+    return (R.ok, "sess-1")
+  }
+
+  def lookup(id String) (R, registry.uploads.UploadSession) {
+    return (R.ok, registry.uploads.absent_session())
+  }
+
+  def complete(id String, digest String, size Int64) (R, Bool) {
+    return (R.ok, true)
   }
 }

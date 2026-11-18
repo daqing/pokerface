@@ -355,7 +355,7 @@ images:
 | [x] | T2.7 | `/v2/` 基础协议与错误格式 | T2.1、T2.2 | 1-2h |
 | [x] | T2.8 | Manifest GET / HEAD 与 tag / digest 解析 | T2.2、T2.3、T2.7 | 3h |
 | [x] | T2.9 | Blob GET 与 307 预签名重定向 | T2.4、T2.6、T2.8 | 2-3h |
-| [ ] | T2.10 | Blob 上传：POST / PUT | T2.4、T2.7 | 3h |
+| [x] | T2.10 | Blob 上传：POST / PUT | T2.4、T2.7 | 3h |
 | [ ] | T2.11 | 分块上传与断点续传：PATCH / GET / DELETE | T2.10 | 3h |
 | [ ] | T2.12 | Manifest PUT 与 tag 更新 | T2.3、T2.10、T2.11 | 2-3h |
 | [ ] | T2.13 | 解析 / 元数据 API | T2.8、T2.12 | 2h |
@@ -493,6 +493,8 @@ images:
 **验收**：上传成功后 `HEAD` 可见；digest 不匹配返回 400 且不落盘；重复 Blob 不重复存储；过期会话可清理；上传大小限制生效。
 
 **依赖**：T2.4、T2.7 · **预估**：3h
+
+> **备注**（2026-11-18，约 2.5h）：已完成。`registry/uploads.emo` 实现最小 OCI 流程：`POST /v2/<name>/blobs/uploads/` 开会话（202，相对 `Location` + `Docker-Upload-UUID`；不带尾斜杠的集合路径同样接受），`PUT .../uploads/<id>?digest=…` **先对请求体哈希、再落任何盘**——不匹配返回 400 `DIGEST_INVALID`，存储和会话都不动——然后写入字节、关联 blob（`INSERT OR IGNORE`，重复上传只存一份），并在同一事务里以 `state = 'pending'` 守卫完成会话（并发竞争者输掉转移 → 404）。带 `?digest=` 的 POST 是规范的单请求整块上传，复用同一完成路径。会话是 `UploadSessions` 接口 + `DbUploadSessions`（每请求短连接）；每次 `start` 先清扫过期 `pending` 行（走索引），TTL 暂为模块常量（24h），可配置化留作后续。POST 会创建仓库行，因此按 OCI 语法校验仓库名（每段 `[a-z0-9]+`，分隔符 `.`/`_`/`__`/`-+`，≤255）→ 400 `NAME_INVALID`。大小限制由 httpd 分帧层强制（超过 `limits.max_body_bytes` 直接 413，两种分帧都覆盖）。路由器**先**检查上传路由再看 blob GET 路由（两者都匹配 `/blobs/`）。db.emo 新增 `upload_info`（join 出状态 + 仓库名）与 `complete_pending_upload`（CAS）。测试：`test/registry_uploads.emo` 27 个（两种路径形态、整块 POST、PUT 完成、缺失/非法 digest、不匹配不落盘、未知/已完成/异库会话、store/lookup/complete 失败、假 store 与真实 LocalStore 的去重（含空 blob）、名称表、方法、路径形态、路由分发）+ 编译版 db_selftest 新增 14 项 `DbUploadSessions` 检查；`emo test` 378/378，db selftest 89/89。已用 curl 实测：POST → 202 带 Location/UUID，PUT 带正确 digest → 201 带 `Docker-Content-Digest`，随后 `HEAD /v2/<name>/blobs/<digest>` 能找到该 blob，错误 digest 是 OCI 400 且不落盘，`?digest=` 的 PUT 返回 400。踩坑：`Map.get` 对缺失 key 直接 raise（先 `has`）；`expire_uploads`/`put_blob` 返回标量不是元组；名称校验器起初接受分隔符开头的组件（`-a`）——语法要求段首必须是 `[a-z0-9]`，已显式强制。后续：T2.11（PATCH/GET/DELETE + 并发写拒绝）、可配置 TTL、POST 不匹配时会话将保留 pending 至过期（已写入文档）。
 
 #### T2.11 分块上传与断点续传：PATCH / GET / DELETE
 

@@ -92,6 +92,7 @@ def main() Int64 {
   check_blobs(report, db)
   check_manifest_store(report, db, path)
   check_blob_links(report, db, path)
+  check_upload_sessions(report, db, path)
   check_uploads(report, db)
   check_cascades(report, db)
   db.close()
@@ -237,6 +238,68 @@ def check_blob_links(report Report, db registry.db.Database, path String) {
     (R.ok, link) then { report.check(!link.found, "an unknown repository has no links") }
     (R.error, why) then { report.check(false, "unknown-repository lookup failed: " + why) }
   }
+}
+
+// The T2.10 upload-session wrapper: start, lookup, complete (with the blob
+// link), and the expiry sweep that rides along with every start.
+def check_upload_sessions(report Report, db registry.db.Database, path String) {
+  const sessions = registry.uploads.DbUploadSessions.new(path)
+  var first = ""
+  case sessions.start("uploads/check") {
+    (R.ok, id) then {
+      first = id
+      report.check(id.length() == 64, "an upload id is 64 hex characters")
+    }
+    (R.error, why) then { report.check(false, "session start failed: " + why) }
+  }
+  var second = ""
+  case sessions.start("uploads/check") {
+    (R.ok, id) then {
+      second = id
+      report.check(id != first, "two sessions get different ids")
+    }
+    (R.error, why) then { report.check(false, "second session start failed: " + why) }
+  }
+  report.check(db.repository_exists("uploads/check"), "start created the repository row")
+  case sessions.lookup(first) {
+    (R.ok, session) then {
+      report.text(session.state, "pending", "a new session is pending")
+      report.text(session.repository, "uploads/check", "the session names its repository")
+    }
+    (R.error, why) then { report.check(false, "session lookup failed: " + why) }
+  }
+  case sessions.lookup("missing-session") {
+    (R.ok, session) then {
+      report.text(session.state, "", "an unknown session is absent")
+      report.text(session.repository, "", "an unknown session has no repository")
+    }
+    (R.error, why) then { report.check(false, "missing-session lookup failed: " + why) }
+  }
+  case sessions.complete(first, blob_digest, 1234) {
+    (R.ok, won) then { report.check(won, "completing a pending session wins") }
+    (R.error, why) then { report.check(false, "session completion failed: " + why) }
+  }
+  case sessions.lookup(first) {
+    (R.ok, session) then { report.text(session.state, "completed", "the session is completed") }
+    (R.error, why) then { report.check(false, "completed lookup failed: " + why) }
+  }
+  const repo = db.repository_id("uploads/check")
+  report.number(db.blob_size(repo, blob_digest), 1234, "completion linked the blob")
+  case sessions.complete(first, blob_digest, 1234) {
+    (R.ok, won) then { report.check(!won, "completing a completed session loses the race") }
+    (R.error, why) then { report.check(false, "second completion failed: " + why) }
+  }
+  case sessions.complete("missing-session", blob_digest, 1234) {
+    (R.ok, won) then { report.check(!won, "completing an unknown session answers false") }
+    (R.error, why) then { report.check(false, "unknown-session completion failed: " + why) }
+  }
+  // The expiry sweep inside start: a stale pending row goes away.
+  db.create_upload("stale-upload", repo, registry.db.now_seconds() - 1)
+  case sessions.start("uploads/check") {
+    (R.ok, _) then { report.text(db.upload_state("stale-upload"), "", "start swept the expired session") }
+    (R.error, why) then { report.check(false, "sweeping start failed: " + why) }
+  }
+  report.check(db.delete_repository(repo), "the uploads/check repository cleans up")
 }
 
 def check_uploads(report Report, db registry.db.Database) {

@@ -355,7 +355,7 @@ Exit criteria:
 | [x] | T2.7 | `/v2/` base protocol and error format | T2.1, T2.2 | 1-2h |
 | [x] | T2.8 | Manifest GET / HEAD and tag / digest resolution | T2.2, T2.3, T2.7 | 3h |
 | [x] | T2.9 | Blob GET and 307 presigned redirect | T2.4, T2.6, T2.8 | 2-3h |
-| [ ] | T2.10 | Blob upload: POST / PUT | T2.4, T2.7 | 3h |
+| [x] | T2.10 | Blob upload: POST / PUT | T2.4, T2.7 | 3h |
 | [ ] | T2.11 | Chunked upload and resumable transfers: PATCH / GET / DELETE | T2.10 | 3h |
 | [ ] | T2.12 | Manifest PUT and tag updates | T2.3, T2.10, T2.11 | 2-3h |
 | [ ] | T2.13 | Resolve / metadata API | T2.8, T2.12 | 2h |
@@ -493,6 +493,8 @@ Suggested tables:
 **Acceptance**: A `HEAD` request finds the blob after upload; a digest mismatch returns 400 and stores nothing; duplicate blobs are stored once; expired sessions can be cleaned up; upload size limits are enforced.
 
 **Depends on**: T2.4, T2.7 · **Estimate**: 3h
+
+> **Notes** (2026-11-18, ~2.5h): Done. `registry/uploads.emo` serves the minimal OCI flow: `POST /v2/<name>/blobs/uploads/` opens a session (202, relative `Location` + `Docker-Upload-UUID`; the slash-less collection path accepted too), `PUT .../uploads/<id>?digest=…` hashes the body **before anything is stored** — a mismatch is 400 `DIGEST_INVALID` and neither the store nor the session changes — then stores the bytes, links the blob (`INSERT OR IGNORE`, so duplicates stay one copy), and completes the session under a `state = 'pending'` guard in one transaction (racing twin loses → 404). POST with `?digest=` is the spec's single-request monolithic upload, sharing the completion path. Sessions are an `UploadSessions` interface with `DbUploadSessions` (short-lived SQLite connection per request); every `start` first sweeps expired `pending` rows (indexed), TTL is a module constant (24h) with a config knob as follow-up. POST creates the repository row, so names are validated against the OCI grammar (per component `[a-z0-9]+` separated by `.`/`_`/`__`/`-+`, ≤255) → 400 `NAME_INVALID`. Size limits ride httpd's framing (413 over `limits.max_body_bytes`, both framings). The router checks the upload routes **before** the blob GET route (both match `/blobs/`). db.emo gained `upload_info` (state + repository name via join) and `complete_pending_upload` (the CAS). Tests: 27 in `test/registry_uploads.emo` (both path forms, monolithic POST, PUT completion, missing/invalid digests, mismatch storing nothing, unknown/completed/foreign sessions, store/lookup/complete failures, dedup against the fake store AND the real LocalStore incl. the empty blob, name tables, methods, split shapes, router dispatch) + 14 checks in the compiled db_selftest for `DbUploadSessions`; `emo test` 378/378, db selftest 89/89. Manually verified over the wire (curl): POST → 202 with Location/UUID, PUT with the right digest → 201 with `Docker-Content-Digest`, a `HEAD /v2/<name>/blobs/<digest>` then finds the blob, a wrong digest is the OCI 400 and stores nothing, `?digest=` PUT is a 400. Gotchas: `Map.get` raises on a missing key (use `has` first); `expire_uploads`/`put_blob` return scalars, not tuples; the name validator originally accepted separator-leading components (`-a`) — the grammar's leading `[a-z0-9]+` is enforced explicitly. Follow-ups: T2.11 (PATCH/GET/DELETE + concurrent-write rejection), a configurable TTL, the POST-mismatch session lingers pending until expiry (documented).
 
 #### T2.11 Chunked Upload and Resumable Transfers: PATCH / GET / DELETE
 

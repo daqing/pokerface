@@ -120,6 +120,23 @@ class ApiFakeBlobLinks {
   }
 }
 
+class ApiFakeUploads {
+  def init() {
+  }
+
+  def start(repository String) (R, String) {
+    return (R.ok, "sess-1")
+  }
+
+  def lookup(id String) (R, registry.uploads.UploadSession) {
+    return (R.ok, registry.uploads.absent_session())
+  }
+
+  def complete(id String, digest String, size Int64) (R, Bool) {
+    return (R.ok, true)
+  }
+}
+
 def make_request(method String, path String) httpd.Request {
   return make_request_with(method, path, [])
 }
@@ -138,7 +155,7 @@ def make_request_with(method String, path String, headers Array[(String, String)
 }
 
 def make_service(name String) registry.router.Service {
-  return registry.router.Service.new(make_config(name), ApiFakeDb.new(true), ApiFakeBlob.new(true), ApiFakeBlobStore.new(), ApiFakeBlobLinks.new(), ApiFakeManifests.new())
+  return registry.router.Service.new(make_config(name), ApiFakeDb.new(true), ApiFakeBlob.new(true), ApiFakeBlobStore.new(), ApiFakeBlobLinks.new(), ApiFakeManifests.new(), ApiFakeUploads.new())
 }
 
 def route(method String, path String) httpd.Response {

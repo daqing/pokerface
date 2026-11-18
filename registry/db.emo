@@ -625,4 +625,36 @@ class Database {
     stmt.finalize()
     return self.handle.changes()
   }
+
+  // The T2.10 session view: the state plus the repository's NAME ("" / "" for
+  // an unknown id). The join turns the stored repository_id into the name the
+  // upload routes compare against the request path.
+  def upload_info(id String) (String, String) {
+    const stmt = self.handle.prepare(
+      "SELECT u.state, r.name FROM uploads AS u "
+        + "JOIN repositories AS r ON r.id = u.repository_id "
+        + "WHERE u.id = ?1")
+    stmt.bind_text(1, id)
+    var state = ""
+    var repository = ""
+    if stmt.step() {
+      state = stmt.column_text(0)
+      repository = stmt.column_text(1)
+    }
+    stmt.finalize()
+    return (state, repository)
+  }
+
+  // Completes a session only while it is still pending — a second PUT racing
+  // the first loses this check instead of completing the session twice.
+  def complete_pending_upload(id String) Bool {
+    const stmt = self.handle.prepare(
+      "UPDATE uploads SET state = ?1 WHERE id = ?2 AND state = ?3")
+    stmt.bind_text(1, upload_completed)
+    stmt.bind_text(2, id)
+    stmt.bind_text(3, upload_pending)
+    stmt.step()
+    stmt.finalize()
+    return self.handle.changes() > 0
+  }
 }

@@ -1,0 +1,728 @@
+// T2.10 tests for the upload routes — run with `emo test`.
+//
+// The session store is a fake, so the POST → PUT flow, the digest checks,
+// and the failure paths all run in the interpreter. One leg uses the real
+// LocalStore to prove re-uploads keep a single content-addressed copy.
+
+const uploads = registry.uploads
+const api = registry.api
+const blobstore = registry.blobstore
+
+require "httpd"
+require "json"
+require "os"
+require "crypto"
+
+const state_pending = "pending"
+const state_completed = "completed"
+
+// ---------------------------------------------------------------------------
+// Fakes.
+
+class SessionRow {
+  def init(id String, state String, repository String) {
+    self.id = id
+    self.state = state
+    self.repository = repository
+  }
+}
+
+class FakeSessions {
+  def init() {
+    self.rows = Box.new([])
+    self.counter = Box.new(0)
+    self.starts = Box.new(0)
+    self.completes = Box.new(0)
+    self.completed_digest = Box.new("")
+    self.completed_size = Box.new(0)
+    self.fail_start = Box.new("")
+    self.fail_lookup = Box.new("")
+    self.fail_complete = Box.new("")
+  }
+
+  def start(repository String) (R, String) {
+    self.starts.replace(self.starts.read() + 1)
+    const why = self.fail_start.read()
+    if why != "" {
+      return (R.error, why)
+    }
+    const n = self.counter.read() + 1
+    self.counter.replace(n)
+    const id = "sess-" + n.to_string()
+    self.rows.replace(self.rows.read().append(SessionRow.new(id, state_pending, repository)))
+    return (R.ok, id)
+  }
+
+  def lookup(id String) (R, registry.uploads.UploadSession) {
+    const why = self.fail_lookup.read()
+    if why != "" {
+      return (R.error, why)
+    }
+    const rows = self.rows.read()
+    var i = 0
+    while i < rows.length() {
+      if rows[i].id == id {
+        return (R.ok, registry.uploads.UploadSession.new(rows[i].state, rows[i].repository))
+      }
+      i = i + 1
+    }
+    return (R.ok, registry.uploads.absent_session())
+  }
+
+  def complete(id String, digest String, size Int64) (R, Bool) {
+    self.completes.replace(self.completes.read() + 1)
+    const why = self.fail_complete.read()
+    if why != "" {
+      return (R.error, why)
+    }
+    const rows = self.rows.read()
+    var updated = []
+    var won = false
+    var i = 0
+    while i < rows.length() {
+      const row = rows[i]
+      if row.id == id && row.state == state_pending {
+        updated = updated.append(SessionRow.new(id, state_completed, row.repository))
+        won = true
+        self.completed_digest.replace(digest)
+        self.completed_size.replace(size)
+      } else {
+        updated = updated.append(row)
+      }
+      i = i + 1
+    }
+    self.rows.replace(updated)
+    return (R.ok, won)
+  }
+
+  def start_count() Int64 {
+    return self.starts.read()
+  }
+
+  def completed_digest_value() String {
+    return self.completed_digest.read()
+  }
+
+  def completed_size_value() Int64 {
+    return self.completed_size.read()
+  }
+}
+
+class FakeStore {
+  def init() {
+    self.blobs = Map.new()
+    self.puts = Box.new(0)
+    self.fail_put = Box.new("")
+  }
+
+  def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
+    self.puts.replace(self.puts.read() + 1)
+    const why = self.fail_put.read()
+    if why != "" {
+      return (R.error, why)
+    }
+    self.blobs.set(digest, body)
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, body.to_bytes().length(), true))
+  }
+
+  def put_file(digest String, source String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put_file")
+  }
+
+  def get(digest String) (R, String) {
+    if self.blobs.has(digest) {
+      return (R.ok, self.blobs.get(digest))
+    }
+    return (R.error, blobstore.not_found(digest))
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    return (R.error, "fake: range")
+  }
+
+  def head(digest String) (R, registry.blobstore.BlobInfo) {
+    if self.blobs.has(digest) {
+      return (R.ok, registry.blobstore.BlobInfo.new(digest, self.blobs.get(digest).to_bytes().length(), true))
+    }
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, -1, false))
+  }
+
+  def delete(digest String) (R, Bool) {
+    if self.blobs.has(digest) {
+      self.blobs.remove(digest)
+      return (R.ok, true)
+    }
+    return (R.ok, false)
+  }
+
+  def presign_get(digest String, ttl_seconds Int64) String {
+    return ""
+  }
+
+  def put_count() Int64 {
+    return self.puts.read()
+  }
+
+  def store_count() Int64 {
+    return self.blobs.length()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers.
+
+def sha256_digest(body String) String {
+  return "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+def hello_digest() String {
+  return sha256_digest("hello")
+}
+
+def make_request(method String, path String) httpd.Request {
+  return httpd.Request.new(
+    method: method,
+    target: path,
+    path: path,
+    query: Map.new(),
+    proto: "HTTP/1.1",
+    headers: [],
+    body: "",
+    params: Map.new()
+  )
+}
+
+def make_request_body(method String, path String, query Map[String, String], body String) httpd.Request {
+  return httpd.Request.new(
+    method: method,
+    target: path,
+    path: path,
+    query: query,
+    proto: "HTTP/1.1",
+    headers: [],
+    body: body,
+    params: Map.new()
+  )
+}
+
+def digest_query(digest String) Map[String, String] {
+  const query = Map.new()
+  query.set("digest", digest)
+  return query
+}
+
+def header_value(headers Array[(String, String)], name String) String {
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == name.lower() {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+def error_field(body String, field String) String {
+  case json.decode(body) {
+    (R.error, _) then { return "" }
+    (R.ok, doc) then { return scan_errors(doc, field) }
+  }
+}
+
+def scan_errors(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == "errors" {
+        if value.is(json.JsonArray) {
+          const items = value.items()
+          if items.length() > 0 {
+            return scan_member(items[0], field)
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+def scan_member(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == field {
+        if value.is(json.JsonString) {
+          return value.as_string()
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+// Opens a session and completes it with `body`, answering the PUT response.
+def upload_body(sessions FakeSessions, store FakeStore, body String, digest String) httpd.Response {
+  const opened = uploads.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), sessions, store)
+  expect_equal(202, opened.status)
+  const id = header_value(opened.headers, "docker-upload-uuid")
+  return uploads.handle(make_request_body("PUT", "/v2/acme/app/blobs/uploads/" + id, digest_query(digest), body), sessions, store)
+}
+
+def tmp_root(name String) String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base + "pokerface-registry-upload-" + os.getpid().to_string() + "-" + name
+}
+
+// ---------------------------------------------------------------------------
+// POST: the session.
+
+def test_post_creates_a_session() {
+  const sessions = FakeSessions.new()
+  const response = uploads.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), sessions, FakeStore.new())
+  expect_equal(202, response.status)
+  expect_equal("", response.body)
+  expect_equal("/v2/acme/app/blobs/uploads/sess-1", header_value(response.headers, "location"))
+  expect_equal("sess-1", header_value(response.headers, "docker-upload-uuid"))
+  case sessions.lookup("sess-1") {
+    (R.ok, session) then {
+      expect_equal(state_pending, session.state)
+      expect_equal("acme/app", session.repository)
+    }
+    (R.error, why) then { expect_true(false) }
+  }
+}
+
+def test_post_accepts_the_path_without_the_trailing_slash() {
+  const response = uploads.handle(make_request("POST", "/v2/acme/app/blobs/uploads"), FakeSessions.new(), FakeStore.new())
+  expect_equal(202, response.status)
+  expect_equal("/v2/acme/app/blobs/uploads/sess-1", header_value(response.headers, "location"))
+}
+
+def test_post_rejects_invalid_repository_names() {
+  const sessions = FakeSessions.new()
+  const response = uploads.handle(make_request("POST", "/v2/ACME/app/blobs/uploads/"), sessions, FakeStore.new())
+  expect_equal(400, response.status)
+  expect_equal(api.code_name_invalid, error_field(response.body, "code"))
+  expect_equal(0, sessions.start_count())
+}
+
+def test_session_start_failure_is_a_500() {
+  const sessions = FakeSessions.new()
+  sessions.fail_start.replace("database is down")
+  const response = uploads.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), sessions, FakeStore.new())
+  expect_equal(500, response.status)
+  expect_equal(api.code_unknown, error_field(response.body, "code"))
+  expect_true(error_field(response.body, "detail").index_of("database is down") >= 0)
+}
+
+// ---------------------------------------------------------------------------
+// POST with a digest: the single-request monolithic upload.
+
+def test_post_with_a_digest_uploads_in_one_request() {
+  const sessions = FakeSessions.new()
+  const store = FakeStore.new()
+  const response = uploads.handle(make_request_body("POST", "/v2/acme/app/blobs/uploads/", digest_query(hello_digest()), "hello"), sessions, store)
+  expect_equal(201, response.status)
+  expect_equal("/v2/acme/app/blobs/" + hello_digest(), header_value(response.headers, "location"))
+  expect_equal(hello_digest(), header_value(response.headers, "docker-content-digest"))
+  expect_equal(1, store.put_count())
+  expect_equal(hello_digest(), sessions.completed_digest_value())
+  expect_equal(5, sessions.completed_size_value())
+}
+
+def test_post_digest_mismatch_stores_nothing() {
+  const sessions = FakeSessions.new()
+  const store = FakeStore.new()
+  const response = uploads.handle(make_request_body("POST", "/v2/acme/app/blobs/uploads/", digest_query(sha256_digest("world")), "hello"), sessions, store)
+  expect_equal(400, response.status)
+  expect_equal(api.code_digest_invalid, error_field(response.body, "code"))
+  expect_equal(0, store.put_count())
+  case sessions.lookup("sess-1") {
+    (R.ok, session) then { expect_equal(state_pending, session.state) }
+    (R.error, _) then { expect_true(false) }
+  }
+}
+
+def test_post_rejects_an_invalid_digest_parameter() {
+  const sessions = FakeSessions.new()
+  const response = uploads.handle(make_request_body("POST", "/v2/acme/app/blobs/uploads/", digest_query("sha256:abc"), ""), sessions, FakeStore.new())
+  expect_equal(400, response.status)
+  expect_equal(api.code_digest_invalid, error_field(response.body, "code"))
+  expect_equal(0, sessions.start_count())
+}
+
+// ---------------------------------------------------------------------------
+// PUT: the monolithic completion.
+
+def test_put_completes_the_upload() {
+  const sessions = FakeSessions.new()
+  const store = FakeStore.new()
+  const response = upload_body(sessions, store, "hello", hello_digest())
+  expect_equal(201, response.status)
+  expect_equal("/v2/acme/app/blobs/" + hello_digest(), header_value(response.headers, "location"))
+  expect_equal(hello_digest(), header_value(response.headers, "docker-content-digest"))
+  expect_equal("", response.body)
+  expect_equal(1, store.put_count())
+  expect_equal(hello_digest(), sessions.completed_digest_value())
+  expect_equal(5, sessions.completed_size_value())
+}
+
+def test_put_requires_the_digest_parameter() {
+  const sessions = FakeSessions.new()
+  const store = FakeStore.new()
+  const opened = uploads.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), sessions, store)
+  const id = header_value(opened.headers, "docker-upload-uuid")
+  const response = uploads.handle(make_request_body("PUT", "/v2/acme/app/blobs/uploads/" + id, Map.new(), "hello"), sessions, store)
+  expect_equal(400, response.status)
+  expect_equal(api.code_digest_invalid, error_field(response.body, "code"))
+  expect_equal(0, store.put_count())
+}
+
+def test_put_rejects_an_invalid_digest() {
+  const sessions = FakeSessions.new()
+  const store = FakeStore.new()
+  const opened = uploads.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), sessions, store)
+  const id = header_value(opened.headers, "docker-upload-uuid")
+  const response = uploads.handle(make_request_body("PUT", "/v2/acme/app/blobs/uploads/" + id, digest_query("sha256:xyz"), "hello"), sessions, store)
+  expect_equal(400, response.status)
+  expect_equal(api.code_digest_invalid, error_field(response.body, "code"))
+  expect_equal(0, store.put_count())
+}
+
+def test_put_digest_mismatch_stores_nothing() {
+  const sessions = FakeSessions.new()
+  const store = FakeStore.new()
+  const opened = uploads.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), sessions, store)
+  const id = header_value(opened.headers, "docker-upload-uuid")
+  const response = uploads.handle(make_request_body("PUT", "/v2/acme/app/blobs/uploads/" + id, digest_query(sha256_digest("world")), "hello"), sessions, store)
+  expect_equal(400, response.status)
+  expect_equal(api.code_digest_invalid, error_field(response.body, "code"))
+  expect_equal("digest mismatch", error_field(response.body, "message"))
+  expect_true(error_field(response.body, "detail").index_of("hashes to") >= 0)
+  expect_equal(0, store.put_count())
+  case sessions.lookup(id) {
+    (R.ok, session) then { expect_equal(state_pending, session.state) }
+    (R.error, _) then { expect_true(false) }
+  }
+}
+
+def test_put_unknown_session_is_a_404() {
+  const response = uploads.handle(make_request_body("PUT", "/v2/acme/app/blobs/uploads/nope", digest_query(hello_digest()), "hello"), FakeSessions.new(), FakeStore.new())
+  expect_equal(404, response.status)
+  expect_equal(api.code_blob_upload_unknown, error_field(response.body, "code"))
+}
+
+def test_put_on_a_completed_session_is_a_404() {
+  const sessions = FakeSessions.new()
+  const store = FakeStore.new()
+  const first = upload_body(sessions, store, "hello", hello_digest())
+  expect_equal(201, first.status)
+  const second = uploads.handle(make_request_body("PUT", "/v2/acme/app/blobs/uploads/sess-1", digest_query(hello_digest()), "hello"), sessions, store)
+  expect_equal(404, second.status)
+  expect_equal(api.code_blob_upload_unknown, error_field(second.body, "code"))
+}
+
+def test_put_to_a_foreign_repository_is_a_404() {
+  const sessions = FakeSessions.new()
+  const opened = uploads.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), sessions, FakeStore.new())
+  const id = header_value(opened.headers, "docker-upload-uuid")
+  const response = uploads.handle(make_request_body("PUT", "/v2/other/app/blobs/uploads/" + id, digest_query(hello_digest()), "hello"), sessions, FakeStore.new())
+  expect_equal(404, response.status)
+  expect_equal(api.code_blob_upload_unknown, error_field(response.body, "code"))
+}
+
+def test_put_store_failure_is_a_500() {
+  const sessions = FakeSessions.new()
+  const store = FakeStore.new()
+  store.fail_put.replace("s3 is unreachable")
+  const opened = uploads.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), sessions, store)
+  const id = header_value(opened.headers, "docker-upload-uuid")
+  const response = uploads.handle(make_request_body("PUT", "/v2/acme/app/blobs/uploads/" + id, digest_query(hello_digest()), "hello"), sessions, store)
+  expect_equal(500, response.status)
+  expect_equal(api.code_unknown, error_field(response.body, "code"))
+  expect_true(error_field(response.body, "detail").index_of("s3 is unreachable") >= 0)
+  case sessions.lookup("sess-1") {
+    (R.ok, session) then { expect_equal(state_pending, session.state) }
+    (R.error, _) then { expect_true(false) }
+  }
+}
+
+def test_put_completion_failure_is_a_500() {
+  const sessions = FakeSessions.new()
+  const store = FakeStore.new()
+  sessions.fail_complete.replace("database is down")
+  const opened = uploads.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), sessions, store)
+  const id = header_value(opened.headers, "docker-upload-uuid")
+  const response = uploads.handle(make_request_body("PUT", "/v2/acme/app/blobs/uploads/" + id, digest_query(hello_digest()), "hello"), sessions, store)
+  expect_equal(500, response.status)
+  expect_equal(api.code_unknown, error_field(response.body, "code"))
+  case sessions.lookup(id) {
+    (R.ok, session) then { expect_equal(state_pending, session.state) }
+    (R.error, _) then { expect_true(false) }
+  }
+}
+
+def test_put_session_lookup_failure_is_a_500() {
+  const sessions = FakeSessions.new()
+  const opened = uploads.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), sessions, FakeStore.new())
+  const id = header_value(opened.headers, "docker-upload-uuid")
+  sessions.fail_lookup.replace("database is down")
+  const response = uploads.handle(make_request_body("PUT", "/v2/acme/app/blobs/uploads/" + id, digest_query(hello_digest()), "hello"), sessions, FakeStore.new())
+  expect_equal(500, response.status)
+  expect_equal(api.code_unknown, error_field(response.body, "code"))
+}
+
+// ---------------------------------------------------------------------------
+// Dedup and the empty blob, the first against the real LocalStore.
+
+def test_duplicate_uploads_store_one_copy() {
+  const sessions = FakeSessions.new()
+  const store = FakeStore.new()
+  const first = upload_body(sessions, store, "hello", hello_digest())
+  expect_equal(201, first.status)
+  const second = upload_body(sessions, store, "hello", hello_digest())
+  expect_equal(201, second.status)
+  expect_equal(2, store.put_count())
+  expect_equal(1, store.store_count())
+}
+
+def test_duplicate_blobs_are_stored_once_in_the_local_store() {
+  case blobstore.open(tmp_root("dedup")) {
+    (R.error, why) then { expect_true(false) }
+    (R.ok, store) then {
+      const sessions = FakeSessions.new()
+      const first = upload_body(sessions, store, "hello", hello_digest())
+      expect_equal(201, first.status)
+      const second = upload_body(sessions, store, "hello", hello_digest())
+      expect_equal(201, second.status)
+      case store.head(hello_digest()) {
+        (R.error, why) then { expect_true(false) }
+        (R.ok, info) then {
+          expect_true(info.exists)
+          expect_equal(5, info.size)
+        }
+      }
+      case os.list_dir(store.dir()) {
+        (R.error, why) then { expect_true(false) }
+        (R.ok, entries) then { expect_equal(2, entries.length()) }
+      }
+    }
+  }
+}
+
+def test_the_empty_blob_uploads() {
+  case blobstore.open(tmp_root("empty")) {
+    (R.error, why) then { expect_true(false) }
+    (R.ok, store) then {
+      const sessions = FakeSessions.new()
+      const response = uploads.handle(make_request_body("POST", "/v2/acme/app/blobs/uploads/", digest_query(sha256_digest("")), ""), sessions, store)
+      expect_equal(201, response.status)
+      case store.head(sha256_digest("")) {
+        (R.error, why) then { expect_true(false) }
+        (R.ok, info) then {
+          expect_true(info.exists)
+          expect_equal(0, info.size)
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Methods and paths.
+
+def test_the_collection_serves_post_only() {
+  const sessions = FakeSessions.new()
+  const path = "/v2/acme/app/blobs/uploads/"
+  const get = uploads.handle(make_request("GET", path), sessions, FakeStore.new())
+  expect_equal(405, get.status)
+  expect_equal("POST", header_value(get.headers, "allow"))
+  const put = uploads.handle(make_request("PUT", path), sessions, FakeStore.new())
+  expect_equal(405, put.status)
+  expect_equal("POST", header_value(put.headers, "allow"))
+}
+
+def test_the_item_serves_put_only() {
+  const sessions = FakeSessions.new()
+  const opened = uploads.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), sessions, FakeStore.new())
+  const path = "/v2/acme/app/blobs/uploads/" + header_value(opened.headers, "docker-upload-uuid")
+  const get = uploads.handle(make_request("GET", path), sessions, FakeStore.new())
+  expect_equal(405, get.status)
+  expect_equal("PUT", header_value(get.headers, "allow"))
+  const patch = uploads.handle(make_request("PATCH", path), sessions, FakeStore.new())
+  expect_equal(405, patch.status)
+  const post = uploads.handle(make_request("POST", path), sessions, FakeStore.new())
+  expect_equal(405, post.status)
+  expect_equal("PUT", header_value(post.headers, "allow"))
+}
+
+def test_unrouted_upload_paths_fall_through_to_the_catch_all() {
+  const response = uploads.handle(make_request("POST", "/v2/acme/app/blobs/uploads/a/b"), FakeSessions.new(), FakeStore.new())
+  expect_equal(404, response.status)
+}
+
+def test_path_shapes() {
+  expect_true(uploads.is_route("/v2/acme/app/blobs/uploads/"))
+  expect_true(uploads.is_route("/v2/acme/app/blobs/uploads/sess-1"))
+  expect_true(!uploads.is_route("/v2/acme/app/blobs/sha256:abcdef"))
+  expect_true(!uploads.is_route("/v2/acme/app/manifests/latest"))
+  const collection = uploads.split("/v2/acme/team/app/blobs/uploads/")
+  expect_equal("acme/team/app", collection[0])
+  expect_equal("collection", collection[1])
+  expect_equal("", collection[2])
+  const item = uploads.split("/v2/acme/app/blobs/uploads/sess-1")
+  expect_equal("acme/app", item[0])
+  expect_equal("item", item[1])
+  expect_equal("sess-1", item[2])
+  expect_equal("", uploads.split("/v2/acme/app/blobs/uploads/a/b")[0])
+  expect_equal("", uploads.split("/v2/acme/app/blobs/")[0])
+}
+
+// ---------------------------------------------------------------------------
+// Repository name grammar.
+
+def test_valid_repository_names() {
+  expect_true(uploads.valid_name("acme/app"))
+  expect_true(uploads.valid_name("a"))
+  expect_true(uploads.valid_name("a.b"))
+  expect_true(uploads.valid_name("a_b"))
+  expect_true(uploads.valid_name("a__b"))
+  expect_true(uploads.valid_name("a-b"))
+  expect_true(uploads.valid_name("a--b"))
+  expect_true(uploads.valid_name("acme/team-1/app_name.v2"))
+}
+
+def test_invalid_repository_names() {
+  expect_true(!uploads.valid_name(""))
+  expect_true(!uploads.valid_name("Acme"))
+  expect_true(!uploads.valid_name("a___b"))
+  expect_true(!uploads.valid_name("a..b"))
+  expect_true(!uploads.valid_name("a.-b"))
+  expect_true(!uploads.valid_name("a-"))
+  expect_true(!uploads.valid_name("-a"))
+  expect_true(!uploads.valid_name(".a"))
+  expect_true(!uploads.valid_name("a_b_"))
+  expect_true(!uploads.valid_name("a/"))
+  expect_true(!uploads.valid_name("/a"))
+  expect_true(!uploads.valid_name("a//b"))
+  expect_true(!uploads.valid_name("a b"))
+  expect_true(!uploads.valid_name(long_name()))
+}
+
+def long_name() String {
+  var out = "a"
+  var i = 0
+  while i < 256 {
+    out = out + "b"
+    i = i + 1
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Router dispatch.
+
+def test_the_router_dispatches_upload_routes_before_blob_routes() {
+  const config = registry.config.RegistryConfig.new(
+    registry.config.RegistryListen.new("127.0.0.1", 5000),
+    "/tmp/pf-uploads-router",
+    "/tmp/pf-uploads-router/registry.db",
+    registry.config.RegistryStore.new("fs", "/tmp/pf-uploads-router/blobs", registry.config.default_s3()),
+    registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
+    "/tmp/pf-uploads-router/shutdown",
+    "<test>"
+  )
+  const sessions = FakeSessions.new()
+  const store = FakeStore.new()
+  const service = registry.router.Service.new(
+    config,
+    UploadFakeDb.new(),
+    UploadFakeHealth.new(),
+    store,
+    UploadFakeLinks.new(),
+    UploadFakeManifests.new(),
+    sessions
+  )
+  const opened = registry.router.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), service)
+  expect_equal(202, opened.status)
+  expect_equal("registry/2.0", header_value(opened.headers, "docker-distribution-api-version"))
+  expect_true(header_value(opened.headers, "x-request-id") != "")
+  const id = header_value(opened.headers, "docker-upload-uuid")
+  const done = registry.router.handle(make_request_body("PUT", "/v2/acme/app/blobs/uploads/" + id, digest_query(hello_digest()), "hello"), service)
+  expect_equal(201, done.status)
+  expect_equal(1, store.put_count())
+  // The blob GET route still answers, now that the blob is linked.
+  const links = UploadFakeLinks.new()
+  links.found.replace(true)
+  const service2 = registry.router.Service.new(
+    config,
+    UploadFakeDb.new(),
+    UploadFakeHealth.new(),
+    store,
+    links,
+    UploadFakeManifests.new(),
+    sessions
+  )
+  const fetched = registry.router.handle(make_request("GET", "/v2/acme/app/blobs/" + hello_digest()), service2)
+  expect_equal(200, fetched.status)
+  expect_equal("hello", fetched.body)
+}
+
+class UploadFakeDb {
+  def init() {
+  }
+
+  def ping() Bool {
+    return true
+  }
+
+  def path() String {
+    return "/tmp/fake.db"
+  }
+}
+
+class UploadFakeHealth {
+  def init() {
+  }
+
+  def probe() (R, String) {
+    return (R.ok, "fs:/tmp/fake")
+  }
+}
+
+class UploadFakeLinks {
+  def init() {
+    self.found = Box.new(false)
+  }
+
+  def linked(repository String, digest String) (R, registry.blobs.BlobLink) {
+    return (R.ok, registry.blobs.BlobLink.new(self.found.read(), 5))
+  }
+}
+
+class UploadFakeManifests {
+  def init() {
+  }
+
+  def lookup(repository String, reference String) (R, registry.manifests.ManifestPayload) {
+    return (R.ok, registry.manifests.absent_payload())
+  }
+}

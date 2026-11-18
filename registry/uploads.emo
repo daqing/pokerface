@@ -1,0 +1,322 @@
+// T2.10: the minimal OCI blob upload flow. `POST /v2/<name>/blobs/uploads/`
+// opens a session (202, Location + Docker-Upload-UUID); `PUT .../uploads/<id>`
+// with a `?digest=` query uploads the whole body, verifies the digest, stores
+// the bytes, links the blob into the repository, and completes the session
+// (201, Location + Docker-Content-Digest). A POST that already carries a
+// `?digest=` is the spec's single-request monolithic upload: session, bytes,
+// and completion in one request.
+//
+// The body is hashed before anything is stored: a mismatch answers 400
+// DIGEST_INVALID and touches neither the blob store nor the session, so
+// nothing partial survives a failed upload. The blob store keeps bytes under
+// their digest, which makes re-uploads free; the `blobs` row is the
+// repository's link and `INSERT OR IGNORE` keeps it single. Completing marks
+// the session completed under a `state = 'pending'` guard, so a PUT that
+// races a twin loses the transition and answers 404.
+//
+// Housekeeping rides along with session creation: every `start` first deletes
+// pending sessions whose deadline passed (an indexed, cheap sweep), so
+// abandoned uploads cannot accumulate. The TTL is a module constant for v0.1;
+// a config knob is a follow-up.
+//
+// Sessions are an interface (UploadSessions) like the manifest and blob-link
+// stores, so the route runs in the interpreter against a fake;
+// DbUploadSessions is the SQLite implementation opening a short-lived
+// connection per request (httpd runs one process per connection). The upload
+// id is a digest of pid and monotonic time — unique across the
+// per-connection processes without shared mutable state.
+// Spec: docs/spec/registry-uploads.md.
+
+require "httpd"
+require "os"
+require "time"
+require "crypto"
+
+const route_prefix = "/v2/"
+const route_marker = "/blobs/uploads/"
+const route_bare = "/blobs/uploads"
+const session_ttl_seconds = 86400
+const name_max_length = 255
+const state_pending = "pending"
+
+class UploadSession {
+  def init(state String, repository String) {
+    self.state = state
+    self.repository = repository
+  }
+}
+
+def absent_session() UploadSession {
+  return UploadSession.new("", "")
+}
+
+interface UploadSessions {
+  def start(repository String) (R, String)
+  def lookup(id String) (R, UploadSession)
+  def complete(id String, digest String, size Int64) (R, Bool)
+}
+
+class DbUploadSessions {
+  def init(db_path String) {
+    self.db_path = db_path
+  }
+
+  // Expires stale sessions, creates the repository row when new, and records
+  // a pending session — one transaction, one connection.
+  def start(repository String) (R, String) {
+    const db = registry.db.connect(self.db_path)
+    db.begin()
+    db.expire_uploads(registry.db.now_seconds())
+    const id = new_upload_id()
+    db.create_upload(id, db.ensure_repository(repository), registry.db.now_seconds() + session_ttl_seconds)
+    db.commit()
+    db.close()
+    return (R.ok, id)
+  }
+
+  def lookup(id String) (R, registry.uploads.UploadSession) {
+    const db = registry.db.connect(self.db_path)
+    const info = db.upload_info(id)
+    db.close()
+    const (state, repository) = info
+    return (R.ok, UploadSession.new(state, repository))
+  }
+
+  // Links the blob and completes the session atomically. False means the
+  // session was not pending any more — the caller answers 404.
+  def complete(id String, digest String, size Int64) (R, Bool) {
+    const db = registry.db.connect(self.db_path)
+    db.begin()
+    const repository_id = db.upload_repository(id)
+    var won = false
+    if repository_id > 0 {
+      db.put_blob(repository_id, digest, size)
+      won = db.complete_pending_upload(id)
+    }
+    db.commit()
+    db.close()
+    return (R.ok, won)
+  }
+}
+
+// The upload id: 32 hex characters over pid and monotonic time. Two POSTs are
+// separate httpd connection processes, so the pid differs; keep-alive
+// requests in one process differ in the monotonic nanoseconds.
+def new_upload_id() String {
+  const seed = "pf-upload:" + os.getpid().to_string() + ":" + time.mono().to_string()
+  return crypto.hex_encode(crypto.sha2.sha256(seed.to_bytes()))
+}
+
+// ---------------------------------------------------------------------------
+// The OCI repository name grammar: per path component, `[a-z0-9]+` separated
+// by `.` or `_` or `__` or one or more `-`. Names are validated on upload
+// because POST creates the repository row; read routes only look them up and
+// fail naturally.
+
+const name_alnum = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+def name_char(c String) Bool {
+  return name_alnum.index_of(c) >= 0
+}
+
+def valid_name(name String) Bool {
+  if name == "" || name.length() > name_max_length {
+    return false
+  }
+  const components = name.split("/")
+  var i = 0
+  while i < components.length() {
+    if !valid_name_component(components[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+def valid_name_component(component String) Bool {
+  if component == "" {
+    return false
+  }
+  // A component starts with an alphanumeric; separators only appear between.
+  if !name_char(component.substring(0, 1)) {
+    return false
+  }
+  var i = 0
+  while i < component.length() {
+    const c = component.substring(i, 1)
+    if name_char(c) {
+      i = i + 1
+    } else {
+      case c {
+        "." then { i = i + 1 }
+        "_" then {
+          if i + 1 < component.length() && component.substring(i + 1, 1) == "_" {
+            i = i + 2
+          } else {
+            i = i + 1
+          }
+        }
+        "-" then {
+          while i < component.length() && component.substring(i, 1) == "-" {
+            i = i + 1
+          }
+        }
+        _ then { return false }
+      }
+      // A separator must be followed by an alphanumeric, so a component
+      // cannot end in one and cannot stack two separators.
+      if i >= component.length() {
+        return false
+      }
+      if !name_char(component.substring(i, 1)) {
+        return false
+      }
+    }
+  }
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// Routing. The uploads family shares the "/blobs/" prefix with the blob GET
+// route, so the router checks this route first.
+
+def is_route(path String) Bool {
+  if !path.starts_with(route_prefix) {
+    return false
+  }
+  return path.index_of(route_bare) >= 0
+}
+
+// "/v2/acme/app/blobs/uploads/"       → ("acme/app", "collection", "")
+// "/v2/acme/app/blobs/uploads/<id>"   → ("acme/app", "item", "<id>")
+// POST also accepts the path without the trailing slash (the collection);
+// anything else — including a second "/" inside the id — is not ours.
+def split(path String) (String, String, String) {
+  if !path.starts_with(route_prefix) {
+    return ("", "", "")
+  }
+  const rest = path.substring(route_prefix.length(), path.length() - route_prefix.length())
+  const at = rest.index_of(route_marker)
+  if at <= 0 {
+    const bare = rest.index_of(route_bare)
+    if bare > 0 && bare + route_bare.length() == rest.length() {
+      return (rest.substring(0, bare), "collection", "")
+    }
+    return ("", "", "")
+  }
+  const repository = rest.substring(0, at)
+  const id = rest.substring(at + route_marker.length(), rest.length() - at - route_marker.length())
+  if id == "" {
+    return (repository, "collection", "")
+  }
+  if id.index_of("/") >= 0 {
+    return ("", "", "")
+  }
+  return (repository, "item", id)
+}
+
+def handle(req httpd.Request, sessions UploadSessions, store registry.blobstore.BlobStore) httpd.Response {
+  const parts = split(req.path)
+  const repository = parts[0]
+  const kind = parts[1]
+  const id = parts[2]
+  if repository == "" {
+    return registry.api.not_found(registry.api.code_blob_upload_unknown, "upload not found", req.path)
+  }
+  if kind == "collection" {
+    if req.method != "POST" {
+      return registry.api.method_not_allowed("POST")
+    }
+    return start(req, repository, sessions, store)
+  }
+  // The item path serves PUT in T2.10; GET (offset), PATCH (append), and
+  // DELETE (cancel) arrive with the chunked upload in T2.11.
+  if req.method != "PUT" {
+    return registry.api.method_not_allowed("PUT")
+  }
+  return finish(req, repository, id, sessions, store)
+}
+
+def start(req httpd.Request, repository String, sessions UploadSessions, store registry.blobstore.BlobStore) httpd.Response {
+  if !valid_name(repository) {
+    return registry.api.bad_request(registry.api.code_name_invalid, "invalid repository name", repository)
+  }
+  const digest = query_digest(req)
+  if digest != "" && registry.digest.hex(digest) == "" {
+    return registry.api.bad_request(registry.api.code_digest_invalid, "invalid digest", digest)
+  }
+  case sessions.start(repository) {
+    (R.error, why) then { return registry.api.server_error("upload session creation failed", why) }
+    (R.ok, id) then {
+      if digest == "" {
+        return httpd.response(202, [
+          ("Location", upload_location(repository, id)),
+          ("Docker-Upload-UUID", id)
+        ], "")
+      }
+      // Single-request monolithic upload: the session is completed at once.
+      return store_and_complete(repository, id, digest, req.body, sessions, store)
+    }
+  }
+}
+
+def finish(req httpd.Request, repository String, id String, sessions UploadSessions, store registry.blobstore.BlobStore) httpd.Response {
+  const digest = query_digest(req)
+  if digest == "" {
+    return registry.api.bad_request(registry.api.code_digest_invalid, "the digest query parameter is required", req.path)
+  }
+  if registry.digest.hex(digest) == "" {
+    return registry.api.bad_request(registry.api.code_digest_invalid, "invalid digest", digest)
+  }
+  case sessions.lookup(id) {
+    (R.error, why) then { return registry.api.server_error("upload session lookup failed", why) }
+    (R.ok, session) then {
+      if session.state != state_pending || session.repository != repository {
+        return registry.api.not_found(registry.api.code_blob_upload_unknown, "upload session not found", id)
+      }
+      return store_and_complete(repository, id, digest, req.body, sessions, store)
+    }
+  }
+}
+
+// The upload's second half, shared by PUT and the single-request POST: hash
+// the body, store the bytes, link the blob, complete the session. The hash
+// check runs first, so a mismatch stores nothing anywhere.
+def store_and_complete(repository String, id String, digest String, body String, sessions UploadSessions, store registry.blobstore.BlobStore) httpd.Response {
+  const actual = "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+  if actual != digest {
+    return registry.api.bad_request(registry.api.code_digest_invalid, "digest mismatch",
+      "the body hashes to " + actual + ", not " + digest)
+  }
+  case store.put(digest, body) {
+    (R.error, why) then { return registry.api.server_error("blob store write failed", why) }
+    (R.ok, info) then {
+      case sessions.complete(id, digest, info.size) {
+        (R.error, why) then { return registry.api.server_error("upload completion failed", why) }
+        (R.ok, won) then {
+          if !won {
+            return registry.api.not_found(registry.api.code_blob_upload_unknown, "upload session not found", id)
+          }
+          return httpd.response(201, [
+            ("Location", route_prefix + repository + "/blobs/" + digest),
+            ("Docker-Content-Digest", digest)
+          ], "")
+        }
+      }
+    }
+  }
+}
+
+// "" when the query has no digest. An empty value (`?digest=`) reads back as
+// absent for POST and as "required" for PUT.
+def query_digest(req httpd.Request) String {
+  if !req.query.has("digest") {
+    return ""
+  }
+  return req.query.get("digest")
+}
+
+def upload_location(repository String, id String) String {
+  return route_prefix + repository + route_marker + id
+}

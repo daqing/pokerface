@@ -319,7 +319,8 @@ def test_the_router_dispatches_blob_routes() {
     BlobFakeHealth.new(),
     local_store_exists(),
     FakeLinks.new(true, 5, ""),
-    BlobFakeManifests.new()
+    BlobFakeManifests.new(),
+    BlobFakeUploads.new()
   )
   const response = registry.router.handle(make_request("GET", "/v2/acme/app/blobs/" + digest_value), service)
   expect_equal(200, response.status)
@@ -356,5 +357,22 @@ class BlobFakeManifests {
 
   def lookup(repository String, reference String) (R, registry.manifests.ManifestPayload) {
     return (R.ok, registry.manifests.absent_payload())
+  }
+}
+
+class BlobFakeUploads {
+  def init() {
+  }
+
+  def start(repository String) (R, String) {
+    return (R.ok, "sess-1")
+  }
+
+  def lookup(id String) (R, registry.uploads.UploadSession) {
+    return (R.ok, registry.uploads.absent_session())
+  }
+
+  def complete(id String, digest String, size Int64) (R, Bool) {
+    return (R.ok, true)
   }
 }
