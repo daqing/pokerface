@@ -74,15 +74,23 @@ def main() Int64 {
             eprint(why + "\n")
             return 1
           }
-          (R.ok, _) then { }
+          (R.ok, store) then { return serve(config, store) }
         }
       }
-      return serve(config)
+      // s3: the bucket is checked here, so a missing bucket or bad
+      // credentials stops start-up with the name and the endpoint.
+      case registry.s3_blobstore.open(config.store.s3) {
+        (R.error, why) then {
+          eprint(why + "\n")
+          return 1
+        }
+        (R.ok, store) then { return serve(config, store) }
+      }
     }
   }
 }
 
-def serve(config registry.config.RegistryConfig) Int64 {
+def serve(config registry.config.RegistryConfig, blob registry.blobstore.BlobHealth) Int64 {
   // A stale marker from a previous run must not shut this one down.
   os.unlink(config.shutdown_file)
   const (R.ok, _) = os.signal_ignore(os.sig_term)
@@ -97,7 +105,7 @@ def serve(config registry.config.RegistryConfig) Int64 {
       const port = listener.port()
       const db_health = registry.db.Health.new(config.db_path)
       const handler = -> (req httpd.Request) {
-        return registry.health.handle(req, config, db_health)
+        return registry.health.handle(req, config, db_health, blob)
       }
       const server = httpd.serve_with(listener, handler, server_options(config))
       // Raw writes: supervisors/scripts poll these readiness lines.

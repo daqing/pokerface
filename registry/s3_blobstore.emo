@@ -1,0 +1,508 @@
+// T2.6: the S3 / MinIO blob backend. Implements the T2.4 BlobStore over
+// signed HTTP requests and hands out presigned GET URLs (T2.5), so a route can
+// answer 307 without proxying the bytes.
+//
+// Keys are content-addressed — [prefix/]sha256/<hex> — in `bucket`. Path-style
+// addressing (`endpoint/bucket/key`) is the default and what MinIO expects;
+// virtual-host style (`bucket.endpoint/key`) is available with
+// path_style: false. The bucket is checked at start-up with a signed HEAD:
+// a missing bucket fails with its name and the endpoint, an access-denied
+// answer names the credential settings (never their values).
+//
+// Every request is signed with SigV4 (x-amz-content-sha256 always signed and
+// sent); the Host header the signer uses is the one the HTTP client will put
+// on the wire, since the client sets Host itself and duplicates are refused by
+// S3. Network failures and 5xx answers retry (three attempts, short backoff);
+// 4xx answers do not. Error messages carry the method, path, and S3's error
+// <Code> — never the body (which may echo key ids) and never either key.
+// Spec: docs/spec/registry-s3.md.
+
+require "http"
+require "net"
+require "os"
+require "file"
+require "crypto"
+require "time"
+
+const default_timeout = 30.0
+const max_attempts = 3
+const retry_delay = 0.1
+const blob_content_type = "application/octet-stream"
+const payload_header = "x-amz-content-sha256"
+
+interface S3Transport {
+  def request(method String, url String, headers Array[(String, String)], body String, timeout Float64) (R, http.HttpResponse)
+}
+
+class HttpS3Transport {
+  def init(options net.TlsClientOptions) {
+    self.options = options
+  }
+
+  def request(method String, url String, headers Array[(String, String)], body String, timeout Float64) (R, http.HttpResponse) {
+    return http.request_with(method, url, headers, body, timeout, self.options)
+  }
+}
+
+// The scheme/host/path of one request. `host` is the Host header value (the
+// default port dropped), so the URL and the signature agree.
+class Target {
+  def init(scheme String, host String, path String) {
+    self.scheme = scheme
+    self.host = host
+    self.path = path
+  }
+
+  def url() String {
+    return self.scheme + "://" + self.host + registry.sigv4.uri_encode(self.path, false)
+  }
+}
+
+// Opens the store unless the bucket cannot be reached. `transport` is
+// injectable; `open` builds the HTTPS-capable one.
+def open(settings registry.config.S3Settings) (R, S3Store) {
+  return open_with(settings, HttpS3Transport.new(tls_options(settings)))
+}
+
+def open_with(settings registry.config.S3Settings, transport S3Transport) (R, S3Store) {
+  if settings.endpoint == "" || settings.bucket == "" {
+    return (R.error, "s3: endpoint and bucket must be configured")
+  }
+  const parsed = parse_endpoint(settings.endpoint)
+  const scheme = parsed[0]
+  var host = host_header_value(scheme, parsed[1])
+  var base_path = ""
+  if settings.path_style {
+    base_path = "/" + settings.bucket
+  } else {
+    host = settings.bucket + "." + host
+  }
+  const credentials = registry.sigv4.Credentials.new(settings.access_key, settings.secret_key, settings.region, "s3", "")
+  const store = S3Store.new(settings, credentials, transport, scheme, host, base_path)
+  case store.check_bucket() {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { return (R.ok, store) }
+  }
+}
+
+// A custom CA replaces the system trust store; without_verification is the
+// explicit development escape hatch.
+def tls_options(settings registry.config.S3Settings) net.TlsClientOptions {
+  var options = net.tls_client_options()
+  if settings.ca_file != "" {
+    options = options.with_ca_file(settings.ca_file)
+  }
+  if !settings.verify_tls {
+    options = options.without_verification()
+  }
+  return options
+}
+
+def parse_endpoint(endpoint String) (String, String) {
+  const at = endpoint.index_of("://")
+  const scheme = endpoint.substring(0, at)
+  var authority = endpoint.substring(at + 3, endpoint.length() - at - 3)
+  while ends_with_text(authority, "/") {
+    authority = authority.substring(0, authority.length() - 1)
+  }
+  return (scheme, authority)
+}
+
+def ends_with_text(text String, suffix String) Bool {
+  if suffix.length() > text.length() {
+    return false
+  }
+  return text.substring(text.length() - suffix.length(), suffix.length()) == suffix
+}
+
+def host_header_value(scheme String, authority String) String {
+  if scheme == "http" && ends_with_text(authority, ":80") {
+    return authority.substring(0, authority.length() - 3)
+  }
+  if scheme == "https" && ends_with_text(authority, ":443") {
+    return authority.substring(0, authority.length() - 4)
+  }
+  return authority
+}
+
+class S3Store {
+  def init(settings registry.config.S3Settings, credentials registry.sigv4.Credentials, transport S3Transport, scheme String, host String, base_path String) {
+    self.settings = settings
+    self.credentials = credentials
+    self.transport = transport
+    self.scheme = scheme
+    self.host = host
+    self.base_path = base_path
+  }
+
+  // -------------------------------------------------------------------------
+  // BlobStore.
+
+  def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
+    case object_key_with(self.settings.prefix, digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, key) then {
+        const actual = "sha256:" + registry.sigv4.sha256_hex(body)
+        if actual != digest {
+          return (R.error, "s3: " + digest + ": digest mismatch — the body hashes to " + actual)
+        }
+        const target = self.target_for(key)
+        case self.send("PUT", target, [("content-type", blob_content_type)], body) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, resp) then {
+            if written(resp.status) {
+              return (R.ok, registry.blobstore.BlobInfo.new(digest, body.to_bytes().length(), true))
+            }
+            return (R.error, self.failure("PUT", target.path, resp))
+          }
+        }
+      }
+    }
+  }
+
+  def put_file(digest String, source String) (R, registry.blobstore.BlobInfo) {
+    case file.read(source) {
+      (R.error, why) then { return (R.error, "s3: cannot read " + source + ": " + why) }
+      (R.ok, body) then { return self.put(digest, body) }
+    }
+  }
+
+  def get(digest String) (R, String) {
+    case object_key_with(self.settings.prefix, digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, key) then {
+        const target = self.target_for(key)
+        case self.send("GET", target, [], "") {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, resp) then {
+            if resp.status == 200 {
+              return (R.ok, resp.body)
+            }
+            if resp.status == 404 {
+              return (R.error, registry.blobstore.not_found(digest))
+            }
+            return (R.error, self.failure("GET", target.path, resp))
+          }
+        }
+      }
+    }
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    if offset < 0 || length < 0 {
+      return (R.error, "s3: " + digest + ": range needs a non-negative offset and length")
+    }
+    if length == 0 {
+      return (R.ok, "")
+    }
+    case object_key_with(self.settings.prefix, digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, key) then {
+        const target = self.target_for(key)
+        const last = offset + length - 1
+        const headers = [("range", "bytes=" + offset.to_string() + "-" + last.to_string())]
+        case self.send("GET", target, headers, "") {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, resp) then {
+            if resp.status == 206 {
+              return (R.ok, resp.body)
+            }
+            if resp.status == 200 {
+              // A backend that ignored Range: clip the full body locally.
+              return (R.ok, clip(resp.body, offset, length))
+            }
+            if resp.status == 404 {
+              return (R.error, registry.blobstore.not_found(digest))
+            }
+            return (R.error, self.failure("GET", target.path, resp))
+          }
+        }
+      }
+    }
+  }
+
+  // A ranged GET rather than HEAD: the stdlib http client reads
+  // Content-Length bytes even for HEAD, and S3's HEAD answers the object's
+  // length with no body. `bytes=0-0` costs one byte and the 206's
+  // Content-Range names the total. An empty object answers 416, so that case
+  // falls back to a plain GET and its (empty) body.
+  def head(digest String) (R, registry.blobstore.BlobInfo) {
+    case object_key_with(self.settings.prefix, digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, key) then {
+        const target = self.target_for(key)
+        const headers = [("range", "bytes=0-0")]
+        case self.send("GET", target, headers, "") {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, resp) then {
+            if resp.status == 206 {
+              return (R.ok, registry.blobstore.BlobInfo.new(digest, content_range_total(resp.header("content-range")), true))
+            }
+            if resp.status == 200 {
+              return (R.ok, registry.blobstore.BlobInfo.new(digest, resp.body.to_bytes().length(), true))
+            }
+            if resp.status == 416 {
+              return self.head_empty(digest, target)
+            }
+            if resp.status == 404 {
+              return (R.ok, registry.blobstore.BlobInfo.new(digest, -1, false))
+            }
+            return (R.error, self.failure("GET", target.path, resp))
+          }
+        }
+      }
+    }
+  }
+
+  def head_empty(digest String, target Target) (R, registry.blobstore.BlobInfo) {
+    case self.send("GET", target, [], "") {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, resp) then {
+        if resp.status == 200 {
+          return (R.ok, registry.blobstore.BlobInfo.new(digest, resp.body.to_bytes().length(), true))
+        }
+        if resp.status == 404 {
+          return (R.ok, registry.blobstore.BlobInfo.new(digest, -1, false))
+        }
+        return (R.error, self.failure("GET", target.path, resp))
+      }
+    }
+  }
+
+  def delete(digest String) (R, Bool) {
+    case object_key_with(self.settings.prefix, digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, key) then {
+        const target = self.target_for(key)
+        case self.send("DELETE", target, [], "") {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, resp) then {
+            if written(resp.status) {
+              return (R.ok, true)
+            }
+            if resp.status == 404 {
+              return (R.ok, false)
+            }
+            return (R.error, self.failure("DELETE", target.path, resp))
+          }
+        }
+      }
+    }
+  }
+
+  // A real direct URL, so the caller answers 307 instead of proxying bytes.
+  def presign_get(digest String, ttl_seconds Int64) String {
+    case object_key_with(self.settings.prefix, digest) {
+      (R.error, why) then { return "" }
+      (R.ok, key) then {
+        var seconds = ttl_seconds
+        if seconds <= 0 {
+          seconds = self.settings.presign_ttl
+        }
+        if seconds > registry.sigv4.max_presign_seconds() {
+          seconds = registry.sigv4.max_presign_seconds()
+        }
+        const target = self.target_for(key)
+        return registry.sigv4.presign(self.credentials, "GET", self.scheme, target.host, target.path, seconds, time.now()).url
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // BlobHealth.
+
+  def probe() (R, String) {
+    case self.check_bucket() {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, _) then { return (R.ok, "s3:" + self.settings.endpoint + "/" + self.settings.bucket) }
+    }
+  }
+
+  def check_bucket() (R, Bool) {
+    const target = self.bucket_target()
+    case self.send("HEAD", target, [], "") {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, resp) then {
+        if written(resp.status) {
+          return (R.ok, true)
+        }
+        if resp.status == 404 {
+          return (R.error, "s3: bucket '" + self.settings.bucket + "' not found at " + self.settings.endpoint
+            + " (create it, or point store.s3.bucket at an existing bucket)")
+        }
+        if resp.status == 403 {
+          return (R.error, "s3: access denied for bucket '" + self.settings.bucket + "' at " + self.settings.endpoint
+            + " (check store.s3.access_key and store.s3.secret_key)")
+        }
+        return (R.error, self.failure("HEAD", target.path, resp))
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Requests.
+
+  // Signs and sends one request. The payload header and Host travel in the
+  // signed header set; Host is dropped from the wire copy because http writes
+  // the same value itself.
+  def send(method String, target Target, extra Array[(String, String)], body String) (R, http.HttpResponse) {
+    const payload_hash = registry.sigv4.sha256_hex(body)
+    var headers = [("host", target.host), (payload_header, payload_hash)]
+    var i = 0
+    while i < extra.length() {
+      headers = headers.append(extra[i])
+      i = i + 1
+    }
+    const signed = registry.sigv4.sign_request(self.credentials, method, target.path, [], headers, payload_hash, time.now())
+    const wire = without_header(signed, "host")
+    return self.send_attempt(method, target.url(), wire, body, 1)
+  }
+
+  def send_attempt(method String, url String, headers Array[(String, String)], body String, attempt Int64) (R, http.HttpResponse) {
+    case self.transport.request(method, url, headers, body, default_timeout) {
+      (R.error, why) then {
+        if attempt < max_attempts {
+          time.sleep(attempt.to_float64() * retry_delay)
+          return self.send_attempt(method, url, headers, body, attempt + 1)
+        }
+        return (R.error, "s3: " + method + " " + url + " failed after " + attempt.to_string() + " attempts: " + why)
+      }
+      (R.ok, resp) then {
+        if resp.status >= 500 && attempt < max_attempts {
+          time.sleep(attempt.to_float64() * retry_delay)
+          return self.send_attempt(method, url, headers, body, attempt + 1)
+        }
+        return (R.ok, resp)
+      }
+    }
+  }
+
+  def failure(method String, path String, resp http.HttpResponse) String {
+    const code = error_code(resp.body)
+    var detail = ""
+    if code != "" {
+      detail = " (" + code + ")"
+    }
+    return "s3: " + method + " " + path + " failed: HTTP " + resp.status.to_string() + detail
+  }
+
+  def target_for(key String) Target {
+    if self.base_path == "" {
+      return Target.new(self.scheme, self.host, "/" + key)
+    }
+    return Target.new(self.scheme, self.host, self.base_path + "/" + key)
+  }
+
+  def bucket_target() Target {
+    if self.base_path == "" {
+      return Target.new(self.scheme, self.host, "/")
+    }
+    return Target.new(self.scheme, self.host, self.base_path)
+  }
+}
+
+// [prefix/]sha256/<hex>, with the configured prefix's slashes trimmed.
+def object_key_with(prefix String, digest String) (R, String) {
+  const hex = registry.digest.hex(digest)
+  if hex == "" {
+    return (R.error, "s3: invalid digest '" + digest + "' (expected sha256:<64 lowercase hex>)")
+  }
+  const trimmed = trim_slashes(prefix)
+  if trimmed == "" {
+    return (R.ok, "sha256/" + hex)
+  }
+  return (R.ok, trimmed + "/sha256/" + hex)
+}
+
+def trim_slashes(text String) String {
+  var start = 0
+  var end = text.length()
+  while start < end {
+    if text.substring(start, 1) == "/" {
+      start = start + 1
+    } else {
+      break
+    }
+  }
+  while end > start {
+    if text.substring(end - 1, 1) == "/" {
+      end = end - 1
+    } else {
+      break
+    }
+  }
+  return text.substring(start, end - start)
+}
+
+// "bytes 0-0/22" → 22; -1 when the header is absent or malformed.
+def content_range_total(header String) Int64 {
+  const slash = header.index_of("/")
+  if slash < 0 {
+    return -1
+  }
+  const total = header.substring(slash + 1, header.length() - slash - 1)
+  if !all_digits(total) {
+    return -1
+  }
+  return total.to_int64()
+}
+
+def written(status Int64) Bool {
+  return status == 200 || status == 201 || status == 204
+}
+
+
+def without_header(headers Array[(String, String)], name String) Array[(String, String)] {
+  var out = []
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() != name.lower() {
+      out = out.append((key, value))
+    }
+    i = i + 1
+  }
+  return out
+}
+
+def clip(body String, offset Int64, length Int64) String {
+  const size = body.to_bytes().length()
+  if offset > size {
+    return ""
+  }
+  var take = length
+  if offset + take > size {
+    take = size - offset
+  }
+  return body.substring(offset, take)
+}
+
+def all_digits(text String) Bool {
+  if text == "" {
+    return false
+  }
+  var i = 0
+  while i < text.length() {
+    const c = text.substring(i, 1)
+    if c != "0" && c != "1" && c != "2" && c != "3" && c != "4" && c != "5" && c != "6" && c != "7" && c != "8" && c != "9" {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// S3 error bodies are XML; take the <Code> element, never the body itself
+// (it can echo the access key id).
+def error_code(body String) String {
+  const open_at = body.index_of("<Code>")
+  if open_at < 0 {
+    return ""
+  }
+  const rest = body.substring(open_at + 6, body.length() - open_at - 6)
+  const close_at = rest.index_of("</Code>")
+  if close_at < 0 {
+    return ""
+  }
+  return rest.substring(0, close_at)
+}

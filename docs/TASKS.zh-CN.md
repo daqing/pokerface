@@ -351,7 +351,7 @@ images:
 | [x] | T2.3 | OCI Manifest / Index 模型与校验 | T1.5 | 2-3h |
 | [x] | T2.4 | BlobStore 接口与本地文件后端 | T2.1 | 2h |
 | [x] | T2.5 | AWS SigV4 签名与预签名 URL | T2.1 | 3h |
-| [ ] | T2.6 | S3 / MinIO BlobStore 适配 | T2.4、T2.5 | 3h |
+| [x] | T2.6 | S3 / MinIO BlobStore 适配 | T2.4、T2.5 | 3h |
 | [ ] | T2.7 | `/v2/` 基础协议与错误格式 | T2.1、T2.2 | 1-2h |
 | [ ] | T2.8 | Manifest GET / HEAD 与 tag / digest 解析 | T2.2、T2.3、T2.7 | 3h |
 | [ ] | T2.9 | Blob GET 与 307 预签名重定向 | T2.4、T2.6、T2.8 | 2-3h |
@@ -445,6 +445,8 @@ images:
 **验收**：对 MinIO 完成上传 / 下载 / 预签名访问；bucket 不存在时启动失败并提示；TLS 与自签 CA 可配置；网络错误有重试与清晰错误；不在日志中输出密钥。
 
 **依赖**：T2.4、T2.5 · **预估**：3h
+
+> **备注**（2026-11-18，约 3h）：已完成，但有一个环境限制（见下）。`registry/s3_blobstore.emo` 用签名 HTTP 实现 BlobStore：path-style 与 virtual-host 两种寻址、键为 `[prefix/]sha256/<hex>`、可注入 transport（真实实现根据 `ca_file`/`verify_tls` 构造 TLS 选项），启动时对 bucket 发签名 HEAD——404 报出 bucket 名与 endpoint，403 点出两个凭据配置项但不打印值。`store.s3.*` 接入配置，含严格未知字段检查、环境变量覆盖与校验（endpoint scheme/路径、bucket、region、凭据、presign ttl 1–604800）；summary 只打印 `access_key=<set>`，从不输出密钥。请求签名包含 `host`（默认端口被去掉，保证与线上 Host 一致）、`x-amz-content-sha256` 以及额外头（`content-type`、`range`、会话 token）；签名用的 Host 条目在发送前移除，因为 stdlib 客户端自己写 Host。传输错误与 5xx 重试 3 次并退避，4xx 不重试；错误文本带方法/URL/状态和 S3 的 `<Code>`，绝不带 body 或密钥。**实测发现的坑**：`head` 不能用 HEAD——stdlib http 客户端在 HEAD 响应里也会读 `Content-Length` 个字节，而 S3 的 HEAD 只报大小没有 body（连接在读取中途断开）。现改为 ranged GET（`bytes=0-0`），从 `Content-Range` 取总大小；空对象由 416 回退到普通 GET，忽略 Range 的服务端由 200 计数兜底。健康检查改为向 backend 询问 `BlobHealth.probe()`，两种存储的 /readyz 都成立（LocalStore 探测 digest 目录，S3Store HEAD bucket）。测试：`test/registry_s3.emo` 20 个——注入 transport 的协议覆盖，加上 `POKERFACE_TEST_S3_*` 设置时的真实往返（put/get/head/range/预签名下载/过期 403/delete）；mock `mock/s3_fixture.emo` 会验签与校验预签名有效期并把对象落盘，由 `scripts/e2e-s3.sh` 启动；`emo test` 314/314。已手工验证服务跑 s3 后端：启动 bucket 检查、`/readyz` 200、summary 脱敏、bucket 不存在时退出 1 并给出清晰信息。**限制**：本机无法访问 Docker Hub（`docker pull minio/minio` 超时），所以没能运行 MinIO 本体；真实往返是对本地会验签的 fixture 跑的。把 `POKERFACE_TEST_S3_*` 指向 MinIO 即可运行同一测试。
 
 #### T2.7 `/v2/` 基础协议与错误格式
 

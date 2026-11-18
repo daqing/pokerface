@@ -53,6 +53,13 @@ interface BlobStore {
   def presign_get(digest String, ttl_seconds Int64) String
 }
 
+// What /readyz asks of a backend: a cheap liveness check that answers the
+// detail to show on success and the reason on failure. T2.6's S3 store probes
+// with a HEAD on the bucket.
+interface BlobHealth {
+  def probe() (R, String)
+}
+
 def is_not_found(reason String) Bool {
   return reason.starts_with(not_found_prefix)
 }
@@ -246,6 +253,18 @@ class LocalStore {
 
   def presign_get(digest String, ttl_seconds Int64) String {
     return ""
+  }
+
+  // /readyz: the digest directory is there and writable.
+  def probe() (R, String) {
+    const probe_path = self.dir() + "/.readyz-" + os.getpid().to_string()
+    case file.write(probe_path, "ok") {
+      (R.error, why) then { return (R.error, "fs:" + self.root + " (" + why + ")") }
+      (R.ok, _) then {
+        const (_, _) = os.unlink(probe_path)
+        return (R.ok, "fs:" + self.root)
+      }
+    }
   }
 
   // Validated paths for one digest: the blob and its size record.

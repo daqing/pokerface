@@ -1,0 +1,453 @@
+// T2.6 tests for the S3 / MinIO blob backend — run with `emo test`.
+//
+// The protocol tests use an injected transport, so they need no network: the
+// first response is always the start-up bucket HEAD, the rest are the calls
+// under test. The last test runs a real round trip when the MinIO environment
+// variables are set (scripts/e2e-s3.sh sets them); otherwise it returns
+// without touching the network, like the skopeo leg of the layout tests.
+
+const s3 = registry.s3_blobstore
+const cfg = registry.config
+const blob = registry.blobstore
+
+require "os"
+require "http"
+require "file"
+require "crypto"
+require "time"
+
+const test_digest_body = "s3 round trip\n"
+
+def round_trip_digest() String {
+  return "sha256:" + crypto.hex_encode(crypto.sha2.sha256(test_digest_body.to_bytes()))
+}
+
+def fake_settings() registry.config.S3Settings {
+  return cfg.S3Settings.new(
+    "http://127.0.0.1:9000",
+    "pokerface",
+    "us-east-1",
+    "AKIAEXAMPLE",
+    "secret-value",
+    true,
+    "registry",
+    "",
+    true,
+    900
+  )
+}
+
+class FakeResponse {
+  def init(status Int64, headers Array[(String, String)], body String, failure String) {
+    self.status = status
+    self.headers = headers
+    self.body = body
+    self.failure = failure
+  }
+}
+
+class FakeCall {
+  def init(method String, url String, headers Array[(String, String)], body String) {
+    self.method = method
+    self.url = url
+    self.headers = headers
+    self.body = body
+  }
+}
+
+def answer(status Int64) FakeResponse {
+  return FakeResponse.new(status, [], "", "")
+}
+
+def answer_with(status Int64, headers Array[(String, String)], body String) FakeResponse {
+  return FakeResponse.new(status, headers, body, "")
+}
+
+def drop(reason String) FakeResponse {
+  return FakeResponse.new(0, [], "", reason)
+}
+
+class FakeS3Transport {
+  def init(responses Array[FakeResponse]) {
+    self.responses = responses
+    self.index = Box.new(0)
+    self.calls = Box.new(ArrayBuilder.new())
+  }
+
+  def request(method String, url String, headers Array[(String, String)], body String, timeout Float64) (R, http.HttpResponse) {
+    self.calls.read().push(FakeCall.new(method, url, headers, body))
+    const i = self.index.read()
+    self.index.replace(i + 1)
+    if i >= self.responses.length() {
+      return (R.error, "fake: no response left for " + method + " " + url)
+    }
+    const r = self.responses[i]
+    if r.failure != "" {
+      return (R.error, r.failure)
+    }
+    return (R.ok, http.response(r.status, r.headers, r.body))
+  }
+
+  def count() Int64 {
+    return self.index.read()
+  }
+
+  def call(i Int64) FakeCall {
+    return self.calls.read().get(i)
+  }
+}
+
+def opened(responses Array[FakeResponse]) (R, registry.s3_blobstore.S3Store) {
+  return s3.open_with(fake_settings(), FakeS3Transport.new(responses))
+}
+
+def header_value(headers Array[(String, String)], name String) String {
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == name.lower() {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+def store_over(transport FakeS3Transport) registry.s3_blobstore.S3Store {
+  case s3.open_with(fake_settings(), transport) {
+    (R.ok, store) then { return store }
+    (R.error, why) then {
+      expect_fail("the store did not open: " + why)
+      return fallback_store(transport)
+    }
+  }
+}
+
+def fallback_store(transport FakeS3Transport) registry.s3_blobstore.S3Store {
+  const credentials = registry.sigv4.Credentials.new("AKIAEXAMPLE", "secret-value", "us-east-1", "s3", "")
+  return s3.S3Store.new(fake_settings(), credentials, transport, "http", "127.0.0.1:9000", "/pokerface")
+}
+
+def test_open_checks_the_bucket() {
+  const transport = FakeS3Transport.new([answer(200)])
+  case s3.open_with(fake_settings(), transport) {
+    (R.ok, _) then { }
+    (R.error, why) then { expect_fail("open failed: " + why) }
+  }
+  expect_equal(1, transport.count())
+  const call = transport.call(0)
+  expect_equal("HEAD", call.method)
+  expect_equal("http://127.0.0.1:9000/pokerface", call.url)
+  expect_true(header_value(call.headers, "authorization").starts_with("AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/"))
+  expect_true(header_value(call.headers, "x-amz-content-sha256") != "")
+  expect_true(header_value(call.headers, "host") == "")
+}
+
+def test_missing_bucket_fails_with_a_clear_message() {
+  case opened([answer(404)]) {
+    (R.ok, _) then { expect_fail("a missing bucket was accepted") }
+    (R.error, why) then {
+      expect_true(why.index_of("bucket 'pokerface' not found") >= 0)
+      expect_true(why.index_of("http://127.0.0.1:9000") >= 0)
+      expect_true(why.index_of("create it") >= 0)
+    }
+  }
+}
+
+def test_access_denied_names_the_settings_not_the_values() {
+  case opened([answer(403)]) {
+    (R.ok, _) then { expect_fail("access denied was accepted") }
+    (R.error, why) then {
+      expect_true(why.index_of("access denied") >= 0)
+      expect_true(why.index_of("store.s3.access_key") >= 0)
+      expect_true(why.index_of("AKIAEXAMPLE") < 0)
+      expect_true(why.index_of("secret-value") < 0)
+    }
+  }
+}
+
+def test_put_signs_a_put_under_the_prefix() {
+  const transport = FakeS3Transport.new([answer(200), answer(200)])
+  const store = store_over(transport)
+  case store.put(round_trip_digest(), test_digest_body) {
+    (R.ok, info) then {
+      expect_true(info.exists)
+      expect_equal(test_digest_body.to_bytes().length(), info.size)
+    }
+    (R.error, why) then { expect_fail("put failed: " + why) }
+  }
+  const call = transport.call(1)
+  expect_equal("PUT", call.method)
+  expect_equal("http://127.0.0.1:9000/pokerface/registry/sha256/" + registry.digest.hex(round_trip_digest()), call.url)
+  expect_equal(test_digest_body, call.body)
+  expect_equal(registry.sigv4.sha256_hex(test_digest_body), header_value(call.headers, "x-amz-content-sha256"))
+  expect_equal("application/octet-stream", header_value(call.headers, "content-type"))
+  expect_true(header_value(call.headers, "authorization") != "")
+  expect_true(header_value(call.headers, "host") == "")
+}
+
+def test_digest_mismatch_is_rejected_before_sending() {
+  const transport = FakeS3Transport.new([answer(200)])
+  const store = store_over(transport)
+  case store.put(round_trip_digest(), "different bytes") {
+    (R.ok, _) then { expect_fail("a mismatched digest was accepted") }
+    (R.error, why) then { expect_true(why.index_of("digest mismatch") >= 0) }
+  }
+  expect_equal(1, transport.count())
+}
+
+def test_invalid_digests_are_rejected() {
+  const transport = FakeS3Transport.new([answer(200)])
+  const store = store_over(transport)
+  case store.put("sha256:../../evil", "x") {
+    (R.ok, _) then { expect_fail("an invalid digest was accepted") }
+    (R.error, why) then { expect_true(why.index_of("invalid digest") >= 0) }
+  }
+  expect_equal("", store.presign_get("sha256:../../evil", 60))
+  expect_equal(1, transport.count())
+}
+
+def test_get_maps_200_and_404() {
+  const transport = FakeS3Transport.new([answer(200), answer_with(200, [], "the bytes"), answer(404)])
+  const store = store_over(transport)
+  case store.get(round_trip_digest()) {
+    (R.ok, text) then { expect_equal("the bytes", text) }
+    (R.error, why) then { expect_fail("get failed: " + why) }
+  }
+  case store.get(round_trip_digest()) {
+    (R.ok, _) then { expect_fail("a missing blob was found") }
+    (R.error, why) then { expect_true(blob.is_not_found(why)) }
+  }
+}
+
+def test_head_uses_a_ranged_get() {
+  const transport = FakeS3Transport.new([answer(200), answer_with(206, [("Content-Range", "bytes 0-0/42")], "x"), answer(404)])
+  const store = store_over(transport)
+  case store.head(round_trip_digest()) {
+    (R.ok, info) then {
+      expect_true(info.exists)
+      expect_equal(42, info.size)
+    }
+    (R.error, why) then { expect_fail("head failed: " + why) }
+  }
+  expect_equal("GET", transport.call(1).method)
+  expect_equal("bytes=0-0", header_value(transport.call(1).headers, "range"))
+  case store.head(round_trip_digest()) {
+    (R.ok, info) then { expect_true(!info.exists) }
+    (R.error, why) then { expect_fail("head failed: " + why) }
+  }
+}
+
+def test_head_falls_back_for_an_empty_object() {
+  const transport = FakeS3Transport.new([answer(200), answer(416), answer_with(200, [], "")])
+  const store = store_over(transport)
+  case store.head(round_trip_digest()) {
+    (R.ok, info) then {
+      expect_true(info.exists)
+      expect_equal(0, info.size)
+    }
+    (R.error, why) then { expect_fail("head failed: " + why) }
+  }
+}
+
+def test_head_accepts_a_server_that_ignores_range() {
+  const transport = FakeS3Transport.new([answer(200), answer_with(200, [], "abc")])
+  const store = store_over(transport)
+  case store.head(round_trip_digest()) {
+    (R.ok, info) then {
+      expect_true(info.exists)
+      expect_equal(3, info.size)
+    }
+    (R.error, why) then { expect_fail("head failed: " + why) }
+  }
+}
+
+def test_read_range_sends_a_range_header() {
+  const transport = FakeS3Transport.new([answer(200), answer_with(206, [], "234"), answer_with(200, [], "0123456789")])
+  const store = store_over(transport)
+  case store.read_range(round_trip_digest(), 2, 3) {
+    (R.ok, text) then { expect_equal("234", text) }
+    (R.error, why) then { expect_fail("range failed: " + why) }
+  }
+  expect_equal("bytes=2-4", header_value(transport.call(1).headers, "range"))
+  case store.read_range(round_trip_digest(), 2, 3) {
+    (R.ok, text) then { expect_equal("234", text) }
+    (R.error, why) then { expect_fail("range fallback failed: " + why) }
+  }
+  case store.read_range(round_trip_digest(), 0, 0) {
+    (R.ok, text) then { expect_equal("", text) }
+    (R.error, why) then { expect_fail("empty range failed: " + why) }
+  }
+  expect_equal(3, transport.count())
+}
+
+def test_delete_maps_204_and_404() {
+  const transport = FakeS3Transport.new([answer(200), answer(204), answer(404)])
+  const store = store_over(transport)
+  case store.delete(round_trip_digest()) {
+    (R.ok, removed) then { expect_true(removed) }
+    (R.error, why) then { expect_fail("delete failed: " + why) }
+  }
+  case store.delete(round_trip_digest()) {
+    (R.ok, removed) then { expect_true(!removed) }
+    (R.error, why) then { expect_fail("delete failed: " + why) }
+  }
+}
+
+def test_network_errors_retry_three_times() {
+  const transport = FakeS3Transport.new([answer(200), drop("connection reset"), drop("connection reset"), drop("connection reset")])
+  const store = store_over(transport)
+  case store.put(round_trip_digest(), test_digest_body) {
+    (R.ok, _) then { expect_fail("a dropped connection succeeded") }
+    (R.error, why) then {
+      expect_true(why.index_of("failed after 3 attempts") >= 0)
+      expect_true(why.index_of("connection reset") >= 0)
+    }
+  }
+  expect_equal(4, transport.count())
+}
+
+def test_server_errors_retry_then_succeed() {
+  const transport = FakeS3Transport.new([answer(200), answer(503), answer(200)])
+  const store = store_over(transport)
+  case store.put(round_trip_digest(), test_digest_body) {
+    (R.ok, _) then { }
+    (R.error, why) then { expect_fail("the retry did not recover: " + why) }
+  }
+  expect_equal(3, transport.count())
+}
+
+def test_error_code_is_reported_without_the_body() {
+  const body = "<Error><Code>NoSuchKey</Code><Message>secret path</Message><AWSAccessKeyId>AKIAEXAMPLE</AWSAccessKeyId></Error>"
+  const transport = FakeS3Transport.new([answer(200), answer_with(400, [], body)])
+  const store = store_over(transport)
+  case store.put(round_trip_digest(), test_digest_body) {
+    (R.ok, _) then { expect_fail("a 400 was accepted") }
+    (R.error, why) then {
+      expect_true(why.index_of("HTTP 400") >= 0)
+      expect_true(why.index_of("(NoSuchKey)") >= 0)
+      expect_true(why.index_of("AKIAEXAMPLE") < 0)
+    }
+  }
+}
+
+def test_presign_get_returns_a_signed_url() {
+  const transport = FakeS3Transport.new([answer(200)])
+  const store = store_over(transport)
+  const url = store.presign_get(round_trip_digest(), 0)
+  expect_true(url.starts_with("http://127.0.0.1:9000/pokerface/registry/sha256/" + registry.digest.hex(round_trip_digest()) + "?"))
+  expect_true(url.index_of("X-Amz-Algorithm=AWS4-HMAC-SHA256") >= 0)
+  expect_true(url.index_of("X-Amz-Expires=900") >= 0)
+  expect_true(url.index_of("X-Amz-Signature=") >= 0)
+  expect_true(url.index_of("secret-value") < 0)
+  const short = store.presign_get(round_trip_digest(), 60)
+  expect_true(short.index_of("X-Amz-Expires=60") >= 0)
+  expect_equal(1, transport.count())
+}
+
+def test_virtual_host_style_addresses_the_bucket_subdomain() {
+  const settings = cfg.S3Settings.new(
+    "https://s3.example.com",
+    "pokerface",
+    "us-east-1",
+    "AKIAEXAMPLE",
+    "secret-value",
+    false,
+    "",
+    "",
+    true,
+    900
+  )
+  const transport = FakeS3Transport.new([answer(200), answer(200)])
+  case s3.open_with(settings, transport) {
+    (R.ok, store) then {
+      expect_equal("HEAD", transport.call(0).method)
+      expect_equal("https://pokerface.s3.example.com/", transport.call(0).url)
+      case store.put(round_trip_digest(), test_digest_body) {
+        (R.ok, _) then { }
+        (R.error, why) then { expect_fail("put failed: " + why) }
+      }
+      expect_equal("https://pokerface.s3.example.com/sha256/" + registry.digest.hex(round_trip_digest()), transport.call(1).url)
+    }
+    (R.error, why) then { expect_fail("open failed: " + why) }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The real round trip, when scripts/e2e-s3.sh points the environment at
+// MinIO. Without it the test does nothing (the storage paths above are still
+// covered), matching the skopeo leg of the layout tests.
+
+def minio_env(name String) String {
+  case os.getenv(name) {
+    (R.ok, value) then { return value }
+    (R.error, _) then { return "" }
+  }
+}
+
+def test_minio_round_trip_when_configured() {
+  const endpoint = minio_env("POKERFACE_TEST_S3_ENDPOINT")
+  if endpoint != "" {
+    minio_round_trip(endpoint)
+  }
+}
+
+def minio_round_trip(endpoint String) {
+  const settings = cfg.S3Settings.new(
+    endpoint,
+    minio_env("POKERFACE_TEST_S3_BUCKET"),
+    "us-east-1",
+    minio_env("POKERFACE_TEST_S3_ACCESS_KEY"),
+    minio_env("POKERFACE_TEST_S3_SECRET_KEY"),
+    true,
+    "pokerface-t2-6-test",
+    "",
+    true,
+    60
+  )
+  case s3.open(settings) {
+    (R.error, why) then { expect_fail("cannot open the MinIO store: " + why) }
+    (R.ok, store) then {
+      const body = "minio round trip " + os.getpid().to_string()
+      const digest = "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+      case store.put(digest, body) {
+        (R.ok, _) then { }
+        (R.error, why) then { expect_fail("put failed: " + why) }
+      }
+      case store.get(digest) {
+        (R.ok, text) then { expect_equal(body, text) }
+        (R.error, why) then { expect_fail("get failed: " + why) }
+      }
+      case store.head(digest) {
+        (R.ok, info) then {
+          expect_true(info.exists)
+          expect_equal(body.to_bytes().length(), info.size)
+        }
+        (R.error, why) then { expect_fail("head failed: " + why) }
+      }
+      case store.read_range(digest, 6, 5) {
+        (R.ok, text) then { expect_equal("round", text) }
+        (R.error, why) then { expect_fail("range failed: " + why) }
+      }
+      const url = store.presign_get(digest, 30)
+      case http.get(url) {
+        (R.ok, resp) then {
+          expect_equal(200, resp.status)
+          expect_equal(body, resp.body)
+        }
+        (R.error, why) then { expect_fail("presigned fetch failed: " + why) }
+      }
+      // A URL whose window has passed is refused by MinIO.
+      const short_url = store.presign_get(digest, 1)
+      time.sleep(1.5)
+      case http.get(short_url) {
+        (R.ok, resp) then { expect_equal(403, resp.status) }
+        (R.error, why) then { expect_fail("expired presigned fetch failed: " + why) }
+      }
+      case store.delete(digest) {
+        (R.ok, removed) then { expect_true(removed) }
+        (R.error, why) then { expect_fail("delete failed: " + why) }
+      }
+    }
+  }
+}

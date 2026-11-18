@@ -16,6 +16,9 @@ const default_read_timeout = 30
 const default_idle_timeout = 5
 const shutdown_file_name = "registry.shutdown"
 const db_file_name = "registry.db"
+const default_s3_region = "us-east-1"
+const default_presign_ttl = 900
+const max_presign_ttl = 604800
 const known_backends = ["fs", "s3"]
 
 class RegistryListen {
@@ -35,10 +38,32 @@ class RegistryLimits {
 }
 
 class RegistryStore {
-  def init(backend String, root String) {
+  def init(backend String, root String, s3 S3Settings) {
     self.backend = backend
     self.root = root
+    self.s3 = s3
   }
+}
+
+// The S3/MinIO side of `store` (T2.6). Empty values mean "not configured";
+// validation only enforces them when the backend is s3.
+class S3Settings {
+  def init(endpoint String, bucket String, region String, access_key String, secret_key String, path_style Bool, prefix String, ca_file String, verify_tls Bool, presign_ttl Int64) {
+    self.endpoint = endpoint
+    self.bucket = bucket
+    self.region = region
+    self.access_key = access_key
+    self.secret_key = secret_key
+    self.path_style = path_style
+    self.prefix = prefix
+    self.ca_file = ca_file
+    self.verify_tls = verify_tls
+    self.presign_ttl = presign_ttl
+  }
+}
+
+def default_s3() S3Settings {
+  return S3Settings.new("", "", "us-east-1", "", "", true, "", "", true, 900)
 }
 
 class RegistryConfig {
@@ -62,7 +87,7 @@ def defaults(config_path String) RegistryConfig {
     RegistryListen.new(default_host, default_port),
     default_data_dir,
     "",
-    RegistryStore.new(default_store_backend, default_store_root),
+    RegistryStore.new(default_store_backend, default_store_root, default_s3()),
     RegistryLimits.new(default_max_body_bytes, default_max_header_bytes, default_read_timeout, default_idle_timeout),
     "",
     config_path
@@ -204,6 +229,7 @@ def parse_store(value yaml.Yaml, path String) (R, RegistryStore) {
   if value.is(yaml.YamlObject) {
     var backend = default_store_backend
     var root = default_store_root
+    var s3 = default_s3()
     const entries = value.entries()
     var i = 0
     while i < entries.length() {
@@ -221,15 +247,109 @@ def parse_store(value yaml.Yaml, path String) (R, RegistryStore) {
             (R.ok, text) then { root = text }
           }
         }
+        "s3" then {
+          case parse_s3(v, path) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, parsed) then { s3 = parsed }
+          }
+        }
         _ then {
-          return (R.error, cfg_error(path, "store." + key + ": unknown field (known: backend, root)"))
+          return (R.error, cfg_error(path, "store." + key + ": unknown field (known: backend, root, s3)"))
         }
       }
       i = i + 1
     }
-    return (R.ok, RegistryStore.new(backend, root))
+    return (R.ok, RegistryStore.new(backend, root, s3))
   }
   return (R.error, cfg_error(path, "store: expected a mapping"))
+}
+
+def parse_s3(value yaml.Yaml, path String) (R, S3Settings) {
+  if value.is(yaml.YamlObject) {
+    var endpoint = ""
+    var bucket = ""
+    var region = default_s3_region
+    var access_key = ""
+    var secret_key = ""
+    var path_style = true
+    var prefix = ""
+    var ca_file = ""
+    var verify_tls = true
+    var presign_ttl = default_presign_ttl
+    const entries = value.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, v) = entries[i]
+      case key {
+        "endpoint" then {
+          case string_value(v, path, "store.s3.endpoint") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { endpoint = text }
+          }
+        }
+        "bucket" then {
+          case string_value(v, path, "store.s3.bucket") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { bucket = text }
+          }
+        }
+        "region" then {
+          case string_value(v, path, "store.s3.region") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { region = text }
+          }
+        }
+        "access_key" then {
+          case string_value(v, path, "store.s3.access_key") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { access_key = text }
+          }
+        }
+        "secret_key" then {
+          case string_value(v, path, "store.s3.secret_key") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { secret_key = text }
+          }
+        }
+        "path_style" then {
+          case bool_value(v, path, "store.s3.path_style") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, flag) then { path_style = flag }
+          }
+        }
+        "prefix" then {
+          case string_value(v, path, "store.s3.prefix") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { prefix = text }
+          }
+        }
+        "ca_file" then {
+          case string_value(v, path, "store.s3.ca_file") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { ca_file = text }
+          }
+        }
+        "verify_tls" then {
+          case bool_value(v, path, "store.s3.verify_tls") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, flag) then { verify_tls = flag }
+          }
+        }
+        "presign_ttl" then {
+          case int_value(v, path, "store.s3.presign_ttl") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, n) then { presign_ttl = n }
+          }
+        }
+        _ then {
+          return (R.error, cfg_error(path, "store.s3." + key + ": unknown field (known: endpoint, bucket, region, access_key, secret_key, path_style, prefix, ca_file, verify_tls, presign_ttl)"))
+        }
+      }
+      i = i + 1
+    }
+    return (R.ok, S3Settings.new(endpoint, bucket, region, access_key, secret_key, path_style, prefix, ca_file, verify_tls, presign_ttl))
+  }
+  return (R.error, cfg_error(path, "store.s3: expected a mapping"))
 }
 
 def parse_limits(value yaml.Yaml, path String) (R, RegistryLimits) {
@@ -292,6 +412,13 @@ def int_value(value yaml.Yaml, path String, field String) (R, Int64) {
   return (R.error, cfg_error(path, field + ": expected an integer, got " + kind_word(value.kind())))
 }
 
+def bool_value(value yaml.Yaml, path String, field String) (R, Bool) {
+  if value.is(yaml.YamlBool) {
+    return (R.ok, value.as_bool())
+  }
+  return (R.error, cfg_error(path, field + ": expected a boolean, got " + kind_word(value.kind())))
+}
+
 def kind_word(kind yaml.YamlKind) String {
   case kind {
     yaml.YamlKind.ynull then { return "null" }
@@ -343,7 +470,7 @@ def apply_env(config RegistryConfig, env src.settings.EnvSource) (R, RegistryCon
   case env.getenv("POKERFACE_REGISTRY_STORE_BACKEND") {
     (R.ok, v) then {
       if v != "" {
-        store = RegistryStore.new(v, store.root)
+        store = RegistryStore.new(v, store.root, store.s3)
       }
     }
     (R.error, _) then { }
@@ -351,11 +478,104 @@ def apply_env(config RegistryConfig, env src.settings.EnvSource) (R, RegistryCon
   case env.getenv("POKERFACE_REGISTRY_STORE_ROOT") {
     (R.ok, v) then {
       if v != "" {
-        store = RegistryStore.new(store.backend, v)
+        store = RegistryStore.new(store.backend, v, store.s3)
       }
     }
     (R.error, _) then { }
   }
+  var s3 = store.s3
+  case env.getenv("POKERFACE_REGISTRY_S3_ENDPOINT") {
+    (R.ok, v) then {
+      if v != "" {
+        s3 = S3Settings.new(v, s3.bucket, s3.region, s3.access_key, s3.secret_key, s3.path_style, s3.prefix, s3.ca_file, s3.verify_tls, s3.presign_ttl)
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_S3_BUCKET") {
+    (R.ok, v) then {
+      if v != "" {
+        s3 = S3Settings.new(s3.endpoint, v, s3.region, s3.access_key, s3.secret_key, s3.path_style, s3.prefix, s3.ca_file, s3.verify_tls, s3.presign_ttl)
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_S3_REGION") {
+    (R.ok, v) then {
+      if v != "" {
+        s3 = S3Settings.new(s3.endpoint, s3.bucket, v, s3.access_key, s3.secret_key, s3.path_style, s3.prefix, s3.ca_file, s3.verify_tls, s3.presign_ttl)
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_S3_ACCESS_KEY") {
+    (R.ok, v) then {
+      if v != "" {
+        s3 = S3Settings.new(s3.endpoint, s3.bucket, s3.region, v, s3.secret_key, s3.path_style, s3.prefix, s3.ca_file, s3.verify_tls, s3.presign_ttl)
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_S3_SECRET_KEY") {
+    (R.ok, v) then {
+      if v != "" {
+        s3 = S3Settings.new(s3.endpoint, s3.bucket, s3.region, s3.access_key, v, s3.path_style, s3.prefix, s3.ca_file, s3.verify_tls, s3.presign_ttl)
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_S3_PATH_STYLE") {
+    (R.ok, v) then {
+      if v != "" {
+        case parse_bool_env("POKERFACE_REGISTRY_S3_PATH_STYLE", v) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, flag) then {
+            s3 = S3Settings.new(s3.endpoint, s3.bucket, s3.region, s3.access_key, s3.secret_key, flag, s3.prefix, s3.ca_file, s3.verify_tls, s3.presign_ttl)
+          }
+        }
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_S3_PREFIX") {
+    (R.ok, v) then {
+      s3 = S3Settings.new(s3.endpoint, s3.bucket, s3.region, s3.access_key, s3.secret_key, s3.path_style, v, s3.ca_file, s3.verify_tls, s3.presign_ttl)
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_S3_CA_FILE") {
+    (R.ok, v) then {
+      s3 = S3Settings.new(s3.endpoint, s3.bucket, s3.region, s3.access_key, s3.secret_key, s3.path_style, s3.prefix, v, s3.verify_tls, s3.presign_ttl)
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_S3_VERIFY_TLS") {
+    (R.ok, v) then {
+      if v != "" {
+        case parse_bool_env("POKERFACE_REGISTRY_S3_VERIFY_TLS", v) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, flag) then {
+            s3 = S3Settings.new(s3.endpoint, s3.bucket, s3.region, s3.access_key, s3.secret_key, s3.path_style, s3.prefix, s3.ca_file, flag, s3.presign_ttl)
+          }
+        }
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_S3_PRESIGN_TTL") {
+    (R.ok, v) then {
+      if v != "" {
+        case parse_int_env("POKERFACE_REGISTRY_S3_PRESIGN_TTL", v) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, n) then {
+            s3 = S3Settings.new(s3.endpoint, s3.bucket, s3.region, s3.access_key, s3.secret_key, s3.path_style, s3.prefix, s3.ca_file, s3.verify_tls, n)
+          }
+        }
+      }
+    }
+    (R.error, _) then { }
+  }
+  store = RegistryStore.new(store.backend, store.root, s3)
   case env.getenv("POKERFACE_REGISTRY_MAX_BODY_BYTES") {
     (R.ok, v) then {
       if v != "" {
@@ -432,6 +652,17 @@ def parse_int_env(name String, text String) (R, Int64) {
   return (R.ok, text.to_int64())
 }
 
+def parse_bool_env(name String, text String) (R, Bool) {
+  const lowered = text.lower()
+  if lowered == "true" || lowered == "1" {
+    return (R.ok, true)
+  }
+  if lowered == "false" || lowered == "0" {
+    return (R.ok, false)
+  }
+  return (R.error, "registry: " + name + ": expected true or false, got '" + text + "'")
+}
+
 def all_digits(text String) Bool {
   if text == "" {
     return false
@@ -460,8 +691,17 @@ def validate(config RegistryConfig) (R, RegistryConfig) {
   if !in_array(known_backends, config.store.backend) {
     return (R.error, cfg_error(config.config_path, "store.backend: unknown backend '" + config.store.backend + "' (known: fs, s3)"))
   }
-  if config.store.root == "" {
-    return (R.error, cfg_error(config.config_path, "store.root: must not be empty"))
+  if config.store.backend == "fs" {
+    if config.store.root == "" {
+      return (R.error, cfg_error(config.config_path, "store.root: must not be empty"))
+    }
+  }
+  if config.store.backend == "s3" {
+    const check = validate_s3(config.store.s3, config.config_path)
+    case check {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, _) then { }
+    }
   }
   if config.limits.max_body_bytes <= 0 {
     return (R.error, cfg_error(config.config_path, "limits.max_body_bytes: must be positive"))
@@ -484,6 +724,42 @@ def validate(config RegistryConfig) (R, RegistryConfig) {
     db_path = config.data_dir + "/" + db_file_name
   }
   return (R.ok, RegistryConfig.new(config.listen, config.data_dir, db_path, config.store, config.limits, shutdown_file, config.config_path))
+}
+
+def validate_s3(s3 S3Settings, path String) (R, Bool) {
+  if s3.endpoint == "" {
+    return (R.error, cfg_error(path, "store.s3.endpoint: must not be empty for the s3 backend"))
+  }
+  if !s3.endpoint.starts_with("http://") && !s3.endpoint.starts_with("https://") {
+    return (R.error, cfg_error(path, "store.s3.endpoint: must start with http:// or https://, got '" + s3.endpoint + "'"))
+  }
+  const scheme_at = s3.endpoint.index_of("://")
+  const authority = s3.endpoint.substring(scheme_at + 3, s3.endpoint.length() - scheme_at - 3)
+  if authority == "" {
+    return (R.error, cfg_error(path, "store.s3.endpoint: has no host"))
+  }
+  if authority.index_of("/") >= 0 {
+    return (R.error, cfg_error(path, "store.s3.endpoint: must not include a path (use store.s3.prefix)"))
+  }
+  if s3.bucket == "" {
+    return (R.error, cfg_error(path, "store.s3.bucket: must not be empty for the s3 backend"))
+  }
+  if s3.bucket.index_of("/") >= 0 {
+    return (R.error, cfg_error(path, "store.s3.bucket: must not contain '/'"))
+  }
+  if s3.region == "" {
+    return (R.error, cfg_error(path, "store.s3.region: must not be empty"))
+  }
+  if s3.access_key == "" {
+    return (R.error, cfg_error(path, "store.s3.access_key: must not be empty (set POKERFACE_REGISTRY_S3_ACCESS_KEY)"))
+  }
+  if s3.secret_key == "" {
+    return (R.error, cfg_error(path, "store.s3.secret_key: must not be empty (set POKERFACE_REGISTRY_S3_SECRET_KEY)"))
+  }
+  if s3.presign_ttl <= 0 || s3.presign_ttl > max_presign_ttl {
+    return (R.error, cfg_error(path, "store.s3.presign_ttl: must be between 1 and " + max_presign_ttl.to_string() + " seconds"))
+  }
+  return (R.ok, true)
 }
 
 def in_array(items Array[String], wanted String) Bool {
@@ -522,12 +798,25 @@ def with_shutdown_file(config RegistryConfig, shutdown_file String) RegistryConf
   return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, config.limits, shutdown_file, config.config_path)
 }
 
+// Never renders the S3 secret (or the access key id) — the summary goes to
+// the service log at start-up.
+def store_summary(store RegistryStore) String {
+  if store.backend == "s3" {
+    var prefix = ""
+    if store.s3.prefix != "" {
+      prefix = " prefix=" + store.s3.prefix
+    }
+    return "s3:" + store.s3.endpoint + "/" + store.s3.bucket + prefix + " access_key=<set>"
+  }
+  return "fs:" + store.root
+}
+
 def summary(config RegistryConfig) String {
   return (
     "registry: listen=" + config.listen.host + ":" + config.listen.port.to_string()
     + " data_dir=" + config.data_dir
     + " db=" + config.db_path
-    + " store=" + config.store.backend + ":" + config.store.root
+    + " store=" + store_summary(config.store)
     + " max_body=" + config.limits.max_body_bytes.to_string()
     + " max_header=" + config.limits.max_header_bytes.to_string()
     + " read_timeout=" + config.limits.read_timeout.to_string()

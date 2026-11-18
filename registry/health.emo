@@ -1,8 +1,8 @@
-// T2.1/T2.2: health and readiness for the registry service. /healthz is
+// T2.1/T2.2/T2.6: health and readiness for the registry service. /healthz is
 // liveness (the process is answering); /readyz runs the configured checks —
 // the data directory, the database, and the blob store must be usable — and
-// answers 503 with the failed check names when they are not. T2.6 adds the
-// real S3 store.
+// answers 503 with the failed check names when they are not. The store check
+// asks the backend (fs or s3) through its BlobHealth probe.
 
 require "os"
 require "file"
@@ -26,8 +26,8 @@ def health_response() httpd.Response {
   return httpd.response(200, [("Content-Type", "text/plain; charset=utf-8")], "ok\n")
 }
 
-def ready_response(config registry.config.RegistryConfig, db DbHealth) httpd.Response {
-  const results = checks(config, db)
+def ready_response(config registry.config.RegistryConfig, db DbHealth, blob registry.blobstore.BlobHealth) httpd.Response {
+  const results = checks(config, db, blob)
   var failed = ""
   var count = 0
   var i = 0
@@ -47,8 +47,8 @@ def ready_response(config registry.config.RegistryConfig, db DbHealth) httpd.Res
   return httpd.response(503, [("Content-Type", "text/plain; charset=utf-8")], "not ready: " + failed + "\n")
 }
 
-def ready(config registry.config.RegistryConfig, db DbHealth) Bool {
-  const results = checks(config, db)
+def ready(config registry.config.RegistryConfig, db DbHealth, blob registry.blobstore.BlobHealth) Bool {
+  const results = checks(config, db, blob)
   var i = 0
   while i < results.length() {
     if !results[i].ok {
@@ -59,8 +59,8 @@ def ready(config registry.config.RegistryConfig, db DbHealth) Bool {
   return true
 }
 
-def checks(config registry.config.RegistryConfig, db DbHealth) Array[HealthCheck] {
-  return [data_dir_check(config.data_dir), db_check(db), store_check(config.store)]
+def checks(config registry.config.RegistryConfig, db DbHealth, blob registry.blobstore.BlobHealth) Array[HealthCheck] {
+  return [data_dir_check(config.data_dir), db_check(db), store_check(blob)]
 }
 
 def db_check(db DbHealth) HealthCheck {
@@ -70,24 +70,20 @@ def db_check(db DbHealth) HealthCheck {
   return HealthCheck.new("db", false, db.path() + " (SELECT 1 failed)")
 }
 
+// The backend answers for itself: the local store proves its digest directory
+// is writable, the S3 store heads its bucket.
+def store_check(blob registry.blobstore.BlobHealth) HealthCheck {
+  case blob.probe() {
+    (R.ok, detail) then { return HealthCheck.new("store", true, detail) }
+    (R.error, why) then { return HealthCheck.new("store", false, why) }
+  }
+}
+
 def data_dir_check(path String) HealthCheck {
   case ensure_writable(path) {
     (R.ok, _) then { return HealthCheck.new("data_dir", true, path) }
     (R.error, why) then { return HealthCheck.new("data_dir", false, path + " (" + why + ")") }
   }
-}
-
-def store_check(store registry.config.RegistryStore) HealthCheck {
-  if store.backend == "fs" {
-    case ensure_writable(store.root) {
-      (R.ok, _) then { return HealthCheck.new("store", true, "fs:" + store.root) }
-      (R.error, why) then { return HealthCheck.new("store", false, "fs:" + store.root + " (" + why + ")") }
-    }
-  }
-  if store.backend == "s3" {
-    return HealthCheck.new("store", false, "s3 backend is not implemented until T2.6 (" + store.root + ")")
-  }
-  return HealthCheck.new("store", false, "unknown backend '" + store.backend + "'")
 }
 
 // Creates the directory when absent and proves it is writable with a probe
@@ -115,7 +111,7 @@ def ensure_writable(path String) (R, Bool) {
 
 // T2.1 routing: the two health endpoints plus a placeholder /v2/ so a
 // standard registry probe succeeds before T2.7 lands.
-def handle(req httpd.Request, config registry.config.RegistryConfig, db DbHealth) httpd.Response {
+def handle(req httpd.Request, config registry.config.RegistryConfig, db DbHealth, blob registry.blobstore.BlobHealth) httpd.Response {
   if req.path == "/healthz" {
     if req.method != "GET" {
       return method_not_allowed()
@@ -126,7 +122,7 @@ def handle(req httpd.Request, config registry.config.RegistryConfig, db DbHealth
     if req.method != "GET" {
       return method_not_allowed()
     }
-    return ready_response(config, db)
+    return ready_response(config, db, blob)
   }
   if req.path == "/v2/" {
     if req.method != "GET" {

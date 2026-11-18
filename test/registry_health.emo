@@ -31,7 +31,7 @@ def make_config(data_dir String, store_root String, backend String) registry.con
     registry.config.RegistryListen.new("127.0.0.1", 5000),
     data_dir,
     data_dir + "/registry.db",
-    registry.config.RegistryStore.new(backend, store_root),
+    registry.config.RegistryStore.new(backend, store_root, registry.config.default_s3()),
     registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
     data_dir + "/registry.shutdown",
     "<test>"
@@ -54,6 +54,24 @@ class FakeDb {
 
 def ready_db() FakeDb {
   return FakeDb.new(true)
+}
+
+class FakeBlob {
+  def init(ok Bool, detail String) {
+    self.ok = ok
+    self.detail = detail
+  }
+
+  def probe() (R, String) {
+    if self.ok {
+      return (R.ok, self.detail)
+    }
+    return (R.error, self.detail)
+  }
+}
+
+def ready_blob() FakeBlob {
+  return FakeBlob.new(true, "fs:/tmp/fake-store")
 }
 
 def dir_exists(path String) Bool {
@@ -80,12 +98,11 @@ def test_ready_when_directories_are_writable() {
   const data = health_tmp("data")
   const store = health_tmp("store")
   const config = make_config(data, store, "fs")
-  const response = reg_health.ready_response(config, ready_db())
+  const response = reg_health.ready_response(config, ready_db(), ready_blob())
   expect_equal(200, response.status)
   expect_equal("ready\n", response.body)
-  expect_true(reg_health.ready(config, ready_db()))
+  expect_true(reg_health.ready(config, ready_db(), ready_blob()))
   expect_true(dir_exists(data))
-  expect_true(dir_exists(store))
   case os.list_dir(data) {
     (R.ok, entries) then { expect_equal(0, entries.length()) }
     (R.error, why) then { expect_fail("cannot list " + data + ": " + why) }
@@ -97,30 +114,31 @@ def test_ready_is_503_when_data_dir_is_not_usable() {
   write_blocking_file(blocked)
   const store = health_tmp("store-ok")
   const config = make_config(blocked, store, "fs")
-  expect_true(!reg_health.ready(config, ready_db()))
-  const response = reg_health.ready_response(config, ready_db())
+  expect_true(!reg_health.ready(config, ready_db(), ready_blob()))
+  const response = reg_health.ready_response(config, ready_db(), ready_blob())
   expect_equal(503, response.status)
   expect_true(response.body.index_of("data_dir") >= 0)
 }
 
-def test_ready_is_503_when_store_is_not_usable() {
+def test_ready_is_503_when_the_store_probe_fails() {
   const data = health_tmp("data-ok")
-  const blocked = health_tmp("blocked-store")
-  write_blocking_file(blocked)
-  const config = make_config(data, blocked, "fs")
-  expect_true(!reg_health.ready(config, ready_db()))
-  const response = reg_health.ready_response(config, ready_db())
+  const config = make_config(data, health_tmp("store-probe"), "fs")
+  const blob = FakeBlob.new(false, "fs:/tmp/fake-store (not writable: denied)")
+  expect_true(!reg_health.ready(config, ready_db(), blob))
+  const response = reg_health.ready_response(config, ready_db(), blob)
   expect_equal(503, response.status)
-  expect_true(response.body.index_of("store") >= 0)
+  expect_true(response.body.index_of("store: fs:/tmp/fake-store") >= 0)
+  expect_true(response.body.index_of("not writable") >= 0)
 }
 
-def test_s3_store_is_not_ready_until_implemented() {
+def test_s3_probe_detail_is_reported() {
   const data = health_tmp("data-s3")
-  const config = make_config(data, "bucket/key", "s3")
-  expect_true(!reg_health.ready(config, ready_db()))
-  const response = reg_health.ready_response(config, ready_db())
-  expect_equal(503, response.status)
-  expect_true(response.body.index_of("s3 backend is not implemented") >= 0)
+  const config = make_config(data, "unused", "s3")
+  const blob = FakeBlob.new(true, "s3:http://minio:9000/pokerface")
+  expect_true(reg_health.ready(config, ready_db(), blob))
+  const response = reg_health.ready_response(config, ready_db(), blob)
+  expect_equal(200, response.status)
+  expect_equal("ready\n", response.body)
 }
 
 def test_ready_is_503_when_the_database_is_down() {
@@ -128,8 +146,8 @@ def test_ready_is_503_when_the_database_is_down() {
   const store = health_tmp("store-db-down")
   const config = make_config(data, store, "fs")
   const db = FakeDb.new(false)
-  expect_true(!reg_health.ready(config, db))
-  const response = reg_health.ready_response(config, db)
+  expect_true(!reg_health.ready(config, db, ready_blob()))
+  const response = reg_health.ready_response(config, db, ready_blob())
   expect_equal(503, response.status)
   expect_true(response.body.index_of("db: /tmp/fake-registry.db") >= 0)
   expect_true(response.body.index_of("SELECT 1 failed") >= 0)

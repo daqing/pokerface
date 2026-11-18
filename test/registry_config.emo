@@ -76,7 +76,7 @@ def expect_config_ok(result (R, registry.config.RegistryConfig), label String) r
         registry.config.RegistryListen.new("", 0),
         "",
         "",
-        registry.config.RegistryStore.new("", ""),
+        registry.config.RegistryStore.new("", "", registry.config.default_s3()),
         registry.config.RegistryLimits.new(0, 0, 0, 0),
         "",
         ""
@@ -156,6 +156,10 @@ def test_env_overrides_file_values() {
     ("POKERFACE_REGISTRY_DB_PATH", "/tmp/env-data/env.db"),
     ("POKERFACE_REGISTRY_STORE_BACKEND", "s3"),
     ("POKERFACE_REGISTRY_STORE_ROOT", "bucket/key"),
+    ("POKERFACE_REGISTRY_S3_ENDPOINT", "http://127.0.0.1:9000"),
+    ("POKERFACE_REGISTRY_S3_BUCKET", "bucket"),
+    ("POKERFACE_REGISTRY_S3_ACCESS_KEY", "AK"),
+    ("POKERFACE_REGISTRY_S3_SECRET_KEY", "SK"),
     ("POKERFACE_REGISTRY_MAX_BODY_BYTES", "4096"),
     ("POKERFACE_REGISTRY_MAX_HEADER_BYTES", "2048"),
     ("POKERFACE_REGISTRY_READ_TIMEOUT", "7"),
@@ -239,4 +243,123 @@ def test_summary_contains_the_effective_values() {
   expect_true(text.index_of("db=/tmp/reg-data/custom.db") >= 0)
   expect_true(text.index_of("max_body=2048") >= 0)
   expect_true(text.index_of("shutdown_file=/tmp/reg-stop") >= 0)
+}
+def s3_config() String {
+  return (
+    "store:\n"
+    + "  backend: s3\n"
+    + "  s3:\n"
+    + "    endpoint: http://127.0.0.1:9000\n"
+    + "    bucket: pokerface\n"
+    + "    region: eu-west-1\n"
+    + "    access_key: AKIAEXAMPLE\n"
+    + "    secret_key: secret-value\n"
+    + "    path_style: false\n"
+    + "    prefix: /registry/blobs/\n"
+    + "    ca_file: /tmp/ca.pem\n"
+    + "    verify_tls: false\n"
+    + "    presign_ttl: 120\n"
+  )
+}
+
+def test_s3_config_parses() {
+  const path = reg_tmp("s3.yaml")
+  write_config(path, s3_config())
+  const config = expect_config_ok(reg_config.load(env_empty(), path), "load")
+  expect_equal("s3", config.store.backend)
+  expect_equal("http://127.0.0.1:9000", config.store.s3.endpoint)
+  expect_equal("pokerface", config.store.s3.bucket)
+  expect_equal("eu-west-1", config.store.s3.region)
+  expect_equal("AKIAEXAMPLE", config.store.s3.access_key)
+  expect_equal("secret-value", config.store.s3.secret_key)
+  expect_true(!config.store.s3.path_style)
+  expect_equal("/registry/blobs/", config.store.s3.prefix)
+  expect_equal("/tmp/ca.pem", config.store.s3.ca_file)
+  expect_true(!config.store.s3.verify_tls)
+  expect_equal(120, config.store.s3.presign_ttl)
+}
+
+def test_s3_defaults_apply() {
+  const path = reg_tmp("s3-min.yaml")
+  write_config(path, "store:\n  backend: s3\n  s3:\n    endpoint: http://minio:9000\n    bucket: b\n    access_key: a\n    secret_key: s\n")
+  const config = expect_config_ok(reg_config.load(env_empty(), path), "load")
+  expect_equal("us-east-1", config.store.s3.region)
+  expect_true(config.store.s3.path_style)
+  expect_equal("", config.store.s3.prefix)
+  expect_equal("", config.store.s3.ca_file)
+  expect_true(config.store.s3.verify_tls)
+  expect_equal(900, config.store.s3.presign_ttl)
+}
+
+def test_s3_requires_endpoint_bucket_and_credentials() {
+  const path = reg_tmp("s3-missing.yaml")
+  write_config(path, "store:\n  backend: s3\n")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, _) then { expect_fail("expected an s3 endpoint error") }
+    (R.error, why) then { expect_true(why.index_of("store.s3.endpoint") >= 0) }
+  }
+  write_config(path, "store:\n  backend: s3\n  s3:\n    endpoint: http://minio:9000\n    bucket: b\n    access_key: a\n")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, _) then { expect_fail("expected a missing secret error") }
+    (R.error, why) then { expect_true(why.index_of("store.s3.secret_key") >= 0) }
+  }
+}
+
+def test_s3_rejects_bad_endpoints_and_ttl() {
+  const path = reg_tmp("s3-bad.yaml")
+  write_config(path, "store:\n  backend: s3\n  s3:\n    endpoint: minio:9000\n    bucket: b\n    access_key: a\n    secret_key: s\n")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, _) then { expect_fail("expected a scheme error") }
+    (R.error, why) then { expect_true(why.index_of("must start with http:// or https://") >= 0) }
+  }
+  write_config(path, "store:\n  backend: s3\n  s3:\n    endpoint: http://minio:9000/bucket\n    bucket: b\n    access_key: a\n    secret_key: s\n")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, _) then { expect_fail("expected a path error") }
+    (R.error, why) then { expect_true(why.index_of("must not include a path") >= 0) }
+  }
+  write_config(path, "store:\n  backend: s3\n  s3:\n    endpoint: http://minio:9000\n    bucket: b\n    access_key: a\n    secret_key: s\n    presign_ttl: 700000\n")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, _) then { expect_fail("expected a ttl error") }
+    (R.error, why) then { expect_true(why.index_of("presign_ttl") >= 0) }
+  }
+}
+
+def test_s3_env_overrides() {
+  const path = reg_tmp("s3-env.yaml")
+  write_config(path, s3_config())
+  const env = RegFakeEnv.new(Map.new(
+    ("POKERFACE_REGISTRY_S3_ENDPOINT", "https://s3.example.com"),
+    ("POKERFACE_REGISTRY_S3_BUCKET", "other"),
+    ("POKERFACE_REGISTRY_S3_ACCESS_KEY", "ENVKEY"),
+    ("POKERFACE_REGISTRY_S3_SECRET_KEY", "env-secret"),
+    ("POKERFACE_REGISTRY_S3_PATH_STYLE", "true"),
+    ("POKERFACE_REGISTRY_S3_PREFIX", "pf"),
+    ("POKERFACE_REGISTRY_S3_VERIFY_TLS", "true"),
+    ("POKERFACE_REGISTRY_S3_PRESIGN_TTL", "60")
+  ))
+  const config = expect_config_ok(reg_config.load(env, path), "load")
+  expect_equal("https://s3.example.com", config.store.s3.endpoint)
+  expect_equal("other", config.store.s3.bucket)
+  expect_equal("ENVKEY", config.store.s3.access_key)
+  expect_equal("env-secret", config.store.s3.secret_key)
+  expect_true(config.store.s3.path_style)
+  expect_equal("pf", config.store.s3.prefix)
+  expect_true(config.store.s3.verify_tls)
+  expect_equal(60, config.store.s3.presign_ttl)
+  const bad = RegFakeEnv.new(Map.new(("POKERFACE_REGISTRY_S3_VERIFY_TLS", "maybe")))
+  case reg_config.load(bad, path) {
+    (R.ok, _) then { expect_fail("expected a bool error") }
+    (R.error, why) then { expect_true(why.index_of("POKERFACE_REGISTRY_S3_VERIFY_TLS") >= 0) }
+  }
+}
+
+def test_s3_summary_redacts_credentials() {
+  const path = reg_tmp("s3-summary.yaml")
+  write_config(path, s3_config())
+  const config = expect_config_ok(reg_config.load(env_empty(), path), "load")
+  const text = reg_config.summary(config)
+  expect_true(text.index_of("store=s3:http://127.0.0.1:9000/pokerface") >= 0)
+  expect_true(text.index_of("access_key=<set>") >= 0)
+  expect_true(text.index_of("AKIAEXAMPLE") < 0)
+  expect_true(text.index_of("secret-value") < 0)
 }

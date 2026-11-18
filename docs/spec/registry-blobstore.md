@@ -93,7 +93,10 @@ uppercase hex are rejected before any filesystem call
 
 `registry/main.emo` opens the local store at start-up (creating the digest
 directory); a store root that is a file or cannot be created exits 1 with the
-path and the reason. `/readyz` still probes writability independently.
+path and the reason. The S3 backend's start-up check and probe are in
+[registry-s3.md](registry-s3.md). `/readyz` asks the backend through
+`BlobHealth.probe()`: `LocalStore` writes and removes a probe file in its
+digest directory; `S3Store` heads its bucket.
 
 ## Tests
 

@@ -54,7 +54,8 @@ A copy lives at `registry/registry.example.yaml`.
 | `data_dir` | string | `./data` | non-empty |
 | `db_path` | string | `<data_dir>/registry.db` | non-empty; the SQLite database ([registry-db.md](registry-db.md)) |
 | `store.backend` | string | `fs` | `fs` or `s3` |
-| `store.root` | string | `./data/blobs` | non-empty; for `fs`, the blob directory |
+| `store.root` | string | `./data/blobs` | non-empty; the `fs` blob directory (ignored by `s3`) |
+| `store.s3.*` | mapping | — | `s3` only: endpoint, bucket, region, access_key, secret_key, path_style, prefix, ca_file, verify_tls, presign_ttl ([registry-s3.md](registry-s3.md)) |
 | `limits.max_body_bytes` | integer | `16777216` (16 MiB) | positive; oversized request bodies get 413 |
 | `limits.max_header_bytes` | integer | `1048576` (1 MiB) | positive; oversized header blocks get 431 |
 | `limits.read_timeout` | integer seconds | `30` | ≥ 0; `0` = unbounded |
@@ -75,6 +76,16 @@ values name the variable.
 | `POKERFACE_REGISTRY_DB_PATH` | `db_path` |
 | `POKERFACE_REGISTRY_STORE_BACKEND` | `store.backend` |
 | `POKERFACE_REGISTRY_STORE_ROOT` | `store.root` |
+| `POKERFACE_REGISTRY_S3_ENDPOINT` | `store.s3.endpoint` |
+| `POKERFACE_REGISTRY_S3_BUCKET` | `store.s3.bucket` |
+| `POKERFACE_REGISTRY_S3_REGION` | `store.s3.region` |
+| `POKERFACE_REGISTRY_S3_ACCESS_KEY` | `store.s3.access_key` |
+| `POKERFACE_REGISTRY_S3_SECRET_KEY` | `store.s3.secret_key` |
+| `POKERFACE_REGISTRY_S3_PATH_STYLE` | `store.s3.path_style` (`true`/`false`) |
+| `POKERFACE_REGISTRY_S3_PREFIX` | `store.s3.prefix` |
+| `POKERFACE_REGISTRY_S3_CA_FILE` | `store.s3.ca_file` |
+| `POKERFACE_REGISTRY_S3_VERIFY_TLS` | `store.s3.verify_tls` (`true`/`false`) |
+| `POKERFACE_REGISTRY_S3_PRESIGN_TTL` | `store.s3.presign_ttl` (seconds) |
 | `POKERFACE_REGISTRY_MAX_BODY_BYTES` | `limits.max_body_bytes` |
 | `POKERFACE_REGISTRY_MAX_HEADER_BYTES` | `limits.max_header_bytes` |
 | `POKERFACE_REGISTRY_READ_TIMEOUT` | `limits.read_timeout` (seconds) |
@@ -97,9 +108,9 @@ Readiness checks in v0.1:
 - `db` — a short-lived connection opens the SQLite database, after a header
   read that catches a missing file, a directory, or a non-database file
   ([registry-db.md](registry-db.md)).
-- `store` — for `fs`, the blob root is usable the same way. `s3` reports not
-  ready with "s3 backend is not implemented until T2.6". T2.4/T2.6 replace
-  the check with the real store.
+- `store` — the backend answers for itself ([registry-blobstore.md](registry-blobstore.md)):
+  `fs` probes the digest directory (`<root>/sha256`) for writability, `s3`
+  sends a signed HEAD for the bucket ([registry-s3.md](registry-s3.md)).
 
 The check runs per request, so a directory that becomes unwritable flips
 `/readyz` to 503 without a restart.

@@ -1,0 +1,448 @@
+// T2.6: a minimal S3 endpoint for the adapter's integration test, used when
+// MinIO itself is not available (scripts/e2e-s3.sh starts this). It speaks the
+// path-style verbs the adapter uses — HEAD bucket, PUT/GET/HEAD/DELETE object —
+// verifies every SigV4 signature (header and presigned forms, including the
+// presigned expiry), and keeps objects on disk so the one-process-per-
+// connection model needs no shared memory.
+//
+// It is a test fixture, not an S3 implementation: one fixed credential, no
+// bucket policies, no chunked uploads. The credential and bucket the adapter
+// must use are the constants below.
+//
+//   emo build -o .emo-build/s3-fixture mock/s3_fixture.emo
+//   .emo-build/s3-fixture <root> <port>
+
+require "os"
+require "file"
+require "net"
+require "httpd"
+require "time"
+require "crypto"
+
+const fixture_access_key = "AKIAEXAMPLE"
+const fixture_secret_key = "secret-value"
+const fixture_bucket = "pokerface"
+
+def main() Int64 {
+  const argv = os.argv()
+  if argv.length() < 3 {
+    eprint("usage: s3-fixture <root> <port>\n")
+    return 2
+  }
+  const root = argv[1]
+  const port = argv[2].to_int64()
+  case os.mkdir(root) {
+    (R.ok, _) then { }
+    (R.error, _) then { }
+  }
+  case os.mkdir(objects_dir(root)) {
+    (R.ok, _) then { }
+    (R.error, _) then { }
+  }
+  case os.mkdir(root + "/" + fixture_bucket) {
+    (R.ok, _) then { }
+    (R.error, _) then { }
+  }
+  case net.listen("127.0.0.1", port) {
+    (R.error, why) then {
+      eprint("s3-fixture: cannot listen: " + why + "\n")
+      return 1
+    }
+    (R.ok, listener) then {
+      const handler = -> (req httpd.Request) {
+        return handle(root, req)
+      }
+      const server = httpd.serve_with(listener, handler, httpd.server_options())
+      const (_, _) = os.write(1, "LISTEN=127.0.0.1:" + listener.port().to_string() + "\n")
+      server.wait()
+      return 0
+    }
+  }
+}
+
+def objects_dir(root String) String {
+  return root + "/objects"
+}
+
+def handle(root String, req httpd.Request) httpd.Response {
+  const split = split_path(req.path)
+  const bucket = split[0]
+  const key = split[1]
+  if bucket != fixture_bucket {
+    return s3_error(req, 404, "NoSuchBucket")
+  }
+  if key == "" {
+    if req.method != "HEAD" {
+      return s3_error(req, 405, "MethodNotAllowed")
+    }
+    case verify_header_auth(req) {
+      (R.ok, _) then { return httpd.response(200, [], "") }
+      (R.error, why) then { return s3_error(req, 403, why) }
+    }
+  }
+  if req.method == "PUT" {
+    case verify_header_auth(req) {
+      (R.ok, _) then {
+        case file.write(object_path(root, key), req.body) {
+          (R.error, why) then { return s3_error(req, 500, "InternalError") }
+          (R.ok, _) then { return httpd.response(200, [], "") }
+        }
+      }
+      (R.error, why) then { return s3_error(req, 403, why) }
+    }
+  }
+  if req.method == "GET" {
+    if req.query.has("X-Amz-Signature") {
+      case verify_presigned(req) {
+        (R.error, why) then { return s3_error(req, 403, why) }
+        (R.ok, _) then { }
+      }
+    } else {
+      case verify_header_auth(req) {
+        (R.error, why) then { return s3_error(req, 403, why) }
+        (R.ok, _) then { }
+      }
+    }
+    case file.read(object_path(root, key)) {
+      (R.error, _) then { return s3_error(req, 404, "NoSuchKey") }
+      (R.ok, body) then { return range_response(req, body) }
+    }
+  }
+  if req.method == "HEAD" {
+    case verify_header_auth(req) {
+      (R.error, why) then { return s3_error(req, 403, why) }
+      (R.ok, _) then { }
+    }
+    case file.read(object_path(root, key)) {
+      (R.error, _) then { return s3_error(req, 404, "NoSuchKey") }
+      (R.ok, body) then {
+        return httpd.response(200, [("Content-Length", body.to_bytes().length().to_string())], "")
+      }
+    }
+  }
+  if req.method == "DELETE" {
+    case verify_header_auth(req) {
+      (R.error, why) then { return s3_error(req, 403, why) }
+      (R.ok, _) then { }
+    }
+    const path = object_path(root, key)
+    case os.open_read(path) {
+      (R.error, _) then { return s3_error(req, 404, "NoSuchKey") }
+      (R.ok, fd) then {
+        const (_, _) = os.close(fd)
+        const (_, _) = os.unlink(path)
+        return httpd.response(204, [], "")
+      }
+    }
+  }
+  return s3_error(req, 405, "MethodNotAllowed")
+}
+
+def split_path(path String) (String, String) {
+  var rest = path
+  if rest.starts_with("/") {
+    rest = rest.substring(1, rest.length() - 1)
+  }
+  const slash = rest.index_of("/")
+  if slash < 0 {
+    return (rest, "")
+  }
+  return (rest.substring(0, slash), rest.substring(slash + 1, rest.length() - slash - 1))
+}
+
+// Content-addressed by the object key, so a key never reaches the filesystem
+// as a path component.
+def object_path(root String, key String) String {
+  const hex = crypto_hex(key)
+  return objects_dir(root) + "/" + hex
+}
+
+def crypto_hex(text String) String {
+  return crypto.hex_encode(crypto.sha2.sha256(text.to_bytes()))
+}
+
+def range_response(req httpd.Request, body String) httpd.Response {
+  const range = req.header("range")
+  if range == "" {
+    return httpd.response(200, [], body)
+  }
+  const parsed = parse_range(range, body.to_bytes().length())
+  case parsed {
+    (R.error, _) then { return httpd.response(416, [], "") }
+    (R.ok, slice) then {
+      const (start, finish) = slice
+      const part = body.substring(start, finish - start + 1)
+      return httpd.response(206, [
+        ("Content-Range", "bytes " + start.to_string() + "-" + finish.to_string() + "/" + body.to_bytes().length().to_string())
+      ], part)
+    }
+  }
+}
+
+def parse_range(range String, size Int64) (R, (Int64, Int64)) {
+  if !range.starts_with("bytes=") {
+    return (R.error, "bad range")
+  }
+  const text = range.substring(6, range.length() - 6)
+  const dash = text.index_of("-")
+  if dash < 0 {
+    return (R.error, "bad range")
+  }
+  const start_text = text.substring(0, dash)
+  const end_text = text.substring(dash + 1, text.length() - dash - 1)
+  if !all_digits(start_text) || !all_digits(end_text) {
+    return (R.error, "bad range")
+  }
+  const start = start_text.to_int64()
+  var finish = end_text.to_int64()
+  if finish >= size {
+    finish = size - 1
+  }
+  if start > finish {
+    return (R.error, "empty range")
+  }
+  return (R.ok, (start, finish))
+}
+
+// HEAD answers no body at all: the client reads Content-Length bytes even for
+// HEAD, so a declared XML error body would end the connection.
+def s3_error(req httpd.Request, status Int64, code String) httpd.Response {
+  if req.method == "HEAD" {
+    return httpd.response(status, [], "")
+  }
+  return httpd.response(status, [("Content-Type", "application/xml")], "<Error><Code>" + code + "</Code></Error>")
+}
+
+// ---------------------------------------------------------------------------
+// SigV4 verification.
+
+def verify_header_auth(req httpd.Request) (R, Bool) {
+  const authorization = req.header("authorization")
+  if authorization == "" {
+    return (R.error, "AccessDenied")
+  }
+  const parsed = parse_authorization(authorization)
+  case parsed {
+    (R.error, _) then { return (R.error, "InvalidArgument") }
+    (R.ok, parts) then {
+      const (access_key, scope, signed_headers, provided) = parts
+      if access_key != fixture_access_key {
+        return (R.error, "InvalidAccessKeyId")
+      }
+      case parse_scope(scope) {
+        (R.error, _) then { return (R.error, "InvalidArgument") }
+        (R.ok, scoped) then {
+          const (date, region, service) = scoped
+          const at_text = req.header("x-amz-date")
+          case parse_amz_date(at_text) {
+            (R.error, _) then { return (R.error, "InvalidArgument") }
+            (R.ok, at) then {
+              const query = canonical_from_map(req.query)
+              const headers = signed_headers_of(req, signed_headers)
+              const payload = req.header("x-amz-content-sha256")
+              const request = registry.sigv4.canonical_request(req.method, req.path, query, headers, payload)
+              const to_sign = registry.sigv4.string_to_sign(at, scope, request)
+              const credentials = registry.sigv4.Credentials.new(access_key, fixture_secret_key, region, service, "")
+              const expected = registry.sigv4.signature(credentials, at, to_sign)
+              return compare_signature(provided, expected)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+def verify_presigned(req httpd.Request) (R, Bool) {
+  const provided = query_value(req.query, "X-Amz-Signature")
+  const credential = query_value(req.query, "X-Amz-Credential")
+  const at_text = query_value(req.query, "X-Amz-Date")
+  const expires_text = query_value(req.query, "X-Amz-Expires")
+  if provided == "" || credential == "" || at_text == "" || expires_text == "" {
+    return (R.error, "AccessDenied")
+  }
+  const slash = credential.index_of("/")
+  if slash < 0 {
+    return (R.error, "InvalidArgument")
+  }
+  const access_key = credential.substring(0, slash)
+  const scope = credential.substring(slash + 1, credential.length() - slash - 1)
+  if access_key != fixture_access_key || !all_digits(expires_text) {
+    return (R.error, "AccessDenied")
+  }
+  case parse_scope(scope) {
+    (R.error, _) then { return (R.error, "InvalidArgument") }
+    (R.ok, scoped) then {
+      const (date, region, service) = scoped
+      case parse_amz_date(at_text) {
+        (R.error, _) then { return (R.error, "InvalidArgument") }
+        (R.ok, at) then {
+          const signed_at = at.unix_ms() / 1000
+          const now = time.now().unix_ms() / 1000
+          if now < signed_at || now >= signed_at + expires_text.to_int64() {
+            return (R.error, "AccessDenied")
+          }
+          const query = canonical_from_map_without(req.query, "X-Amz-Signature")
+          const headers = [("host", req.header("host"))]
+          const request = registry.sigv4.canonical_request(req.method, req.path, query, headers, registry.sigv4.unsigned_payload)
+          const to_sign = registry.sigv4.string_to_sign(at, scope, request)
+          const credentials = registry.sigv4.Credentials.new(access_key, fixture_secret_key, region, service, "")
+          const expected = registry.sigv4.signature(credentials, at, to_sign)
+          return compare_signature(provided, expected)
+        }
+      }
+    }
+  }
+}
+
+def query_value(query Map[String, String], key String) String {
+  if query.has(key) {
+    return query.get(key)
+  }
+  return ""
+}
+
+def compare_signature(provided String, expected String) (R, Bool) {
+  if provided == expected {
+    return (R.ok, true)
+  }
+  return (R.error, "SignatureDoesNotMatch")
+}
+
+// Credential=AK/scope, SignedHeaders=a;b, Signature=hex
+def parse_authorization(value String) (R, (String, String, String, String)) {
+  const credential_at = value.index_of("Credential=")
+  const signed_at = value.index_of("SignedHeaders=")
+  const signature_at = value.index_of("Signature=")
+  if credential_at < 0 || signed_at < 0 || signature_at < 0 {
+    return (R.error, "bad authorization")
+  }
+  const credential_end = value.index_of(",")
+  if credential_end < 0 {
+    return (R.error, "bad authorization")
+  }
+  const credential = value.substring(credential_at + 11, credential_end - credential_at - 11)
+  const slash = credential.index_of("/")
+  if slash < 0 {
+    return (R.error, "bad credential")
+  }
+  const access_key = credential.substring(0, slash)
+  const scope = credential.substring(slash + 1, credential.length() - slash - 1)
+  const signed_part = value.substring(signed_at, value.length() - signed_at)
+  const signed_end = signed_part.index_of(",")
+  if signed_end < 0 {
+    return (R.error, "bad authorization")
+  }
+  const signed = value.substring(signed_at + 14, signed_end - 14)
+  const signature = value.substring(signature_at + 10, value.length() - signature_at - 10)
+  return (R.ok, (access_key, scope, signed, signature))
+}
+
+def parse_scope(scope String) (R, (String, String, String)) {
+  const first = scope.index_of("/")
+  if first < 0 {
+    return (R.error, "bad scope")
+  }
+  const rest = scope.substring(first + 1, scope.length() - first - 1)
+  const second = rest.index_of("/")
+  if second < 0 {
+    return (R.error, "bad scope")
+  }
+  const rest2 = rest.substring(second + 1, rest.length() - second - 1)
+  const third = rest2.index_of("/")
+  if third < 0 {
+    return (R.error, "bad scope")
+  }
+  return (
+    R.ok,
+    (scope.substring(0, first), rest.substring(0, second), rest2.substring(0, third))
+  )
+}
+
+def parse_amz_date(text String) (R, time.Time) {
+  if text.length() != 16 {
+    return (R.error, "bad date")
+  }
+  if text.substring(8, 1) != "T" || text.substring(15, 1) != "Z" {
+    return (R.error, "bad date")
+  }
+  const year = text.substring(0, 4)
+  const month = text.substring(4, 2)
+  const day = text.substring(6, 2)
+  const hour = text.substring(9, 2)
+  const minute = text.substring(11, 2)
+  const second = text.substring(13, 2)
+  if !all_digits(year) || !all_digits(month) || !all_digits(day) || !all_digits(hour) || !all_digits(minute) || !all_digits(second) {
+    return (R.error, "bad date")
+  }
+  return (R.ok, time.of(year.to_int64(), month.to_int64(), day.to_int64(), hour.to_int64(), minute.to_int64(), second.to_int64(), 0))
+}
+
+// The signed names in wire order, taken from the request's headers.
+def signed_headers_of(req httpd.Request, names String) Array[(String, String)] {
+  var out = []
+  var i = 0
+  var start = 0
+  while i <= names.length() {
+    if i == names.length() || names.substring(i, 1) == ";" {
+      const name = names.substring(start, i - start)
+      if name != "" {
+        out = out.append((name, req.header(name)))
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return out
+}
+
+def map_pairs(query Map[String, String]) Array[(String, String)] {
+  const keys = query.keys()
+  const values = query.values()
+  var pairs = []
+  var i = 0
+  while i < keys.length() {
+    pairs = pairs.append((keys[i], values[i]))
+    i = i + 1
+  }
+  return pairs
+}
+
+def canonical_from_map(query Map[String, String]) String {
+  return registry.sigv4.canonical_query(map_pairs(query))
+}
+
+def canonical_from_map_without(query Map[String, String], skip String) String {
+  var pairs = []
+  const all = map_pairs(query)
+  var i = 0
+  while i < all.length() {
+    const (key, value) = all[i]
+    if key != skip {
+      pairs = pairs.append((key, value))
+    }
+    i = i + 1
+  }
+  return registry.sigv4.canonical_query(pairs)
+}
+
+def all_digits(text String) Bool {
+  if text == "" {
+    return false
+  }
+  var i = 0
+  while i < text.length() {
+    const c = text.substring(i, 1)
+    if c != "0" && c != "1" && c != "2" && c != "3" && c != "4" && c != "5" && c != "6" && c != "7" && c != "8" && c != "9" {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+def eprint(text String) {
+  const (_, _) = os.write(2, text)
+}
+
+os._exit(main())

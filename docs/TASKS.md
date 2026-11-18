@@ -351,7 +351,7 @@ Exit criteria:
 | [x] | T2.3 | OCI manifest / index model and validation | T1.5 | 2-3h |
 | [x] | T2.4 | BlobStore interface and local filesystem backend | T2.1 | 2h |
 | [x] | T2.5 | AWS SigV4 signing and presigned URLs | T2.1 | 3h |
-| [ ] | T2.6 | S3 / MinIO BlobStore adapter | T2.4, T2.5 | 3h |
+| [x] | T2.6 | S3 / MinIO BlobStore adapter | T2.4, T2.5 | 3h |
 | [ ] | T2.7 | `/v2/` base protocol and error format | T2.1, T2.2 | 1-2h |
 | [ ] | T2.8 | Manifest GET / HEAD and tag / digest resolution | T2.2, T2.3, T2.7 | 3h |
 | [ ] | T2.9 | Blob GET and 307 presigned redirect | T2.4, T2.6, T2.8 | 2-3h |
@@ -445,6 +445,8 @@ Suggested tables:
 **Acceptance**: Upload, download, and presigned access against MinIO work; a missing bucket fails startup with a clear message; TLS and custom CAs are configurable; network errors retry with clear messages; keys are never logged.
 
 **Depends on**: T2.4, T2.5 · **Estimate**: 3h
+
+> **Notes** (2026-11-18, ~3h): Done, with one environment caveat below. `registry/s3_blobstore.emo` implements BlobStore over signed HTTP: path-style and virtual-host addressing, keys `[prefix/]sha256/<hex>`, an injectable transport (the real one builds TLS options from `ca_file`/`verify_tls`), and a start-up signed HEAD of the bucket that fails with the bucket name and endpoint (404) or names the credential settings without their values (403). `store.s3.*` joined the config with strict field checks, env overrides, and validation (endpoint scheme/path, bucket, region, credentials, presign ttl 1–604800); the summary prints `access_key=<set>` and never the keys. Requests sign `host` (the default port dropped so it matches the wire), `x-amz-content-sha256`, and any extra headers (`content-type`, `range`, session token); the signed Host entry is dropped before sending because the stdlib client writes it. Transport errors and 5xx retry 3× with backoff; 4xx do not. Error text carries method/URL/status and S3's `<Code>`, never the body or keys. **Gotcha found live**: `head` cannot use HEAD — the stdlib http client reads `Content-Length` bytes even on a HEAD response, while S3 announces the object size with no body (the connection dies mid-read). It now uses a ranged GET (`bytes=0-0`) and takes the total from `Content-Range`, with a 416→plain-GET fallback for empty objects and a 200 fallback for servers that ignore Range. Health now asks a backend `BlobHealth.probe()`, so /readyz works for both stores (LocalStore probes its digest dir, S3Store heads the bucket). Tests: 20 in `test/registry_s3.emo` — injected-transport protocol coverage plus a live round trip (put/get/head/range/presigned fetch/expiry 403/delete) when `POKERFACE_TEST_S3_*` is set — the mock `mock/s3_fixture.emo` verifies SigV4 and presigned expiries and stores objects on disk, run by `scripts/e2e-s3.sh`; `emo test` 314/314. Manually verified the service on the s3 backend: start-up bucket check, `/readyz` 200, summary redaction, and a missing bucket exiting 1 with the clear message. **Caveat**: Docker Hub is unreachable from this machine (`docker pull minio/minio` times out), so the MinIO binary/image could not be run; the live leg was exercised against the local SigV4-verifying fixture instead. Point the `POKERFACE_TEST_S3_*` variables at MinIO to run the identical test against it.
 
 #### T2.7 `/v2/` Base Protocol and Error Format
 
