@@ -73,7 +73,7 @@
 | [x] | T1.1 | CLI 骨架与命令路由 | 无 | 1-2h |
 | [x] | T1.2 | Emo 运行时能力验证与依赖锁定 | T1.1 | 2h |
 | [x] | T1.3 | 仓库引用解析 | T1.1 | 1-2h |
-| [ ] | T1.4 | `pokerface.yaml` v0.1 规范与解析 | T1.2 | 2-3h |
+| [x] | T1.4 | `pokerface.yaml` v0.1 规范与解析 | T1.2 | 2-3h |
 | [ ] | T1.5 | `pokerface.lock.yaml` v0.1 规范与解析 | T1.2 | 2h |
 | [ ] | T1.6 | Git ref 解析：tag / branch / commit | T1.3 | 2-3h |
 | [ ] | T1.7 | Git 元数据读取与镜像缓存 | T1.6、T1.5 | 3h |
@@ -154,6 +154,8 @@ tag 规则至少要支持 `latest`、`{{ commit.short }}`、`{{ git.tag }}`、`{
 **验收**：示例文件可解析；缺少 `version` / `image` / `build.context` 时报错并指出路径；非法平台名、重复 tag、未闭合占位符被拒绝；规范文档包含完整字段表。
 
 **依赖**：T1.2 · **预估**：2-3h
+
+> **笔记**（2026-11-18，约 2h）：完成。`src/config.emo` 解析并校验 v0.1 全部字段，错误信息带路径（`pokerface.yaml: build.context: …`）；version 为 1 时拒绝未知字段；tags 支持字面量与 `{{ commit.short }}`/`{{ git.tag }}`/`{{ branch }}`/`{{ version }}` 模板。T1.2 的踩坑实测命中：裸 `context: .` 解析成 `YamlFloat`，被拒绝并附引号提示，所以 `examples/pokerface.yaml` 用 `context: "."`。共 25 个测试用例（示例文件、最小配置默认值、7 个合法变体、25 行非法表）；`emo test` 32/32。踩坑：`is()` 窄化只覆盖 `if` 分支本身，解析器统一写成 `if value.is(…) { …主体… } return error` 的形状；`substring(start, len)` 越界会抛异常——取两字符窗口前先用 `i + 2 <= len` 守卫。后续：模板渲染在 T4.1 落地；平台支持集随真实构建能力再扩充。
 
 #### T1.5 `pokerface.lock.yaml` v0.1 规范与解析
 

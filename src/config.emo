@@ -1,0 +1,491 @@
+// T1.4: parse and validate pokerface.yaml, the build configuration stored in
+// the application repository (decision D2). Spec: docs/spec/pokerface-yaml.md.
+// Errors are path-aware: "pokerface.yaml: build.context: ...". Unknown fields
+// are rejected while version is 1.
+
+require "yaml"
+
+const default_platform = "linux/amd64"
+const default_tag = "latest"
+const known_os_list = ["linux", "windows", "darwin", "freebsd"]
+const known_arch_list = ["amd64", "arm64", "arm", "386", "riscv64"]
+const known_placeholders = ["commit.short", "git.tag", "branch", "version"]
+const tag_charset = "abcdefghijklmnopqrstuvwxyz0123456789.-_"
+const image_charset = "abcdefghijklmnopqrstuvwxyz0123456789.-_/:"
+const digits = "0123456789"
+
+class BuildSection {
+  def init(context String, dockerfile String, target String, platforms Array[String], args Map[String, String]) {
+    self.context = context
+    self.dockerfile = dockerfile
+    self.target = target
+    self.platforms = platforms
+    self.args = args
+  }
+}
+
+class RegistrySection {
+  def init(url String) {
+    self.url = url
+  }
+}
+
+class PokerfaceConfig {
+  def init(version Int64, image String, build BuildSection, tags Array[String], registry RegistrySection) {
+    self.version = version
+    self.image = image
+    self.build = build
+    self.tags = tags
+    self.registry = registry
+  }
+}
+
+def error_at(path String, message String) String {
+  return "pokerface.yaml: " + path + ": " + message
+}
+
+def load(text String) (R, PokerfaceConfig) {
+  const trimmed = text.trim()
+  if trimmed == "" {
+    return (R.error, "pokerface.yaml: the file is empty")
+  }
+  case yaml.decode(trimmed) {
+    (R.error, why) then { return (R.error, "pokerface.yaml: invalid YAML — " + why) }
+    (R.ok, doc) then { return from_yaml(doc) }
+  }
+}
+
+def from_yaml(doc yaml.Yaml) (R, PokerfaceConfig) {
+  if doc.is(yaml.YamlObject) {
+    var version = 0
+    var have_version = false
+    var image = ""
+    var have_image = false
+    var have_build = false
+    var build_context = ""
+    var build_dockerfile = "Dockerfile"
+    var build_target = ""
+    var build_platforms = []
+    var build_args = {}
+    var tags = []
+    var have_tags = false
+    var registry_url = ""
+    var have_registry = false
+
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      case key {
+        "version" then {
+          if value.is(yaml.YamlInt) {
+            version = value.as_int()
+          } else {
+            return (R.error, error_at("version", "expected the integer 1, got " + kind_word(value.kind())))
+          }
+          have_version = true
+        }
+        "image" then {
+          if value.is(yaml.YamlString) {
+            image = value.as_string()
+          } else {
+            return (R.error, error_at("image", "expected a string, got " + kind_word(value.kind())))
+          }
+          have_image = true
+        }
+        "build" then {
+          case parse_build(value) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, section) then {
+              build_context = section.context
+              build_dockerfile = section.dockerfile
+              build_target = section.target
+              build_platforms = section.platforms
+              build_args = section.args
+            }
+          }
+          have_build = true
+        }
+        "tags" then {
+          case parse_tags(value) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, list) then { tags = list }
+          }
+          have_tags = true
+        }
+        "registry" then {
+          case parse_registry(value) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, url) then { registry_url = url }
+          }
+          have_registry = true
+        }
+        _ then {
+          return (R.error, error_at(key, "unknown field (known: version, image, build, tags, registry)"))
+        }
+      }
+      i = i + 1
+    }
+
+    if !have_version {
+      return (R.error, error_at("version", "missing required field"))
+    }
+    if version != 1 {
+      return (R.error, error_at("version", "expected 1, got " + version.to_string()))
+    }
+    if !have_image {
+      return (R.error, error_at("image", "missing required field"))
+    }
+    case validate_image(image, "image") {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, checked) then { image = checked }
+    }
+    if !have_build {
+      return (R.error, error_at("build", "missing required section"))
+    }
+    if !have_tags {
+      tags = [default_tag]
+    }
+
+    var registry = RegistrySection.new("")
+    if have_registry {
+      registry = RegistrySection.new(registry_url)
+    }
+    const build = BuildSection.new(build_context, build_dockerfile, build_target, build_platforms, build_args)
+    return (R.ok, PokerfaceConfig.new(version, image, build, tags, registry))
+  }
+  return (R.error, "pokerface.yaml: expected a mapping at the top level, got " + kind_word(doc.kind()))
+}
+
+def parse_build(value yaml.Yaml) (R, BuildSection) {
+  if value.is(yaml.YamlObject) {
+    var context = ""
+    var have_context = false
+    var dockerfile = "Dockerfile"
+    var target = ""
+    var platforms = []
+    var have_platforms = false
+    var args = {}
+
+    const entries = value.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, v) = entries[i]
+      case key {
+        "context" then {
+          if v.is(yaml.YamlString) {
+            context = v.as_string()
+          } else {
+            if v.is(yaml.YamlFloat) {
+              return (R.error, error_at("build.context", "a number is not a valid context — YAML reads a bare '.' as a float; quote it: context: \".\""))
+            }
+            return (R.error, error_at("build.context", "expected a string, got " + kind_word(v.kind())))
+          }
+          have_context = true
+        }
+        "dockerfile" then {
+          if v.is(yaml.YamlString) {
+            dockerfile = v.as_string()
+          } else {
+            return (R.error, error_at("build.dockerfile", "expected a string, got " + kind_word(v.kind())))
+          }
+        }
+        "target" then {
+          if v.is(yaml.YamlString) {
+            target = v.as_string()
+          } else {
+            return (R.error, error_at("build.target", "expected a string, got " + kind_word(v.kind())))
+          }
+        }
+        "platforms" then {
+          case parse_platforms(v) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, list) then { platforms = list }
+          }
+          have_platforms = true
+        }
+        "args" then {
+          case parse_args(v) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, m) then { args = m }
+          }
+        }
+        _ then {
+          return (R.error, error_at("build." + key, "unknown field (known: context, dockerfile, target, platforms, args)"))
+        }
+      }
+      i = i + 1
+    }
+
+    if !have_context {
+      return (R.error, error_at("build.context", "missing required field"))
+    }
+    if context == "" {
+      return (R.error, error_at("build.context", "must not be empty"))
+    }
+    if dockerfile == "" {
+      return (R.error, error_at("build.dockerfile", "must not be empty"))
+    }
+    if !have_platforms {
+      platforms = [default_platform]
+    }
+    return (R.ok, BuildSection.new(context, dockerfile, target, platforms, args))
+  }
+  return (R.error, error_at("build", "expected a mapping, got " + kind_word(value.kind())))
+}
+
+def parse_platforms(value yaml.Yaml) (R, Array[String]) {
+  if value.is(yaml.YamlArray) {
+    const items = value.items()
+    var out = []
+    var i = 0
+    while i < items.length() {
+      const item = items[i]
+      if !item.is(yaml.YamlString) {
+        return (R.error, error_at("build.platforms[" + i.to_string() + "]", "expected a string, got " + kind_word(item.kind())))
+      }
+      case validate_platform(item.as_string(), "build.platforms[" + i.to_string() + "]") {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, checked) then { out = out.append(checked) }
+      }
+      i = i + 1
+    }
+    if out.length() == 0 {
+      return (R.error, error_at("build.platforms", "at least one platform is required"))
+    }
+    return (R.ok, out)
+  }
+  return (R.error, error_at("build.platforms", "expected an array, got " + kind_word(value.kind())))
+}
+
+def parse_args(value yaml.Yaml) (R, Map[String, String]) {
+  if value.is(yaml.YamlObject) {
+    var out = {}
+    const entries = value.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, v) = entries[i]
+      if key == "" {
+        return (R.error, error_at("build.args", "arg name must not be empty"))
+      }
+      if !v.is(yaml.YamlString) {
+        return (R.error, error_at("build.args." + key, "expected a string value (quote it), got " + kind_word(v.kind())))
+      }
+      out.set(key, v.as_string())
+      i = i + 1
+    }
+    return (R.ok, out)
+  }
+  return (R.error, error_at("build.args", "expected a mapping, got " + kind_word(value.kind())))
+}
+
+def parse_tags(value yaml.Yaml) (R, Array[String]) {
+  if value.is(yaml.YamlArray) {
+    const items = value.items()
+    var out = []
+    var i = 0
+    while i < items.length() {
+      const item = items[i]
+      if !item.is(yaml.YamlString) {
+        return (R.error, error_at("tags[" + i.to_string() + "]", "expected a string, got " + kind_word(item.kind())))
+      }
+      const tag = item.as_string()
+      case validate_tag(tag, "tags[" + i.to_string() + "]") {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, _) then { }
+      }
+      var j = 0
+      while j < out.length() {
+        if out[j] == tag {
+          return (R.error, error_at("tags[" + i.to_string() + "]", "duplicate tag '" + tag + "'"))
+        }
+        j = j + 1
+      }
+      out = out.append(tag)
+      i = i + 1
+    }
+    if out.length() == 0 {
+      return (R.error, error_at("tags", "at least one tag is required"))
+    }
+    return (R.ok, out)
+  }
+  return (R.error, error_at("tags", "expected an array, got " + kind_word(value.kind())))
+}
+
+def parse_registry(value yaml.Yaml) (R, String) {
+  if value.is(yaml.YamlObject) {
+    var url = ""
+    var have_url = false
+    const entries = value.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, v) = entries[i]
+      case key {
+        "url" then {
+          if v.is(yaml.YamlString) {
+            url = v.as_string()
+          } else {
+            return (R.error, error_at("registry.url", "expected a string, got " + kind_word(v.kind())))
+          }
+          have_url = true
+        }
+        _ then {
+          return (R.error, error_at("registry." + key, "unknown field (known: url)"))
+        }
+      }
+      i = i + 1
+    }
+    if !have_url {
+      return (R.error, error_at("registry.url", "missing required field"))
+    }
+    if url == "" {
+      return (R.error, error_at("registry.url", "must not be empty"))
+    }
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+      return (R.error, error_at("registry.url", "must start with https:// or http://"))
+    }
+    while url.substring(url.length() - 1, 1) == "/" {
+      url = url.substring(0, url.length() - 1)
+    }
+    if url == "https:" || url == "http:" {
+      return (R.error, error_at("registry.url", "host is missing"))
+    }
+    return (R.ok, url)
+  }
+  return (R.error, error_at("registry", "expected a mapping, got " + kind_word(value.kind())))
+}
+
+def validate_image(image String, path String) (R, String) {
+  if image == "" {
+    return (R.error, error_at(path, "image must not be empty"))
+  }
+  if image.index_of("://") >= 0 {
+    return (R.error, error_at(path, "image must not include a scheme (write registry.example.com/acme/app)"))
+  }
+  if image.index_of("@") >= 0 {
+    return (R.error, error_at(path, "image must not include a digest"))
+  }
+  var i = 0
+  while i < image.length() {
+    const c = image.substring(i, 1)
+    if image_charset.index_of(c) < 0 {
+      return (R.error, error_at(path, "image '" + image + "' has invalid character '" + c + "' (lowercase [a-z0-9._-/] and an optional :port)"))
+    }
+    i = i + 1
+  }
+  const slash = image.index_of("/")
+  if slash < 0 {
+    return (R.error, error_at(path, "expected <registry-host>/<owner>/<repo>, got '" + image + "'"))
+  }
+  const host = image.substring(0, slash)
+  const path_part = image.substring(slash + 1, image.length() - slash - 1)
+  if host == "" {
+    return (R.error, error_at(path, "registry host is empty"))
+  }
+  if path_part == "" {
+    return (R.error, error_at(path, "repository path after the host is empty"))
+  }
+  if path_part.index_of(":") >= 0 {
+    return (R.error, error_at(path, "image must not include a tag (use the tags section)"))
+  }
+  const port_at = host.index_of(":")
+  if port_at >= 0 {
+    if !all_digits(host.substring(port_at + 1, host.length() - port_at - 1)) {
+      return (R.error, error_at(path, "invalid host '" + host + "' (expected <host> or <host>:<port>)"))
+    }
+  }
+  const segments = path_part.split("/")
+  var s = 0
+  while s < segments.length() {
+    if segments[s] == "" {
+      return (R.error, error_at(path, "repository path '" + path_part + "' has an empty segment"))
+    }
+    if segments[s].starts_with(".") {
+      return (R.error, error_at(path, "repository segment '" + segments[s] + "' must not start with '.'"))
+    }
+    s = s + 1
+  }
+  return (R.ok, image)
+}
+
+def validate_platform(platform String, path String) (R, String) {
+  const parts = platform.split("/")
+  if parts.length() != 2 {
+    return (R.error, error_at(path, "invalid platform '" + platform + "' (expected <os>/<arch>)"))
+  }
+  if !in_array(known_os_list, parts[0]) {
+    return (R.error, error_at(path, "unknown platform '" + platform + "' (supported os: linux, windows, darwin, freebsd)"))
+  }
+  if !in_array(known_arch_list, parts[1]) {
+    return (R.error, error_at(path, "unknown platform '" + platform + "' (supported arch: amd64, arm64, arm, 386, riscv64)"))
+  }
+  return (R.ok, platform)
+}
+
+def validate_tag(tag String, path String) (R, String) {
+  if tag == "" {
+    return (R.error, error_at(path, "tag must not be empty"))
+  }
+  if tag.length() > 128 {
+    return (R.error, error_at(path, "tag is longer than 128 characters"))
+  }
+  var i = 0
+  while i < tag.length() {
+    if i + 2 <= tag.length() && tag.substring(i, 2) == "{{" {
+      const rest = tag.substring(i, tag.length() - i)
+      const close = rest.index_of("}}")
+      if close < 0 {
+        return (R.error, error_at(path, "unterminated placeholder in tag '" + tag + "' (missing '}}')"))
+      }
+      const name = rest.substring(2, close - 2).trim()
+      if !in_array(known_placeholders, name) {
+        return (R.error, error_at(path, "unknown placeholder '{{ " + name + " }}' (supported: commit.short, git.tag, branch, version)"))
+      }
+      i = i + close + 2
+    } else {
+      const c = tag.substring(i, 1)
+      if tag_charset.index_of(c) < 0 {
+        return (R.error, error_at(path, "tag '" + tag + "' has invalid character '" + c + "' (allowed: [a-z0-9._-] and {{ placeholder }})"))
+      }
+      i = i + 1
+    }
+  }
+  return (R.ok, tag)
+}
+
+def kind_word(kind yaml.YamlKind) String {
+  case kind {
+    yaml.YamlKind.ynull then { return "null" }
+    yaml.YamlKind.ybool then { return "a boolean" }
+    yaml.YamlKind.yint then { return "an integer" }
+    yaml.YamlKind.yfloat then { return "a number" }
+    yaml.YamlKind.ystring then { return "a string" }
+    yaml.YamlKind.yarray then { return "an array" }
+    yaml.YamlKind.yobject then { return "a mapping" }
+  }
+}
+
+def in_array(arr Array[String], wanted String) Bool {
+  var i = 0
+  while i < arr.length() {
+    if arr[i] == wanted {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+def all_digits(s String) Bool {
+  if s == "" {
+    return false
+  }
+  var i = 0
+  while i < s.length() {
+    if digits.index_of(s.substring(i, 1)) < 0 {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}

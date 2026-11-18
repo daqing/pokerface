@@ -73,7 +73,7 @@ Exit criteria:
 | [x] | T1.1 | CLI skeleton and command routing | none | 1-2h |
 | [x] | T1.2 | Verify Emo runtime capabilities and pin dependencies | T1.1 | 2h |
 | [x] | T1.3 | Parse repository references | T1.1 | 1-2h |
-| [ ] | T1.4 | `pokerface.yaml` v0.1 spec and parser | T1.2 | 2-3h |
+| [x] | T1.4 | `pokerface.yaml` v0.1 spec and parser | T1.2 | 2-3h |
 | [ ] | T1.5 | `pokerface.lock.yaml` v0.1 spec and parser | T1.2 | 2h |
 | [ ] | T1.6 | Git ref resolution: tag / branch / commit | T1.3 | 2-3h |
 | [ ] | T1.7 | Read Git metadata and cache repository mirrors | T1.6, T1.5 | 3h |
@@ -154,6 +154,8 @@ Tag rules must support at least the `latest`, `{{ commit.short }}`, `{{ git.tag 
 **Acceptance**: The example parses; missing `version`, `image`, or `build.context` produces path-aware errors; invalid platform names, duplicate tags, and unterminated placeholders are rejected; the spec includes a complete field table.
 
 **Depends on**: T1.2 · **Estimate**: 2-3h
+
+> **Notes** (2026-11-18, ~2h): Done. `src/config.emo` parses and validates the full v0.1 surface with path-aware errors (`pokerface.yaml: build.context: …`); unknown fields are rejected while version is 1; tags accept literals plus `{{ commit.short }}`/`{{ git.tag }}`/`{{ branch }}`/`{{ version }}` templates. The T1.2 gotcha was confirmed in practice: a bare `context: .` decodes as `YamlFloat` and is rejected with a quote hint, so `examples/pokerface.yaml` uses `context: "."`. 25 test cases (example file, minimal defaults, 7 valid variants, 25-row invalid table); `emo test` 32/32. Gotchas: `is()` narrowing only covers the `if` branch, so every parser is shaped as `if value.is(…) { …body… } return error`; `substring(start, len)` raises past the end — guard two-char windows with `i + 2 <= len`. Follow-ups: template rendering lands in T4.1; platform sets may widen with real build support.
 
 #### T1.5 `pokerface.lock.yaml` v0.1 Spec and Parser
 

@@ -1,0 +1,155 @@
+// T1.4 parser and validation tests for src/config.emo — run with `emo test`.
+
+const cfg = src.config
+
+def test_example_file_parses() {
+  const (R.ok, text) = file.read("examples/pokerface.yaml")
+  case cfg.load(text) {
+    (R.ok, c) then {
+      expect_equal(1, c.version)
+      expect_equal("registry.example.com/acme/app", c.image)
+      expect_equal(".", c.build.context)
+      expect_equal("Dockerfile", c.build.dockerfile)
+      expect_equal("runtime", c.build.target)
+      expect_equal(1, c.build.platforms.length())
+      expect_equal("linux/amd64", c.build.platforms[0])
+      expect_equal("production", c.build.args.get("NODE_ENV"))
+      expect_equal(2, c.tags.length())
+      expect_equal("latest", c.tags[0])
+      expect_equal("{{ commit.short }}", c.tags[1])
+      expect_equal("https://registry.example.com", c.registry.url)
+    }
+    (R.error, why) then {
+      expect_fail("examples/pokerface.yaml should parse: " + why)
+    }
+  }
+}
+
+def test_minimal_config_defaults() {
+  case cfg.load(minimal_yaml()) {
+    (R.ok, c) then {
+      expect_equal(1, c.version)
+      expect_equal("registry.example.com/acme/app", c.image)
+      expect_equal("src", c.build.context)
+      expect_equal("Dockerfile", c.build.dockerfile)
+      expect_equal("", c.build.target)
+      expect_equal(1, c.build.platforms.length())
+      expect_equal("linux/amd64", c.build.platforms[0])
+      expect_equal(0, c.build.args.length())
+      expect_equal(1, c.tags.length())
+      expect_equal("latest", c.tags[0])
+      expect_equal("", c.registry.url)
+    }
+    (R.error, why) then {
+      expect_fail("minimal config should parse: " + why)
+    }
+  }
+}
+
+def test_valid_variants() {
+  const cases = valid_variants()
+  var i = 0
+  while i < cases.length() {
+    expect_valid(cases[i])
+    i = i + 1
+  }
+}
+
+def test_invalid_configs() {
+  const cases = invalid_cases()
+  var i = 0
+  while i < cases.length() {
+    const (text, path) = cases[i]
+    expect_invalid(text, path)
+    i = i + 1
+  }
+}
+
+def expect_valid(text String) {
+  case cfg.load(text) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("expected config to parse: " + why) }
+  }
+}
+
+def expect_invalid(text String, path String) {
+  case cfg.load(text) {
+    (R.ok, _) then { expect_fail("expected config to be rejected: " + text) }
+    (R.error, why) then { expect_true(why.index_of(path) >= 0) }
+  }
+}
+
+def minimal_yaml() String {
+  return (
+    "version: 1\n"
+    + "image: registry.example.com/acme/app\n"
+    + "build:\n"
+    + "  context: src\n"
+  )
+}
+
+def valid_variants() Array[String] {
+  return [
+    minimal_yaml(),
+    example_yaml_text(),
+    "version: 1\nimage: registry.example.com:5000/acme/app\nbuild:\n  context: src\n",
+    "version: 1\nimage: registry.example.com/acme/app\nbuild:\n  context: src\ntags: [\"v{{ version }}\", \"{{ git.tag }}\", \"{{ branch }}\"]\n",
+    "version: 1\nimage: registry.example.com/acme/app\nbuild:\n  context: src\n  platforms: [linux/amd64, linux/arm64]\n",
+    "version: 1\nimage: registry.example.com/acme/app\nbuild:\n  context: src\n  args:\n    FOO: \"123\"\n",
+    "version: 1\nimage: registry.example.com/acme/app\nbuild:\n  context: src\nregistry:\n  url: https://registry.example.com/\n"
+  ]
+}
+
+def example_yaml_text() String {
+  return (
+    "version: 1\n"
+    + "image: registry.example.com/acme/app\n"
+    + "build:\n"
+    + "  context: \".\"\n"
+    + "  dockerfile: Dockerfile\n"
+    + "  target: runtime\n"
+    + "  platforms:\n"
+    + "    - linux/amd64\n"
+    + "  args:\n"
+    + "    NODE_ENV: production\n"
+    + "tags:\n"
+    + "  - latest\n"
+    + "  - \"{{ commit.short }}\"\n"
+    + "registry:\n"
+    + "  url: https://registry.example.com\n"
+  )
+}
+
+def invalid_cases() Array[(String, String)] {
+  return [
+    ("", "empty"),
+    ("just a string", "top level"),
+    ("image: [unclosed", "invalid YAML"),
+    ("image: registry.example.com/a/b\n", "version"),
+    ("version: 2\nimage: registry.example.com/a/b\nbuild:\n  context: src\n", "version"),
+    (
+      "image: registry.example.com/a/b\n"
+      + "build:\n"
+      + "  context: src\n",
+      "version"
+    ),
+    ("version: 1\nbuild:\n  context: src\n", "image"),
+    ("version: 1\nimage: registry.example.com/a/b\n", "build"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  dockerfile: Dockerfile\n", "build.context"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  context: .\n", "build.context"),
+    ("version: 1\nimage: Registry.example.com/A/B\nbuild:\n  context: src\n", "image"),
+    ("version: 1\nimage: registry.example.com/a/b:latest\nbuild:\n  context: src\n", "image"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  context: src\n  platforms: [linux/nvidia]\n", "build.platforms"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  context: src\n  platforms: [linux]\n", "build.platforms"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  context: src\ntags: [latest, latest]\n", "duplicate"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  context: src\ntags: [\"{{ commit.short\"]\n", "unterminated"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  context: src\ntags: [\"{{ nope }}\"]\n", "unknown placeholder"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  context: src\ntags: [\"Bad Tag\"]\n", "tags"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  context: src\nbogus: 1\n", "unknown field"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  context: src\n  bogus: 1\n", "build.bogus"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  context: src\n  args:\n    FOO: 123\n", "build.args.FOO"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  context: src\nregistry:\n  url: registry.example.com\n", "registry.url"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  context: src\nregistry:\n  bogus: 1\n", "registry.bogus"),
+    ("version: 1\nimage: registry.example.com/a/b\nbuild:\n  context: src\nregistry:\n  url: https://\n", "registry.url")
+  ]
+}

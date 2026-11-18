@@ -1,0 +1,15 @@
+version: 1
+image: registry.example.com/acme/app
+build:
+  context: "."
+  dockerfile: Dockerfile
+  target: runtime
+  platforms:
+    - linux/amd64
+  args:
+    NODE_ENV: production
+tags:
+  - latest
+  - "{{ commit.short }}"
+registry:
+  url: https://registry.example.com
