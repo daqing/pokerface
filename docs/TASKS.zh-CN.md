@@ -74,7 +74,7 @@
 | [x] | T1.2 | Emo 运行时能力验证与依赖锁定 | T1.1 | 2h |
 | [x] | T1.3 | 仓库引用解析 | T1.1 | 1-2h |
 | [x] | T1.4 | `pokerface.yaml` v0.1 规范与解析 | T1.2 | 2-3h |
-| [ ] | T1.5 | `pokerface.lock.yaml` v0.1 规范与解析 | T1.2 | 2h |
+| [x] | T1.5 | `pokerface.lock.yaml` v0.1 规范与解析 | T1.2 | 2h |
 | [ ] | T1.6 | Git ref 解析：tag / branch / commit | T1.3 | 2-3h |
 | [ ] | T1.7 | Git 元数据读取与镜像缓存 | T1.6、T1.5 | 3h |
 | [ ] | T1.8 | 配置、凭据与 XDG 路径 | T1.1 | 2h |
@@ -180,6 +180,8 @@ images:
 **验收**：解析后可稳定重编码（字段顺序确定）；`commit` 必须为完整 SHA；digest 格式校验；重复 tag 被拒绝；未知 `version` 明确报错；`generated_at` 不参与任何 digest 校验。
 
 **依赖**：T1.2 · **预估**：2h
+
+> **笔记**（2026-11-18，约 2h）：完成。`src/lockfile.emo` 解析并编码 v0.1 全部字段；`source` 复用 `src.ref.parse` 并归一化为裸 `host/owner/repo` 形式（source 里带 ref 会被拒绝）；lock 的 tags 只接受已渲染字面量——`{{ 占位符 }}` 会被拒绝并提示回 `pokerface.yaml`。编码器固定字段顺序并省略空的可选字段，`encode(load(text))` 字节级稳定；`generated_at` 仅是元数据，两条只差该字段的 lock 解析出相同 digest（有测试钉住）。镜像/平台校验通过新增的无前缀 `config.check_image`/`check_platform` 与 T1.4 共用。7 个测试约 40 个用例；`emo test` 39/39。踩坑重申：具体类方法（`entries`）需要窄化后的接收者，所以 `parse_image_entry` 拆成 `is()` 闸门 + 接收具体类型 `yaml.YamlObject` 的内层 `parse_image_object`。
 
 #### T1.6 Git ref 解析：tag / branch / commit
 

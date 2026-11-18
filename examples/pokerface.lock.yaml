@@ -1,0 +1,11 @@
+version: 1
+commit: 0123456789abcdef0123456789abcdef01234567
+source: github.com/acme/app
+generated_at: "2026-11-18T08:30:00Z"
+images:
+  - image: registry.example.com/acme/app
+    tags: [latest, sha-01234567]
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    manifest_digest: sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+    platforms: [linux/amd64]
+    builder: buildkit

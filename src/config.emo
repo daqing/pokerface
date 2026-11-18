@@ -356,52 +356,60 @@ def parse_registry(value yaml.Yaml) (R, String) {
 }
 
 def validate_image(image String, path String) (R, String) {
+  case check_image(image) {
+    (R.error, why) then { return (R.error, error_at(path, why)) }
+    (R.ok, checked) then { return (R.ok, checked) }
+  }
+}
+
+// Plain-message image validation, shared with the lockfile parser.
+def check_image(image String) (R, String) {
   if image == "" {
-    return (R.error, error_at(path, "image must not be empty"))
+    return (R.error, "image must not be empty")
   }
   if image.index_of("://") >= 0 {
-    return (R.error, error_at(path, "image must not include a scheme (write registry.example.com/acme/app)"))
+    return (R.error, "image must not include a scheme (write registry.example.com/acme/app)")
   }
   if image.index_of("@") >= 0 {
-    return (R.error, error_at(path, "image must not include a digest"))
+    return (R.error, "image must not include a digest")
   }
   var i = 0
   while i < image.length() {
     const c = image.substring(i, 1)
     if image_charset.index_of(c) < 0 {
-      return (R.error, error_at(path, "image '" + image + "' has invalid character '" + c + "' (lowercase [a-z0-9._-/] and an optional :port)"))
+      return (R.error, "image '" + image + "' has invalid character '" + c + "' (lowercase [a-z0-9._-/] and an optional :port)")
     }
     i = i + 1
   }
   const slash = image.index_of("/")
   if slash < 0 {
-    return (R.error, error_at(path, "expected <registry-host>/<owner>/<repo>, got '" + image + "'"))
+    return (R.error, "expected <registry-host>/<owner>/<repo>, got '" + image + "'")
   }
   const host = image.substring(0, slash)
   const path_part = image.substring(slash + 1, image.length() - slash - 1)
   if host == "" {
-    return (R.error, error_at(path, "registry host is empty"))
+    return (R.error, "registry host is empty")
   }
   if path_part == "" {
-    return (R.error, error_at(path, "repository path after the host is empty"))
+    return (R.error, "repository path after the host is empty")
   }
   if path_part.index_of(":") >= 0 {
-    return (R.error, error_at(path, "image must not include a tag (use the tags section)"))
+    return (R.error, "image must not include a tag (use the tags section)")
   }
   const port_at = host.index_of(":")
   if port_at >= 0 {
     if !all_digits(host.substring(port_at + 1, host.length() - port_at - 1)) {
-      return (R.error, error_at(path, "invalid host '" + host + "' (expected <host> or <host>:<port>)"))
+      return (R.error, "invalid host '" + host + "' (expected <host> or <host>:<port>)")
     }
   }
   const segments = path_part.split("/")
   var s = 0
   while s < segments.length() {
     if segments[s] == "" {
-      return (R.error, error_at(path, "repository path '" + path_part + "' has an empty segment"))
+      return (R.error, "repository path '" + path_part + "' has an empty segment")
     }
     if segments[s].starts_with(".") {
-      return (R.error, error_at(path, "repository segment '" + segments[s] + "' must not start with '.'"))
+      return (R.error, "repository segment '" + segments[s] + "' must not start with '.'")
     }
     s = s + 1
   }
@@ -409,15 +417,23 @@ def validate_image(image String, path String) (R, String) {
 }
 
 def validate_platform(platform String, path String) (R, String) {
+  case check_platform(platform) {
+    (R.error, why) then { return (R.error, error_at(path, why)) }
+    (R.ok, checked) then { return (R.ok, checked) }
+  }
+}
+
+// Plain-message platform validation, shared with the lockfile parser.
+def check_platform(platform String) (R, String) {
   const parts = platform.split("/")
   if parts.length() != 2 {
-    return (R.error, error_at(path, "invalid platform '" + platform + "' (expected <os>/<arch>)"))
+    return (R.error, "invalid platform '" + platform + "' (expected <os>/<arch>)")
   }
   if !in_array(known_os_list, parts[0]) {
-    return (R.error, error_at(path, "unknown platform '" + platform + "' (supported os: linux, windows, darwin, freebsd)"))
+    return (R.error, "unknown platform '" + platform + "' (supported os: linux, windows, darwin, freebsd)")
   }
   if !in_array(known_arch_list, parts[1]) {
-    return (R.error, error_at(path, "unknown platform '" + platform + "' (supported arch: amd64, arm64, arm, 386, riscv64)"))
+    return (R.error, "unknown platform '" + platform + "' (supported arch: amd64, arm64, arm, 386, riscv64)")
   }
   return (R.ok, platform)
 }

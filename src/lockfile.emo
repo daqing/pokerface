@@ -1,0 +1,444 @@
+// T1.5: parse and encode pokerface.lock.yaml — the metadata CI writes back to
+// Git so the pull side can resolve tag -> commit -> digest from Git alone
+// (decision D2). Spec: docs/spec/pokerface-lock.md. The encoder's field order
+// is fixed, so encode(load(text)) is byte-stable across repeats. generated_at
+// is informational and never participates in digest verification.
+
+require "yaml"
+
+const hex_charset = "0123456789abcdef"
+const lock_tag_charset = "abcdefghijklmnopqrstuvwxyz0123456789.-_"
+const known_builders = ["buildkit", "podman"]
+const lock_default_platform = "linux/amd64"
+
+class LockImage {
+  def init(image String, tags Array[String], digest String, manifest_digest String, platforms Array[String], builder String) {
+    self.image = image
+    self.tags = tags
+    self.digest = digest
+    self.manifest_digest = manifest_digest
+    self.platforms = platforms
+    self.builder = builder
+  }
+}
+
+class LockDoc {
+  def init(version Int64, commit String, source String, generated_at String, images Array[LockImage]) {
+    self.version = version
+    self.commit = commit
+    self.source = source
+    self.generated_at = generated_at
+    self.images = images
+  }
+}
+
+def error_at(path String, message String) String {
+  return "pokerface.lock.yaml: " + path + ": " + message
+}
+
+def load(text String) (R, LockDoc) {
+  const trimmed = text.trim()
+  if trimmed == "" {
+    return (R.error, "pokerface.lock.yaml: the file is empty")
+  }
+  case yaml.decode(trimmed) {
+    (R.error, why) then { return (R.error, "pokerface.lock.yaml: invalid YAML — " + why) }
+    (R.ok, doc) then { return from_yaml(doc) }
+  }
+}
+
+def from_yaml(doc yaml.Yaml) (R, LockDoc) {
+  if doc.is(yaml.YamlObject) {
+    var version = 0
+    var have_version = false
+    var commit = ""
+    var have_commit = false
+    var source = ""
+    var have_source = false
+    var generated_at = ""
+    var images = []
+    var have_images = false
+
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      case key {
+        "version" then {
+          if value.is(yaml.YamlInt) {
+            version = value.as_int()
+          } else {
+            return (R.error, error_at("version", "expected the integer 1, got " + kind_word(value.kind())))
+          }
+          have_version = true
+        }
+        "commit" then {
+          if value.is(yaml.YamlString) {
+            commit = value.as_string()
+          } else {
+            return (R.error, error_at("commit", "expected a string, got " + kind_word(value.kind())))
+          }
+          have_commit = true
+        }
+        "source" then {
+          if value.is(yaml.YamlString) {
+            case parse_source(value.as_string()) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, normalized) then { source = normalized }
+            }
+          } else {
+            return (R.error, error_at("source", "expected a string, got " + kind_word(value.kind())))
+          }
+          have_source = true
+        }
+        "generated_at" then {
+          if value.is(yaml.YamlString) {
+            generated_at = value.as_string()
+          } else {
+            return (R.error, error_at("generated_at", "expected a string, got " + kind_word(value.kind())))
+          }
+        }
+        "images" then {
+          case parse_images(value) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, list) then { images = list }
+          }
+          have_images = true
+        }
+        _ then {
+          return (R.error, error_at(key, "unknown field (known: version, commit, source, generated_at, images)"))
+        }
+      }
+      i = i + 1
+    }
+
+    if !have_version {
+      return (R.error, error_at("version", "missing required field"))
+    }
+    if version != 1 {
+      return (R.error, error_at("version", "expected 1, got " + version.to_string() + " (unknown version)"))
+    }
+    if !have_commit {
+      return (R.error, error_at("commit", "missing required field"))
+    }
+    case check_commit(commit) {
+      (R.error, why) then { return (R.error, error_at("commit", why)) }
+      (R.ok, checked) then { commit = checked }
+    }
+    if !have_source {
+      return (R.error, error_at("source", "missing required field"))
+    }
+    if !have_images {
+      return (R.error, error_at("images", "missing required field"))
+    }
+    return (R.ok, LockDoc.new(version, commit, source, generated_at, images))
+  }
+  return (R.error, "pokerface.lock.yaml: expected a mapping at the top level, got " + kind_word(doc.kind()))
+}
+
+// The source names the repository only; any D3 form is accepted and
+// normalized to the bare <host>/<owner>/<repo> shape. A ref in the source is
+// an error — the commit field carries that information.
+def parse_source(source String) (R, String) {
+  case src.ref.parse(source) {
+    (R.error, why) then { return (R.error, error_at("source", why)) }
+    (R.ok, r) then {
+      if r.ref != "latest" {
+        return (R.error, error_at("source", "must not include a ref ('" + r.ref + "'); the commit field carries that information"))
+      }
+      return (R.ok, r.host + "/" + r.owner + "/" + r.repo)
+    }
+  }
+}
+
+def parse_images(value yaml.Yaml) (R, Array[LockImage]) {
+  if value.is(yaml.YamlArray) {
+    const items = value.items()
+    var out = []
+    var i = 0
+    while i < items.length() {
+      const item = items[i]
+      if !item.is(yaml.YamlObject) {
+        return (R.error, error_at("images[" + i.to_string() + "]", "expected a mapping, got " + kind_word(item.kind())))
+      }
+      case parse_image_entry(item, "images[" + i.to_string() + "]") {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, entry) then {
+          var j = 0
+          while j < out.length() {
+            if out[j].image == entry.image {
+              return (R.error, error_at("images[" + i.to_string() + "]", "duplicate image '" + entry.image + "'"))
+            }
+            j = j + 1
+          }
+          out = out.append(entry)
+        }
+      }
+      i = i + 1
+    }
+    if out.length() == 0 {
+      return (R.error, error_at("images", "at least one image entry is required"))
+    }
+    return (R.ok, out)
+  }
+  return (R.error, error_at("images", "expected an array, got " + kind_word(value.kind())))
+}
+
+def parse_image_entry(value yaml.Yaml, path String) (R, LockImage) {
+  if value.is(yaml.YamlObject) {
+    return parse_image_object(value, path)
+  }
+  return (R.error, error_at(path, "expected a mapping, got " + kind_word(value.kind())))
+}
+
+def parse_image_object(value yaml.YamlObject, path String) (R, LockImage) {
+  var image = ""
+  var have_image = false
+  var tags = []
+  var have_tags = false
+  var digest = ""
+  var have_digest = false
+  var manifest_digest = ""
+  var platforms = []
+  var have_platforms = false
+  var builder = ""
+
+  const entries = value.entries()
+  var i = 0
+  while i < entries.length() {
+    const (key, v) = entries[i]
+    case key {
+      "image" then {
+        if v.is(yaml.YamlString) {
+          image = v.as_string()
+        } else {
+          return (R.error, error_at(path + ".image", "expected a string, got " + kind_word(v.kind())))
+        }
+        have_image = true
+      }
+      "tags" then {
+        case parse_entry_tags(v, path) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, list) then { tags = list }
+        }
+        have_tags = true
+      }
+      "digest" then {
+        if v.is(yaml.YamlString) {
+          digest = v.as_string()
+        } else {
+          return (R.error, error_at(path + ".digest", "expected a string, got " + kind_word(v.kind())))
+        }
+        have_digest = true
+      }
+      "manifest_digest" then {
+        if v.is(yaml.YamlString) {
+          manifest_digest = v.as_string()
+        } else {
+          return (R.error, error_at(path + ".manifest_digest", "expected a string, got " + kind_word(v.kind())))
+        }
+      }
+      "platforms" then {
+        if v.is(yaml.YamlArray) {
+          const items = v.items()
+          var k = 0
+          while k < items.length() {
+            const item = items[k]
+            if !item.is(yaml.YamlString) {
+              return (R.error, error_at(path + ".platforms[" + k.to_string() + "]", "expected a string, got " + kind_word(item.kind())))
+            }
+            case src.config.check_platform(item.as_string()) {
+              (R.error, why) then { return (R.error, error_at(path + ".platforms[" + k.to_string() + "]", why)) }
+              (R.ok, checked) then { platforms = platforms.append(checked) }
+            }
+            k = k + 1
+          }
+          have_platforms = true
+        } else {
+          return (R.error, error_at(path + ".platforms", "expected an array, got " + kind_word(v.kind())))
+        }
+      }
+      "builder" then {
+        if v.is(yaml.YamlString) {
+          builder = v.as_string()
+        } else {
+          return (R.error, error_at(path + ".builder", "expected a string, got " + kind_word(v.kind())))
+        }
+      }
+      _ then {
+        return (R.error, error_at(path + "." + key, "unknown field (known: image, tags, digest, manifest_digest, platforms, builder)"))
+      }
+    }
+    i = i + 1
+  }
+
+  if !have_image {
+    return (R.error, error_at(path + ".image", "missing required field"))
+  }
+  case src.config.check_image(image) {
+    (R.error, why) then { return (R.error, error_at(path + ".image", why)) }
+    (R.ok, checked) then { image = checked }
+  }
+  if !have_tags {
+    return (R.error, error_at(path + ".tags", "missing required field"))
+  }
+  if !have_digest {
+    return (R.error, error_at(path + ".digest", "missing required field"))
+  }
+  case check_digest(digest) {
+    (R.error, why) then { return (R.error, error_at(path + ".digest", why)) }
+    (R.ok, checked) then { digest = checked }
+  }
+  if manifest_digest != "" {
+    case check_digest(manifest_digest) {
+      (R.error, why) then { return (R.error, error_at(path + ".manifest_digest", why)) }
+      (R.ok, checked) then { manifest_digest = checked }
+    }
+  }
+  if !have_platforms {
+    platforms = [lock_default_platform]
+  }
+  if platforms.length() == 0 {
+    return (R.error, error_at(path + ".platforms", "at least one platform is required"))
+  }
+  if builder != "" {
+    if !src.config.in_array(known_builders, builder) {
+      return (R.error, error_at(path + ".builder", "unknown builder '" + builder + "' (supported: buildkit, podman)"))
+    }
+  }
+  return (R.ok, LockImage.new(image, tags, digest, manifest_digest, platforms, builder))
+}
+
+// Lock tags are already-rendered tags: the placeholder syntax is rejected
+// here along with everything outside the OCI tag charset.
+def parse_entry_tags(value yaml.Yaml, path String) (R, Array[String]) {
+  if value.is(yaml.YamlArray) {
+    const items = value.items()
+    var out = []
+    var i = 0
+    while i < items.length() {
+      const item = items[i]
+      if !item.is(yaml.YamlString) {
+        return (R.error, error_at(path + ".tags[" + i.to_string() + "]", "expected a string, got " + kind_word(item.kind())))
+      }
+      const tag = item.as_string()
+      if tag == "" {
+        return (R.error, error_at(path + ".tags[" + i.to_string() + "]", "tag must not be empty"))
+      }
+      if tag.length() > 128 {
+        return (R.error, error_at(path + ".tags[" + i.to_string() + "]", "tag is longer than 128 characters"))
+      }
+      var c = 0
+      while c < tag.length() {
+        if lock_tag_charset.index_of(tag.substring(c, 1)) < 0 {
+          return (R.error, error_at(path + ".tags[" + i.to_string() + "]", "tag '" + tag + "' has invalid character '" + tag.substring(c, 1) + "' (rendered tags are lowercase [a-z0-9._-]; placeholders belong in pokerface.yaml)"))
+        }
+        c = c + 1
+      }
+      var j = 0
+      while j < out.length() {
+        if out[j] == tag {
+          return (R.error, error_at(path + ".tags[" + i.to_string() + "]", "duplicate tag '" + tag + "'"))
+        }
+        j = j + 1
+      }
+      out = out.append(tag)
+      i = i + 1
+    }
+    if out.length() == 0 {
+      return (R.error, error_at(path + ".tags", "at least one tag is required"))
+    }
+    return (R.ok, out)
+  }
+  return (R.error, error_at(path + ".tags", "expected an array, got " + kind_word(value.kind())))
+}
+
+def check_commit(sha String) (R, String) {
+  if sha.length() != 40 {
+    return (R.error, "must be a full 40-character commit SHA, got " + sha.length().to_string() + " characters")
+  }
+  if !all_hex(sha) {
+    return (R.error, "must be 40 lowercase hex characters, got '" + sha + "'")
+  }
+  return (R.ok, sha)
+}
+
+def check_digest(digest String) (R, String) {
+  if !digest.starts_with("sha256:") {
+    return (R.error, "must start with 'sha256:', got '" + digest + "'")
+  }
+  const hex = digest.substring(7, digest.length() - 7)
+  if hex.length() != 64 {
+    return (R.error, "must be 'sha256:' followed by 64 hex characters, got " + hex.length().to_string())
+  }
+  if !all_hex(hex) {
+    return (R.error, "must be 'sha256:' followed by 64 lowercase hex characters, got '" + digest + "'")
+  }
+  return (R.ok, digest)
+}
+
+def all_hex(s String) Bool {
+  var i = 0
+  while i < s.length() {
+    if hex_charset.index_of(s.substring(i, 1)) < 0 {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+def kind_word(kind yaml.YamlKind) String {
+  case kind {
+    yaml.YamlKind.ynull then { return "null" }
+    yaml.YamlKind.ybool then { return "a boolean" }
+    yaml.YamlKind.yint then { return "an integer" }
+    yaml.YamlKind.yfloat then { return "a number" }
+    yaml.YamlKind.ystring then { return "a string" }
+    yaml.YamlKind.yarray then { return "an array" }
+    yaml.YamlKind.yobject then { return "a mapping" }
+  }
+}
+
+// Deterministic encoder: fixed field order, flow-style lists, empty optional
+// fields omitted (generated_at, manifest_digest, builder). Two LockDoc values
+// with equal content always encode to the same bytes.
+def encode(doc LockDoc) String {
+  var out = ""
+  out = out + "version: " + doc.version.to_string() + "\n"
+  out = out + "commit: " + doc.commit + "\n"
+  out = out + "source: " + doc.source + "\n"
+  if doc.generated_at != "" {
+    out = out + "generated_at: \"" + doc.generated_at + "\"\n"
+  }
+  out = out + "images:\n"
+  var i = 0
+  while i < doc.images.length() {
+    const img = doc.images[i]
+    out = out + "  - image: " + img.image + "\n"
+    out = out + "    tags: [" + join_strings(img.tags) + "]\n"
+    out = out + "    digest: " + img.digest + "\n"
+    if img.manifest_digest != "" {
+      out = out + "    manifest_digest: " + img.manifest_digest + "\n"
+    }
+    out = out + "    platforms: [" + join_strings(img.platforms) + "]\n"
+    if img.builder != "" {
+      out = out + "    builder: " + img.builder + "\n"
+    }
+    i = i + 1
+  }
+  return out
+}
+
+def join_strings(arr Array[String]) String {
+  var out = ""
+  var i = 0
+  while i < arr.length() {
+    if i > 0 {
+      out = out + ", "
+    }
+    out = out + arr[i]
+    i = i + 1
+  }
+  return out
+}

@@ -1,0 +1,326 @@
+// T1.5 parser and encoder tests for src/lockfile.emo — run with `emo test`.
+
+const lock = src.lockfile
+
+def digest_a() String {
+  return "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
+
+def digest_b() String {
+  return "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+}
+
+def full_commit() String {
+  return "0123456789abcdef0123456789abcdef01234567"
+}
+
+def base_entry() String {
+  return (
+    "  - image: registry.example.com/acme/app\n"
+    + "    tags: [latest]\n"
+    + "    digest: " + digest_a() + "\n"
+  )
+}
+
+def lock_with_images(images_yaml String) String {
+  return (
+    "version: 1\n"
+    + "commit: " + full_commit() + "\n"
+    + "source: github.com/acme/app\n"
+    + "images:\n"
+    + images_yaml
+  )
+}
+
+def minimal_lock() String {
+  return lock_with_images(base_entry())
+}
+
+def source_variant_lock() String {
+  return (
+    "version: 1\n"
+    + "commit: " + full_commit() + "\n"
+    + "source: https://github.com/acme/app.git\n"
+    + "images:\n"
+    + base_entry()
+  )
+}
+
+def test_example_file_parses() {
+  const (R.ok, text) = file.read("examples/pokerface.lock.yaml")
+  case lock.load(text) {
+    (R.ok, doc) then {
+      expect_equal(1, doc.version)
+      expect_equal(full_commit(), doc.commit)
+      expect_equal("github.com/acme/app", doc.source)
+      expect_equal("2026-11-18T08:30:00Z", doc.generated_at)
+      expect_equal(1, doc.images.length())
+      const img = doc.images[0]
+      expect_equal("registry.example.com/acme/app", img.image)
+      expect_equal(2, img.tags.length())
+      expect_equal("latest", img.tags[0])
+      expect_equal("sha-01234567", img.tags[1])
+      expect_equal(digest_a(), img.digest)
+      expect_equal(digest_b(), img.manifest_digest)
+      expect_equal("linux/amd64", img.platforms[0])
+      expect_equal("buildkit", img.builder)
+    }
+    (R.error, why) then {
+      expect_fail("examples/pokerface.lock.yaml should parse: " + why)
+    }
+  }
+}
+
+def test_minimal_lock_defaults_and_encode() {
+  case lock.load(minimal_lock()) {
+    (R.ok, doc) then {
+      expect_equal("", doc.generated_at)
+      expect_equal("", doc.images[0].manifest_digest)
+      expect_equal("", doc.images[0].builder)
+      expect_equal(1, doc.images[0].platforms.length())
+      expect_equal("linux/amd64", doc.images[0].platforms[0])
+      const encoded = lock.encode(doc)
+      expect_true(encoded.index_of("generated_at") < 0)
+      expect_true(encoded.index_of("manifest_digest") < 0)
+      expect_true(encoded.index_of("builder") < 0)
+      expect_true(encoded.index_of("platforms: [linux/amd64]") >= 0)
+    }
+    (R.error, why) then {
+      expect_fail("minimal lock should parse: " + why)
+    }
+  }
+}
+
+def test_encode_is_deterministic() {
+  const (R.ok, text) = file.read("examples/pokerface.lock.yaml")
+  const (R.ok, doc1) = lock.load(text)
+  const once = lock.encode(doc1)
+  expect_true(once.index_of("generated_at: \"2026-11-18T08:30:00Z\"") >= 0)
+  const (R.ok, doc2) = lock.load(once)
+  expect_equal(once, lock.encode(doc2))
+  expect_docs_equal(doc1, doc2)
+}
+
+def expect_docs_equal(a src.lockfile.LockDoc, b src.lockfile.LockDoc) {
+  expect_equal(a.version, b.version)
+  expect_equal(a.commit, b.commit)
+  expect_equal(a.source, b.source)
+  expect_equal(a.generated_at, b.generated_at)
+  expect_equal(a.images.length(), b.images.length())
+  const ia = a.images[0]
+  const ib = b.images[0]
+  expect_equal(ia.image, ib.image)
+  expect_equal(ia.tags.length(), ib.tags.length())
+  expect_equal(ia.tags[0], ib.tags[0])
+  expect_equal(ia.digest, ib.digest)
+  expect_equal(ia.manifest_digest, ib.manifest_digest)
+  expect_equal(ia.platforms[0], ib.platforms[0])
+  expect_equal(ia.builder, ib.builder)
+}
+
+def test_generated_at_not_in_digest_verification() {
+  const (R.ok, doc) = lock.load(minimal_lock())
+  const with_time = (
+    "version: 1\n"
+    + "commit: " + full_commit() + "\n"
+    + "source: github.com/acme/app\n"
+    + "generated_at: \"2020-01-01T00:00:00Z\"\n"
+    + "images:\n"
+    + base_entry()
+  )
+  const (R.ok, doc2) = lock.load(with_time)
+  expect_equal(doc.images[0].digest, doc2.images[0].digest)
+  expect_equal(doc.commit, doc2.commit)
+  expect_true(doc.generated_at != doc2.generated_at)
+}
+
+def test_source_is_normalized() {
+  const (R.ok, doc) = lock.load(source_variant_lock())
+  expect_equal("github.com/acme/app", doc.source)
+}
+
+def test_valid_variants() {
+  const cases = valid_locks()
+  var i = 0
+  while i < cases.length() {
+    expect_valid(cases[i])
+    i = i + 1
+  }
+}
+
+def test_invalid_locks() {
+  const cases = invalid_locks()
+  var i = 0
+  while i < cases.length() {
+    const (text, path) = cases[i]
+    expect_invalid(text, path)
+    i = i + 1
+  }
+}
+
+def expect_valid(text String) {
+  case lock.load(text) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("expected lock to parse: " + why) }
+  }
+}
+
+def expect_invalid(text String, path String) {
+  case lock.load(text) {
+    (R.ok, _) then { expect_fail("expected lock to be rejected: " + text) }
+    (R.error, why) then {
+      if why.index_of(path) < 0 {
+        expect_fail("error '" + why + "' does not mention '" + path + "'")
+      }
+      expect_true(true)
+    }
+  }
+}
+
+def valid_locks() Array[String] {
+  return [
+    minimal_lock(),
+    source_variant_lock(),
+    lock_with_images(
+      "  - image: registry.example.com/acme/app\n"
+      + "    tags: [latest, sha-01234567, v1.2.0]\n"
+      + "    digest: " + digest_a() + "\n"
+    ),
+    lock_with_images(
+      "  - image: registry.example.com/acme/app\n"
+      + "    tags: [latest]\n"
+      + "    digest: " + digest_a() + "\n"
+      + "    platforms: [linux/amd64, linux/arm64]\n"
+      + "    builder: podman\n"
+    ),
+    lock_with_images(
+      "  - image: registry.example.com/acme/app\n"
+      + "    tags: [latest]\n"
+      + "    digest: " + digest_a() + "\n"
+      + "    manifest_digest: " + digest_b() + "\n"
+    )
+  ]
+}
+
+def invalid_locks() Array[(String, String)] {
+  return [
+    ("", "empty"),
+    ("just text", "top level"),
+    (
+      "source: github.com/acme/app\nimages:\n" + base_entry(),
+      "version"
+    ),
+    (
+      "version: 2\ncommit: " + full_commit() + "\nsource: github.com/acme/app\nimages:\n" + base_entry(),
+      "version"
+    ),
+    (
+      "version: \"1\"\ncommit: " + full_commit() + "\nsource: github.com/acme/app\nimages:\n" + base_entry(),
+      "version"
+    ),
+    (
+      "version: 1\nsource: github.com/acme/app\nimages:\n" + base_entry(),
+      "commit"
+    ),
+    (
+      "version: 1\ncommit: 0123456789abcdef0123456789abcdef0123456\nsource: github.com/acme/app\nimages:\n" + base_entry(),
+      "commit"
+    ),
+    (
+      "version: 1\ncommit: 0123456789abcdef0123456789abcdef01234567g\nsource: github.com/acme/app\nimages:\n" + base_entry(),
+      "commit"
+    ),
+    (
+      "version: 1\ncommit: 0123456789ABCDEF0123456789abcdef01234567\nsource: github.com/acme/app\nimages:\n" + base_entry(),
+      "commit"
+    ),
+    (
+      "version: 1\ncommit: " + full_commit() + "\nimages:\n" + base_entry(),
+      "source"
+    ),
+    (
+      "version: 1\ncommit: " + full_commit() + "\nsource: github.com/acme/app:main\nimages:\n" + base_entry(),
+      "source"
+    ),
+    (
+      "version: 1\ncommit: " + full_commit() + "\nsource: not-a-repo\nimages:\n" + base_entry(),
+      "source"
+    ),
+    (
+      "version: 1\ncommit: " + full_commit() + "\nsource: github.com/acme/app\n",
+      "images"
+    ),
+    (
+      "version: 1\ncommit: " + full_commit() + "\nsource: github.com/acme/app\nimages: []\n",
+      "images"
+    ),
+    (
+      "version: 1\ncommit: " + full_commit() + "\nsource: github.com/acme/app\nimages:\n  - tags: [latest]\n    digest: " + digest_a() + "\n",
+      "images[0].image"
+    ),
+    (
+      lock_with_images("  - digest: " + digest_a() + "\n"),
+      "images[0].image"
+    ),
+    (
+      lock_with_images("  - image: registry.example.com/acme/app\n    digest: " + digest_a() + "\n"),
+      "images[0].tags"
+    ),
+    (
+      lock_with_images("  - image: registry.example.com/acme/app\n    tags: [latest]\n"),
+      "images[0].digest"
+    ),
+    (
+      lock_with_images("  - image: registry.example.com/acme/app\n    tags: [latest]\n    digest: sha256:123\n"),
+      "images[0].digest"
+    ),
+    (
+      lock_with_images("  - image: registry.example.com/acme/app\n    tags: [latest]\n    digest: md5:" + digest_a() + "\n"),
+      "images[0].digest"
+    ),
+    (
+      lock_with_images("  - image: registry.example.com/acme/app\n    tags: [latest]\n    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde\n"),
+      "images[0].digest"
+    ),
+    (
+      lock_with_images("  - image: registry.example.com/acme/app\n    tags: [latest]\n    digest: " + digest_a() + "\n    manifest_digest: sha256:xyz\n"),
+      "images[0].manifest_digest"
+    ),
+    (
+      lock_with_images("  - image: registry.example.com/acme/app\n    tags: [latest, latest]\n    digest: " + digest_a() + "\n"),
+      "duplicate"
+    ),
+    (
+      lock_with_images("  - image: registry.example.com/acme/app\n    tags: [\"{{ commit.short }}\"]\n    digest: " + digest_a() + "\n"),
+      "images[0].tags[0]"
+    ),
+    (
+      lock_with_images("  - image: registry.example.com/acme/app\n    tags: [UPPER]\n    digest: " + digest_a() + "\n"),
+      "images[0].tags[0]"
+    ),
+    (
+      lock_with_images("  - image: registry.example.com/acme/app\n    tags: [latest]\n    digest: " + digest_a() + "\n    builder: kaniko\n"),
+      "images[0].builder"
+    ),
+    (
+      lock_with_images("  - image: registry.example.com/acme/app\n    tags: [latest]\n    digest: " + digest_a() + "\n    platforms: [nvidia/x]\n"),
+      "images[0].platforms"
+    ),
+    (
+      lock_with_images("  - image: registry.example.com/acme/app\n    tags: [latest]\n    digest: " + digest_a() + "\n    bogus: 1\n"),
+      "images[0].bogus"
+    ),
+    (
+      "version: 1\ncommit: " + full_commit() + "\nsource: github.com/acme/app\nbogus: 1\nimages:\n" + base_entry(),
+      "unknown field"
+    ),
+    (
+      lock_with_images("  - image: registry.example.com/acme/app\n    tags: [latest]\n    digest: " + digest_a() + "\n" + base_entry()),
+      "duplicate image"
+    ),
+    (
+      "version: 1\ncommit: " + full_commit() + "\nsource: github.com/acme/app\nimages:\n  - just a string\n",
+      "images[0]"
+    )
+  ]
+}

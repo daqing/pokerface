@@ -74,7 +74,7 @@ Exit criteria:
 | [x] | T1.2 | Verify Emo runtime capabilities and pin dependencies | T1.1 | 2h |
 | [x] | T1.3 | Parse repository references | T1.1 | 1-2h |
 | [x] | T1.4 | `pokerface.yaml` v0.1 spec and parser | T1.2 | 2-3h |
-| [ ] | T1.5 | `pokerface.lock.yaml` v0.1 spec and parser | T1.2 | 2h |
+| [x] | T1.5 | `pokerface.lock.yaml` v0.1 spec and parser | T1.2 | 2h |
 | [ ] | T1.6 | Git ref resolution: tag / branch / commit | T1.3 | 2-3h |
 | [ ] | T1.7 | Read Git metadata and cache repository mirrors | T1.6, T1.5 | 3h |
 | [ ] | T1.8 | Configuration, credentials, and XDG paths | T1.1 | 2h |
@@ -180,6 +180,8 @@ images:
 **Acceptance**: Parse and re-encode deterministically (stable field order); `commit` must be a full SHA; validate digest format; reject duplicate tags; reject an unknown `version`; `generated_at` never participates in digest verification.
 
 **Depends on**: T1.2 · **Estimate**: 2h
+
+> **Notes** (2026-11-18, ~2h): Done. `src/lockfile.emo` parses and encodes the full v0.1 lock; `source` reuses `src.ref.parse` and normalizes to the bare `host/owner/repo` shape (a ref in the source is rejected); lock tags are rendered-only — `{{ placeholder }}` syntax is rejected with a pointer back to `pokerface.yaml`. The encoder emits a fixed field order and omits empty optionals, so `encode(load(text))` is byte-stable; `generated_at` is metadata only and two locks differing just there resolve to the same digest (pinned by a test). Image/platform validation is shared with T1.4 via new plain-message `config.check_image`/`check_platform`. 7 tests over ~40 cases; `emo test` 39/39. Gotcha repeat: concrete-class methods (`entries`) need the narrowed receiver, so `parse_image_entry` splits into an `is()` gate plus an inner `parse_image_object(value yaml.YamlObject, …)` taking the concrete type.
 
 #### T1.6 Git Ref Resolution: Tag / Branch / Commit
 
