@@ -1,0 +1,211 @@
+// T1.7: bare-mirror cache under <cache_root>/git/<hash-of-url> and lock
+// metadata reads via `git show <commit>:pokerface.lock.yaml`. The mirror is
+// a bare repo git operates on with -C — the user's working tree is never
+// touched. First read fetches; the same commit reads offline afterwards
+// (the show fast path never runs a fetch). Layout:
+// docs/notes/git-cache-layout.md.
+
+require "os"
+require "file"
+require "time"
+require "crypto"
+
+const lock_file_name = "pokerface.lock.yaml"
+const cache_key_length = 16
+
+// XDG_CACHE_HOME, else $HOME/.cache — plus /pokerface. T1.8 owns the full
+// precedence table; "" means no usable HOME/XDG value.
+def default_cache_root() String {
+  var base = ""
+  case os.getenv("XDG_CACHE_HOME") {
+    (R.ok, v) then {
+      if v != "" {
+        base = v
+      }
+    }
+    (R.error, _) then { base = "" }
+  }
+  if base == "" {
+    case os.getenv("HOME") {
+      (R.ok, v) then { base = v + "/.cache" }
+      (R.error, _) then { base = "" }
+    }
+  }
+  if base == "" {
+    return ""
+  }
+  return base + "/pokerface"
+}
+
+def cache_key(git_url String) String {
+  return crypto.hex_encode(crypto.sha2.sha256(git_url.to_bytes())).substring(0, cache_key_length)
+}
+
+def ensure_dir(path String) (R, Bool) {
+  case os.mkdir(path) {
+    (R.ok, _) then { return (R.ok, true) }
+    (R.error, _) then {
+      case os.list_dir(path) {
+        (R.ok, _) then { return (R.ok, true) }
+        (R.error, why) then { return (R.error, "git cache: cannot create directory " + path + ": " + why) }
+      }
+    }
+  }
+}
+
+// Reads <lock_file_name> at <commit>. The mirror is initialized and fetched
+// on demand; ref_hint ("main", "v1.0", "refs/tags/v1.0", or a full SHA)
+// narrows the fetch, and "" fetches all heads and tags.
+def read_lock(runner src.git.CommandRunner, git_url String, commit String, ref_hint String, cache_root String, timeout Float64) (R, String) {
+  if commit.length() != 40 || !src.git.all_hex(commit) {
+    return (R.error, "git cache: commit must be a full 40-character hex SHA, got '" + commit + "'")
+  }
+  const dir = cache_root + "/git/" + cache_key(git_url)
+  const mirror = dir + "/mirror.git"
+  case ensure_dir(cache_root) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case ensure_dir(cache_root + "/git") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case ensure_dir(dir) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case ensure_mirror(runner, dir, mirror, git_url, timeout) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+
+  case show_lock(runner, mirror, commit, timeout) {
+    (R.ok, text) then { return (R.ok, text) }
+    (R.error, _) then {
+      const attempts = fetch_attempts(mirror, git_url, ref_hint)
+      var fetch_why = ""
+      var fetched = false
+      var round = 0
+      while round < 3 {
+        var a = 0
+        while a < attempts.length() {
+          case runner.run(attempts[a], timeout) {
+            (R.ok, _) then { fetched = true }
+            (R.error, why) then { fetch_why = why }
+          }
+          if fetched {
+            break
+          }
+          a = a + 1
+        }
+        if fetched {
+          break
+        }
+        if fetch_why.index_of("File exists") < 0 {
+          break
+        }
+        time.sleep(0.1)
+        round = round + 1
+      }
+      if !fetched {
+        if is_full_sha(ref_hint) {
+          return (R.error, "git cache: cannot fetch " + git_url + " into the mirror: " + fetch_why + " (fetching a raw commit SHA requires the server to enable uploadpack.allowAnySHA1InWant)")
+        }
+        return (R.error, "git cache: cannot fetch " + git_url + " into the mirror: " + fetch_why)
+      }
+      case show_lock(runner, mirror, commit, timeout) {
+        (R.ok, text) then { return (R.ok, text) }
+        (R.error, retry_why) then {
+          if retry_why.index_of("does not exist") >= 0 {
+            return (R.error, "git cache: " + git_url + " has no " + lock_file_name + " at commit " + commit)
+          }
+          return (R.error, "git cache: cannot read " + lock_file_name + " at commit " + commit + ": " + retry_why)
+        }
+      }
+    }
+  }
+}
+
+// read_lock + lockfile.load: the convenience entry T1.9 will call. Invalid
+// YAML at the commit is its own distinct error.
+def load_lock(runner src.git.CommandRunner, git_url String, commit String, ref_hint String, cache_root String, timeout Float64) (R, src.lockfile.LockDoc) {
+  case read_lock(runner, git_url, commit, ref_hint, cache_root, timeout) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, text) then {
+      case src.lockfile.load(text) {
+        (R.error, why) then {
+          return (R.error, "git cache: " + lock_file_name + " at commit " + commit + " is not valid lock YAML: " + why)
+        }
+        (R.ok, doc) then { return (R.ok, doc) }
+      }
+    }
+  }
+}
+
+// The mirror exists once <mirror>/HEAD does. Two racing initializers can
+// make git init fail with a mkdir race, so each round re-checks HEAD (the
+// other process may have finished) and retries a bounded number of times.
+// source-url records which remote the mirror belongs to.
+def ensure_mirror(runner src.git.CommandRunner, dir String, mirror String, git_url String, timeout Float64) (R, Bool) {
+  var last_why = ""
+  var round = 0
+  while round < 3 {
+    case file.read(mirror + "/HEAD") {
+      (R.ok, _) then { return (R.ok, true) }
+      (R.error, _) then { last_why = "mirror not initialized yet" }
+    }
+    case runner.run(["git", "init", "--bare", mirror], timeout) {
+      (R.ok, _) then {
+        case file.write(dir + "/source-url", git_url + "\n") {
+          (R.error, why) then { return (R.error, "git cache: cannot write source-url: " + why) }
+          (R.ok, _) then { return (R.ok, true) }
+        }
+      }
+      (R.error, why) then { last_why = why }
+    }
+    case file.read(mirror + "/HEAD") {
+      (R.ok, _) then { return (R.ok, true) }
+      (R.error, _) then { last_why = "mirror not initialized yet" }
+    }
+    time.sleep(0.05)
+    round = round + 1
+  }
+  return (R.error, "git cache: cannot initialize the bare mirror: " + last_why)
+}
+
+def show_lock(runner src.git.CommandRunner, mirror String, commit String, timeout Float64) (R, String) {
+  case runner.run(["git", "-C", mirror, "show", commit + ":" + lock_file_name], timeout) {
+    (R.ok, text) then { return (R.ok, text) }
+    (R.error, why) then { return (R.error, why) }
+  }
+}
+
+// Fetch directly from the URL (no "origin" remote setup needed). A full-SHA
+// hint fetches the raw SHA — local transports allow it, remote servers need
+// uploadpack.allowAnySHA1InWant. A name hint tries the branch refspec, then
+// the tag refspec: git fails a fetch when any refspec has no match, and the
+// caller does not know which kind the name is. Fetching an annotated tag
+// brings its peeled commit along, so one refspec suffices.
+def fetch_attempts(mirror String, git_url String, ref_hint String) Array[Array[String]] {
+  if is_full_sha(ref_hint) {
+    return [["git", "-C", mirror, "fetch", git_url, ref_hint]]
+  }
+  if ref_hint.starts_with("refs/") {
+    return [["git", "-C", mirror, "fetch", "--prune", git_url, "+" + ref_hint + ":" + ref_hint]]
+  }
+  if ref_hint == "" || ref_hint == "latest" || ref_hint == "HEAD" || is_short_sha(ref_hint) {
+    return [["git", "-C", mirror, "fetch", "--prune", git_url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]]
+  }
+  return [
+    ["git", "-C", mirror, "fetch", git_url, "+refs/heads/" + ref_hint + ":refs/heads/" + ref_hint],
+    ["git", "-C", mirror, "fetch", git_url, "+refs/tags/" + ref_hint + ":refs/tags/" + ref_hint]
+  ]
+}
+
+def is_full_sha(s String) Bool {
+  return s.length() == 40 && src.git.all_hex(s)
+}
+
+def is_short_sha(s String) Bool {
+  return s.length() >= 4 && s.length() < 40 && src.git.all_hex(s)
+}

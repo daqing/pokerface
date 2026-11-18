@@ -76,7 +76,7 @@ Exit criteria:
 | [x] | T1.4 | `pokerface.yaml` v0.1 spec and parser | T1.2 | 2-3h |
 | [x] | T1.5 | `pokerface.lock.yaml` v0.1 spec and parser | T1.2 | 2h |
 | [x] | T1.6 | Git ref resolution: tag / branch / commit | T1.3 | 2-3h |
-| [ ] | T1.7 | Read Git metadata and cache repository mirrors | T1.6, T1.5 | 3h |
+| [x] | T1.7 | Read Git metadata and cache repository mirrors | T1.6, T1.5 | 3h |
 | [ ] | T1.8 | Configuration, credentials, and XDG paths | T1.1 | 2h |
 | [ ] | T1.9 | Wire up the `resolve` command | T1.4-T1.8 | 2h |
 | [ ] | T1.10 | Registry authentication and manifest client | T1.5, T1.8 | 3h |
@@ -204,6 +204,8 @@ images:
 **Acceptance**: After the first read, the same commit's lock is readable offline; missing repositories, missing files, and invalid YAML each produce distinct errors; concurrent runs do not corrupt the cache; the user's working tree is never modified.
 
 **Depends on**: T1.6, T1.5 · **Estimate**: 3h
+
+> **Notes** (2026-11-18, ~2.5h): Done. `src/git_cache.emo` keeps one bare mirror per URL under `<cache_root>/git/<sha256-prefix>` with a `source-url` marker; reads go `git show <commit>:pokerface.lock.yaml` with a fetch-then-retry on miss. The offline guarantee is structural: the show fast path never runs a fetch (RecordingRunner asserts no fetch in the added log). Ref hints route fetches: full SHA → raw-SHA fetch (error mentions `uploadpack.allowAnySHA1InWant` when it fails — local transports allow it), `refs/...` → exact ref, name → branch refspec then tag refspec, unknown → all heads+tags. RealRunner now captures stderr too, so `git show`'s "does not exist" text is classifiable. Concurrency needed two bounded retries: racing `git init --bare` loses a mkdir race (re-check HEAD each round) and concurrent fetches collide on lock files (retry on "File exists"). Tests: 10, including a real forked-process race on one fresh cache and a worktree snapshot; `emo test` 63/63. Layout doc: docs/notes/git-cache-layout.md.
 
 #### T1.8 Configuration, Credentials, and XDG Paths
 

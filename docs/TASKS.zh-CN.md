@@ -76,7 +76,7 @@
 | [x] | T1.4 | `pokerface.yaml` v0.1 规范与解析 | T1.2 | 2-3h |
 | [x] | T1.5 | `pokerface.lock.yaml` v0.1 规范与解析 | T1.2 | 2h |
 | [x] | T1.6 | Git ref 解析：tag / branch / commit | T1.3 | 2-3h |
-| [ ] | T1.7 | Git 元数据读取与镜像缓存 | T1.6、T1.5 | 3h |
+| [x] | T1.7 | Git 元数据读取与镜像缓存 | T1.6、T1.5 | 3h |
 | [ ] | T1.8 | 配置、凭据与 XDG 路径 | T1.1 | 2h |
 | [ ] | T1.9 | `resolve` 命令串联 | T1.4-T1.8 | 2h |
 | [ ] | T1.10 | Registry 认证与 Manifest 客户端 | T1.5、T1.8 | 3h |
@@ -204,6 +204,8 @@ images:
 **验收**：首次读取后断网仍可读到同一 commit 的 lock；仓库不存在、文件不存在、YAML 非法分别报错；并发执行不会写坏缓存；不修改用户工作区。
 
 **依赖**：T1.6、T1.5 · **预估**：3h
+
+> **笔记**（2026-11-18，约 2.5h）：完成。`src/git_cache.emo` 在 `<cache_root>/git/<sha256 前缀>` 下为每个 URL 保留一个裸镜像并写 `source-url` 标记；读取走 `git show <commit>:pokerface.lock.yaml`，未命中则 fetch 后重试。离线保证是结构性的：show 快路径绝不触发 fetch（RecordingRunner 断言新增日志里没有 fetch）。ref 提示路由 fetch：完整 SHA → 按 SHA 拉取（失败时错误提及 `uploadpack.allowAnySHA1InWant`——本地传输允许）；`refs/...` → 精确 ref；名字 → 先分支 refspec 再 tag refspec；未知 → 全部 heads+tags。RealRunner 现在同时捕获 stderr，`git show` 的 "does not exist" 文本可用于分类。并发需要两处有限重试：竞态的 `git init --bare` 会输掉 mkdir 竞争（每轮复查 HEAD），并发 fetch 会撞锁文件（对 "File exists" 重试）。测试 10 个，含真实 fork 子进程与父进程在同一全新缓存上赛跑、工作目录快照对照；`emo test` 63/63。布局文档：docs/notes/git-cache-layout.md。
 
 #### T1.8 配置、凭据与 XDG 路径
 

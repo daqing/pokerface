@@ -36,6 +36,7 @@ class RealRunner {
         }
       }
       const (R.ok, _) = os.dup2(write_fd, 1)
+      const (R.ok, _) = os.dup2(write_fd, 2)
       os.close(read_fd)
       os.close(write_fd)
       os.execvp(argv[0], argv)
@@ -57,7 +58,7 @@ class RealRunner {
     }
     const code = os.wait_exit_code(w[1])
     if code != 0 {
-      return (R.error, "git: '" + argv[0] + "' exited with code " + code.to_string())
+      return (R.error, "git: '" + argv[0] + "' exited with code " + code.to_string() + ": " + out.trim())
     }
     return (R.ok, out)
   }

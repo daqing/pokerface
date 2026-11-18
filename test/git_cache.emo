@@ -1,0 +1,242 @@
+// T1.7 tests for src/git_cache.emo — run with `emo test`.
+// Fixture repos and cache roots live under TMPDIR with unique per-run names
+// and are left for the OS temp cleaner; nothing is ever deleted here.
+
+const git_cache = src.git_cache
+const cache_runner = src.git.RealRunner.new()
+
+def temp_base_dir() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def repo_dir(name String) String {
+  return temp_base_dir() + "pokerface-cache-repo-" + os.getpid().to_string() + "-" + name
+}
+
+def cache_root_for(name String) String {
+  return temp_base_dir() + "pokerface-cache-root-" + os.getpid().to_string() + "-" + name
+}
+
+def expect_runner_ok(result (R, String)) {
+  case result {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("fixture git command failed: " + why) }
+  }
+}
+
+def valid_lock_text() String {
+  return (
+    "version: 1\n"
+    + "commit: 0123456789abcdef0123456789abcdef01234567\n"
+    + "source: github.com/acme/app\n"
+    + "images:\n"
+    + "  - image: registry.example.com/acme/app\n"
+    + "    tags: [latest]\n"
+    + "    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+  )
+}
+
+def make_repo(name String, lock_text String) String {
+  const dir = repo_dir(name)
+  expect_runner_ok(cache_runner.run(["git", "init", "-b", "main", dir], 10.0))
+  if lock_text != "" {
+    case file.write(dir + "/pokerface.lock.yaml", lock_text) {
+      (R.ok, _) then { expect_true(true) }
+      (R.error, why) then { expect_fail("fixture lock write failed: " + why) }
+    }
+    expect_runner_ok(cache_runner.run(["git", "-C", dir, "add", "pokerface.lock.yaml"], 10.0))
+  }
+  expect_runner_ok(cache_runner.run(["git", "-C", dir, "-c", "user.name=pf", "-c", "user.email=pf@example.com", "commit", "--allow-empty", "-m", "c"], 10.0))
+  return dir
+}
+
+def head_of(repo String) String {
+  case cache_runner.run(["git", "-C", repo, "rev-parse", "HEAD"], 10.0) {
+    (R.ok, out) then { return out.trim() }
+    (R.error, why) then {
+      expect_fail("rev-parse failed: " + why)
+      return ""
+    }
+  }
+}
+
+class RecordingRunner {
+  def init() {
+    self.log = Box.new(ArrayBuilder.new())
+    self.real = src.git.RealRunner.new()
+  }
+
+  def run(argv Array[String], timeout Float64) (R, String) {
+    var summary = ""
+    var i = 0
+    while i < argv.length() {
+      if i > 0 {
+        summary = summary + " "
+      }
+      summary = summary + argv[i]
+      i = i + 1
+    }
+    self.log.read().push(summary)
+    return self.real.run(argv, timeout)
+  }
+
+  def log_text() String {
+    var out = ""
+    const arr = self.log.read().to_array()
+    var i = 0
+    while i < arr.length() {
+      out = out + arr[i] + "\n"
+      i = i + 1
+    }
+    return out
+  }
+}
+
+def test_first_fetch_then_offline_read() {
+  const repo = make_repo("offline", valid_lock_text())
+  const cache = cache_root_for("offline")
+  const head = head_of(repo)
+  const rr = RecordingRunner.new()
+  case git_cache.read_lock(rr, repo, head, "main", cache, 30.0) {
+    (R.ok, text) then { expect_equal(valid_lock_text(), text) }
+    (R.error, why) then { expect_fail("first read failed: " + why) }
+  }
+  const log_after_first = rr.log_text()
+  case git_cache.read_lock(rr, repo, head, "main", cache, 30.0) {
+    (R.ok, text) then { expect_equal(valid_lock_text(), text) }
+    (R.error, why) then { expect_fail("offline read failed: " + why) }
+  }
+  const log_after_second = rr.log_text()
+  const added = log_after_second.substring(log_after_first.length(), log_after_second.length() - log_after_first.length())
+  expect_true(added.index_of("show") >= 0)
+  expect_true(added.index_of("fetch") < 0)
+}
+
+def test_targeted_fetch_uses_ref_hint() {
+  const repo = make_repo("hinted", valid_lock_text())
+  const cache = cache_root_for("hinted")
+  const head = head_of(repo)
+  const rr = RecordingRunner.new()
+  case git_cache.read_lock(rr, repo, head, "main", cache, 30.0) {
+    (R.ok, text) then { expect_equal(valid_lock_text(), text) }
+    (R.error, why) then { expect_fail("hinted read failed: " + why) }
+  }
+  const log = rr.log_text()
+  expect_true(log.index_of("refs/heads/main:refs/heads/main") >= 0)
+  expect_true(log.index_of("+refs/heads/*") < 0)
+}
+
+def test_fetch_by_full_sha_hint() {
+  const repo = make_repo("shahint", valid_lock_text())
+  const cache = cache_root_for("shahint")
+  const head = head_of(repo)
+  const rr = RecordingRunner.new()
+  case git_cache.read_lock(rr, repo, head, head, cache, 30.0) {
+    (R.ok, text) then { expect_equal(valid_lock_text(), text) }
+    (R.error, why) then { expect_fail("sha-hint read failed: " + why) }
+  }
+}
+
+def test_missing_repository_distinct_error() {
+  const missing = repo_dir("does-not-exist")
+  const cache = cache_root_for("missing-repo")
+  case git_cache.read_lock(cache_runner, missing, "0123456789abcdef0123456789abcdef01234567", "main", cache, 30.0) {
+    (R.ok, text) then { expect_fail("expected a fetch failure, got: " + text) }
+    (R.error, why) then { expect_true(why.index_of("cannot fetch") >= 0) }
+  }
+}
+
+def test_missing_file_distinct_error() {
+  const repo = make_repo("nolock", "")
+  const cache = cache_root_for("missing-file")
+  const head = head_of(repo)
+  case git_cache.read_lock(cache_runner, repo, head, "main", cache, 30.0) {
+    (R.ok, text) then { expect_fail("expected a missing-file failure, got: " + text) }
+    (R.error, why) then { expect_true(why.index_of("has no pokerface.lock.yaml") >= 0) }
+  }
+}
+
+def test_invalid_yaml_distinct_error() {
+  const repo = make_repo("badlock", "{ not yaml: [")
+  const cache = cache_root_for("invalid-yaml")
+  const head = head_of(repo)
+  case git_cache.load_lock(cache_runner, repo, head, "main", cache, 30.0) {
+    (R.ok, _) then { expect_fail("expected an invalid-YAML failure") }
+    (R.error, why) then { expect_true(why.index_of("not valid lock YAML") >= 0) }
+  }
+}
+
+def test_concurrent_fetches_do_not_corrupt_cache() {
+  const repo = make_repo("concurrent", valid_lock_text())
+  const cache = cache_root_for("concurrent")
+  const head = head_of(repo)
+  const marker = cache + "/child-result.txt"
+  const (R.ok, pid) = os.fork()
+  if pid == 0 {
+    var outcome = "err: no attempt"
+    case git_cache.read_lock(cache_runner, repo, head, "main", cache, 30.0) {
+      (R.ok, _) then { outcome = "ok" }
+      (R.error, why) then { outcome = "err " + why }
+    }
+    case file.write(marker, outcome) {
+      (R.ok, _) then { os._exit(0) }
+      (R.error, _) then { os._exit(1) }
+    }
+  }
+  case git_cache.read_lock(cache_runner, repo, head, "main", cache, 30.0) {
+    (R.ok, parent_text) then {
+      const w = os.waitpid(pid)
+      expect_true(os.wait_exited(w[1]))
+      expect_equal(0, os.wait_exit_code(w[1]))
+      case file.read(marker) {
+        (R.ok, marker_text) then { expect_equal("ok", marker_text.trim()) }
+        (R.error, why) then { expect_fail("child marker missing: " + why) }
+      }
+      expect_equal(valid_lock_text(), parent_text)
+    }
+    (R.error, why) then { expect_fail("parent read failed: " + why) }
+  }
+  case git_cache.read_lock(cache_runner, repo, head, "main", cache, 30.0) {
+    (R.ok, again) then { expect_equal(valid_lock_text(), again) }
+    (R.error, why) then { expect_fail("post-race read failed: " + why) }
+  }
+}
+
+def test_user_working_tree_untouched() {
+  const repo = make_repo("worktree", valid_lock_text())
+  const cache = cache_root_for("worktree")
+  const head = head_of(repo)
+  const before = os.list_dir(".")
+  case git_cache.read_lock(cache_runner, repo, head, "main", cache, 30.0) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("read failed: " + why) }
+  }
+  const after = os.list_dir(".")
+  expect_equal(before, after)
+}
+
+def test_cache_key_is_deterministic() {
+  const a = git_cache.cache_key("https://github.com/acme/app")
+  expect_equal(a, git_cache.cache_key("https://github.com/acme/app"))
+  expect_true(a != git_cache.cache_key("https://github.com/acme/other"))
+  expect_equal(16, a.length())
+}
+
+def test_default_cache_root_shape() {
+  const root = git_cache.default_cache_root()
+  if root != "" {
+    expect_true(root.index_of("/pokerface") >= 0)
+  }
+}
