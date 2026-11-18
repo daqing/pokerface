@@ -1,0 +1,181 @@
+// T2.5 tests for SigV4 signing and presigning — run with `emo test`.
+//
+// The vectors are AWS's: the aws-sig-v4-test-suite `get-vanilla` and
+// `get-vanilla-query-order-key` cases (AKIDEXAMPLE, us-east-1, service
+// "service", 20150830T123600Z), and the S3 documentation's presigned-GET
+// example (examplebucket.s3.amazonaws.com, 20130524T000000Z, 86400 s).
+
+const sig = registry.sigv4
+
+require "time"
+
+def suite_credentials() registry.sigv4.Credentials {
+  return registry.sigv4.Credentials.new(
+    "AKIDEXAMPLE",
+    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+    "us-east-1",
+    "service",
+    ""
+  )
+}
+
+def suite_time() time.Time {
+  return time.of(year: 2015, month: 8, day: 30, hour: 12, minute: 36, second: 0, ms: 0)
+}
+
+def presign_credentials() registry.sigv4.Credentials {
+  return registry.sigv4.Credentials.new(
+    "AKIAIOSFODNN7EXAMPLE",
+    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "us-east-1",
+    "s3",
+    ""
+  )
+}
+
+def presign_time() time.Time {
+  return time.of(year: 2013, month: 5, day: 24, hour: 0, minute: 0, second: 0, ms: 0)
+}
+
+def header_value(headers Array[(String, String)], name String) String {
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == name.lower() {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+def test_get_vanilla_matches_the_aws_vector() {
+  const headers = [("host", "example.amazonaws.com")]
+  const signed = sig.sign_request(suite_credentials(), "GET", "/", [], headers, sig.sha256_hex(""), suite_time())
+  expect_equal(
+    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31",
+    header_value(signed, "authorization")
+  )
+}
+
+def test_get_vanilla_query_order_key_matches_the_aws_vector() {
+  const headers = [("host", "example.amazonaws.com")]
+  const query = [("Param1", "Value1"), ("Param1", "value2")]
+  const signed = sig.sign_request(suite_credentials(), "GET", "/", query, headers, sig.sha256_hex(""), suite_time())
+  expect_equal("Param1=Value1&Param1=value2", sig.canonical_query(query))
+  expect_equal(
+    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=eedbc4e291e521cf13422ffca22be7d2eb8146eecf653089df300a15b2382bd1",
+    header_value(signed, "authorization")
+  )
+}
+
+def test_presigned_get_matches_the_s3_example() {
+  const at = presign_time()
+  const signed = sig.presign(presign_credentials(), "GET", "https", "examplebucket.s3.amazonaws.com", "/test.txt", 86400, at)
+  expect_equal(
+    "https://examplebucket.s3.amazonaws.com/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404",
+    signed.url
+  )
+}
+
+def test_presigned_url_validity_window() {
+  const at = presign_time()
+  const signed = sig.presign(presign_credentials(), "GET", "https", "examplebucket.s3.amazonaws.com", "/test.txt", 86400, at)
+  const signed_at = at.unix_ms() / 1000
+  expect_equal(signed_at, signed.signed_at)
+  expect_equal(signed_at + 86400, signed.expires_at())
+  expect_true(signed.valid_at(signed_at))
+  expect_true(signed.valid_at(signed_at + 86399))
+  expect_true(!signed.valid_at(signed_at + 86400))
+  expect_true(!signed.valid_at(signed_at - 1))
+}
+
+def test_uri_encoding_follows_sigv4() {
+  expect_equal("a%20b", sig.uri_encode("a b", true))
+  expect_equal("a%2Bb", sig.uri_encode("a+b", true))
+  expect_equal("a/b", sig.uri_encode("a/b", false))
+  expect_equal("a%2Fb", sig.uri_encode("a/b", true))
+  expect_equal("AZaz09-_.~", sig.uri_encode("AZaz09-_.~", true))
+  expect_equal("%C3%BC", sig.uri_encode("ü", true))
+  expect_equal("%3A", sig.uri_encode(":", true))
+}
+
+def test_canonical_query_sorts_encoded_pairs() {
+  expect_equal("a=1&b=2", sig.canonical_query([("b", "2"), ("a", "1")]))
+  expect_equal("a=%20&b=%2B", sig.canonical_query([("b", "+"), ("a", " ")]))
+  expect_equal("k=a&k=b", sig.canonical_query([("k", "b"), ("k", "a")]))
+  expect_equal("Param1=Value1&Param2=value2", sig.canonical_query([("Param2", "value2"), ("Param1", "Value1")]))
+}
+
+def test_canonical_headers_normalize_sort_and_merge() {
+  const headers = [("X-Amz-Date", "  20150830T123600Z "), ("Host", "example.com"), ("Host", "other.com")]
+  expect_equal(
+    "host:example.com,other.com\nx-amz-date:20150830T123600Z\n",
+    sig.canonical_headers(headers)
+  )
+  expect_equal("host;x-amz-date", sig.signed_header_names(headers))
+  expect_equal("a b c", sig.normalize_value("  a   b\t c "))
+}
+
+def test_sign_request_replaces_caller_dates_and_authorization() {
+  const headers = [("host", "example.amazonaws.com"), ("authorization", "old"), ("x-amz-date", "19990101T000000Z")]
+  const signed = sig.sign_request(suite_credentials(), "GET", "/", [], headers, sig.sha256_hex(""), suite_time())
+  expect_equal("20150830T123600Z", header_value(signed, "x-amz-date"))
+  var dates = 0
+  var i = 0
+  while i < signed.length() {
+    if signed[i][0].lower() == "x-amz-date" {
+      dates = dates + 1
+    }
+    i = i + 1
+  }
+  expect_equal(1, dates)
+  expect_equal(
+    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31",
+    header_value(signed, "authorization")
+  )
+}
+
+def test_session_tokens_are_signed() {
+  const creds = registry.sigv4.Credentials.new(
+    "AKIDEXAMPLE",
+    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+    "us-east-1",
+    "service",
+    "session-token"
+  )
+  const signed = sig.sign_request(creds, "GET", "/", [], [("host", "example.amazonaws.com")], sig.sha256_hex(""), suite_time())
+  expect_equal("session-token", header_value(signed, "x-amz-security-token"))
+  expect_true(header_value(signed, "authorization").index_of("host;x-amz-date;x-amz-security-token") >= 0)
+  const presigned = sig.presign(creds, "GET", "https", "example.amazonaws.com", "/blob", 60, suite_time())
+  expect_true(presigned.url.index_of("X-Amz-Security-Token=session-token") >= 0)
+  expect_true(presigned.url.index_of("X-Amz-Signature=") >= 0)
+}
+
+def test_the_signature_depends_on_the_credentials_scope_and_clock() {
+  const base = sig.presign(presign_credentials(), "GET", "https", "examplebucket.s3.amazonaws.com", "/test.txt", 86400, presign_time()).url
+  const other_secret = registry.sigv4.Credentials.new(
+    "AKIAIOSFODNN7EXAMPLE",
+    "a-different-secret",
+    "us-east-1",
+    "s3",
+    ""
+  )
+  const changed = sig.presign(other_secret, "GET", "https", "examplebucket.s3.amazonaws.com", "/test.txt", 86400, presign_time()).url
+  expect_true(base != changed)
+  const later = sig.presign(presign_credentials(), "GET", "https", "examplebucket.s3.amazonaws.com", "/test.txt", 86400, presign_time().add(time.seconds(1))).url
+  expect_true(base != later)
+  expect_true(base.index_of("wJalrXUtnFEMI") < 0)
+}
+
+def test_timestamps_and_scope() {
+  expect_equal("20150830T123600Z", sig.amz_date(suite_time()))
+  expect_equal("20150830", sig.date_stamp(suite_time()))
+  expect_equal("20150830/us-east-1/service/aws4_request", sig.scope(suite_credentials(), "20150830"))
+  expect_equal(604800, sig.max_presign_seconds())
+}
+
+def test_presigned_paths_are_encoded() {
+  const signed = sig.presign(presign_credentials(), "GET", "https", "examplebucket.s3.amazonaws.com", "/a b/ü.txt", 60, presign_time())
+  expect_true(signed.url.index_of("/a%20b/%C3%BC.txt?") >= 0)
+}

@@ -350,7 +350,7 @@ images:
 | [x] | T2.2 | SQLite 数据层与迁移 | T2.1 | 2-3h |
 | [x] | T2.3 | OCI Manifest / Index 模型与校验 | T1.5 | 2-3h |
 | [x] | T2.4 | BlobStore 接口与本地文件后端 | T2.1 | 2h |
-| [ ] | T2.5 | AWS SigV4 签名与预签名 URL | T2.1 | 3h |
+| [x] | T2.5 | AWS SigV4 签名与预签名 URL | T2.1 | 3h |
 | [ ] | T2.6 | S3 / MinIO BlobStore 适配 | T2.4、T2.5 | 3h |
 | [ ] | T2.7 | `/v2/` 基础协议与错误格式 | T2.1、T2.2 | 1-2h |
 | [ ] | T2.8 | Manifest GET / HEAD 与 tag / digest 解析 | T2.2、T2.3、T2.7 | 3h |
@@ -433,6 +433,8 @@ images:
 **验收**：签名结果与 AWS 测试向量一致；预签名 URL 在有效期内可访问、过期后拒绝；URI 编码符合 SigV4 要求；密钥与签名不出现在日志中。
 
 **依赖**：T2.1 · **预估**：3h
+
+> **备注**（2026-11-18，约 2h）：已完成。`registry/sigv4.emo` 把整个算法写成注入 `time.Time` 的纯函数：规范化请求（编码后的 URI、规范化查询串、规范化请求头、签名头名、payload 哈希）、待签字符串、HMAC 密钥链、签名。两个入口：`sign_request` 自动加 `x-amz-date`（覆盖调用方给的值）、会话 token，并把 `authorization` 放到最后；`presign` 生成查询串形式（`UNSIGNED-PAYLOAD`、只签 `host`、`X-Amz-Signature` 追加在最后），返回 `PresignedUrl`，其 `valid_at(now)` 正好覆盖 `[signed_at, signed_at + expires_in)`。编码完全遵循 SigV4（空格 `%20`、按 UTF-8 字节大写十六进制、URI 里保留 `/` 而查询值里 `%2F`、参数先按编码后的名再按值排序；头名小写、去首尾空白、内部空白折叠、排序、重名逗号合并）。**官方向量一次通过**：aws-sig-v4-test-suite 的 `get-vanilla`（`5fa00fa3…`）、`get-vanilla-query-order-key`（`eedbc4e2…`），以及 S3 预签名示例（`aeeed9bb…`），共同覆盖了规范化请求、编码、日期 scope 与 HMAC 链。`test/registry_sigv4.emo` 12 个测试：向量、编码、查询/头规范化、两种模式的会话 token、调用方日期/authorization 覆盖、时钟与密钥敏感性、有效期边界秒、UTF-8 路径；`emo test` 290/290。模块不写任何日志，secret 只作为 HMAC key 使用；测试还断言预签名 URL 中不会出现 secret。踩坑：没有 `else if`；`Bytes.get` 直接返回 Int64（没有 `to_int64`）；数组没有排序，规范化排序是对编码后的键值对做插入排序（参数数量很小，足够）。后续：重试与日志在 T2.6，必须对 Authorization 与预签名 URL 脱敏。
 
 #### T2.6 S3 / MinIO BlobStore 适配
 

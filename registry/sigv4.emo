@@ -1,0 +1,393 @@
+// T2.5: AWS Signature Version 4 — header signing and query-string presigning,
+// path-style compatible with S3 and MinIO. Pure functions over injectable
+// `time.Time` values, so the official test vectors run on a fixed clock.
+//
+// The flow is the spec's: canonical request (method, encoded URI, canonical
+// query, canonical headers, signed header names, payload hash) → string to
+// sign (algorithm, timestamp, credential scope, hash of the canonical
+// request) → signing key (HMAC chain over date/region/service/aws4_request) →
+// signature. `sign_request` and `presign` are the two entry points the S3
+// adapter (T2.6) calls; the smaller steps stay public because the test suite
+// pins them one by one.
+//
+// Nothing here logs: the secret key is used only as HMAC key material and the
+// signature is returned to the caller. Callers must never log Authorization
+// headers or presigned query strings (they carry X-Amz-Signature).
+//
+// Encoding follows SigV4 rather than form encoding: unreserved characters
+// (A-Z a-z 0-9 - . _ ~) pass through, everything else is percent-encoded per
+// UTF-8 byte with uppercase hex, and a space is %20, never +.
+
+require "crypto"
+require "time"
+
+const algorithm = "AWS4-HMAC-SHA256"
+const algorithm_tag = "AWS4"
+const terminal = "aws4_request"
+const unsigned_payload = "UNSIGNED-PAYLOAD"
+const hex_digits = "0123456789ABCDEF"
+const max_expires = 604800
+
+class Credentials {
+  def init(access_key String, secret_key String, region String, service String, session_token String) {
+    self.access_key = access_key
+    self.secret_key = secret_key
+    self.region = region
+    self.service = service
+    self.session_token = session_token
+  }
+}
+
+class PresignedUrl {
+  def init(url String, signed_at Int64, expires_in Int64) {
+    self.url = url
+    self.signed_at = signed_at
+    self.expires_in = expires_in
+  }
+
+  def expires_at() Int64 {
+    return self.signed_at + self.expires_in
+  }
+
+  // S3's rule: a presigned URL is usable up to, but not including, its
+  // expiry second.
+  def valid_at(now Int64) Bool {
+    return now >= self.signed_at && now < self.expires_at()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Timestamps and scope.
+
+def amz_date(at time.Time) String {
+  return at.format("YYYYMMDDThhmmssZ")
+}
+
+def date_stamp(at time.Time) String {
+  return at.format("YYYYMMDD")
+}
+
+def scope(credentials Credentials, date String) String {
+  return date + "/" + credentials.region + "/" + credentials.service + "/" + terminal
+}
+
+// ---------------------------------------------------------------------------
+// Encoding.
+
+def is_unreserved(n Int64) Bool {
+  if n >= 65 && n <= 90 {
+    return true
+  }
+  if n >= 97 && n <= 122 {
+    return true
+  }
+  if n >= 48 && n <= 57 {
+    return true
+  }
+  return n == 45 || n == 95 || n == 46 || n == 126
+}
+
+def percent_encode(n Int64) String {
+  return "%" + hex_digits.substring(n / 16, 1) + hex_digits.substring(n % 16, 1)
+}
+
+// encode_slash false leaves "/" alone, the canonical URI's rule; query names
+// and values pass true.
+def uri_encode(text String, encode_slash Bool) String {
+  const data = text.to_bytes()
+  var out = ""
+  var i = 0
+  while i < data.length() {
+    const n = data.get(i)
+    if is_unreserved(n) {
+      out = out + text.substring(i, 1)
+    } else {
+      if n == 47 && !encode_slash {
+        out = out + "/"
+      } else {
+        out = out + percent_encode(n)
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+def canonical_uri(path String) String {
+  return uri_encode(path, false)
+}
+
+// ---------------------------------------------------------------------------
+// Canonical query: encode names and values, sort by name then value, join.
+
+def compare_text(a String, b String) Int64 {
+  const ab = a.to_bytes()
+  const bb = b.to_bytes()
+  var i = 0
+  while i < ab.length() {
+    if i >= bb.length() {
+      return 1
+    }
+    const x = ab.get(i)
+    const y = bb.get(i)
+    if x < y {
+      return -1
+    }
+    if x > y {
+      return 1
+    }
+    i = i + 1
+  }
+  if ab.length() < bb.length() {
+    return -1
+  }
+  return 0
+}
+
+def compare_pair(a (String, String), b (String, String)) Int64 {
+  const by_name = compare_text(a[0], b[0])
+  if by_name != 0 {
+    return by_name
+  }
+  return compare_text(a[1], b[1])
+}
+
+def sort_pairs(items Array[(String, String)]) Array[(String, String)] {
+  var out = items
+  var i = 1
+  while i < out.length() {
+    const current = out[i]
+    var j = i
+    while j > 0 && compare_pair(out[j - 1], current) > 0 {
+      out = replace_at(out, j, out[j - 1])
+      j = j - 1
+    }
+    out = replace_at(out, j, current)
+    i = i + 1
+  }
+  return out
+}
+
+def replace_at(items Array[(String, String)], index Int64, value (String, String)) Array[(String, String)] {
+  var out = []
+  var i = 0
+  while i < items.length() {
+    if i == index {
+      out = out.append(value)
+    } else {
+      out = out.append(items[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+def canonical_query(params Array[(String, String)]) String {
+  var encoded = []
+  var i = 0
+  while i < params.length() {
+    const (name, value) = params[i]
+    encoded = encoded.append((uri_encode(name, true), uri_encode(value, true)))
+    i = i + 1
+  }
+  const sorted = sort_pairs(encoded)
+  var out = ""
+  var j = 0
+  while j < sorted.length() {
+    if j > 0 {
+      out = out + "&"
+    }
+    out = out + sorted[j][0] + "=" + sorted[j][1]
+    j = j + 1
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Canonical headers.
+
+// Trim, then collapse runs of spaces/tabs to one space — the spec's rule.
+def normalize_value(text String) String {
+  var out = ""
+  var pending = false
+  var started = false
+  var i = 0
+  while i < text.length() {
+    const c = text.substring(i, 1)
+    if c == " " || c == "\t" {
+      if started {
+        pending = true
+      }
+    } else {
+      if pending {
+        out = out + " "
+        pending = false
+      }
+      out = out + c
+      started = true
+    }
+    i = i + 1
+  }
+  return out
+}
+
+def normalize_headers(headers Array[(String, String)]) Array[(String, String)] {
+  var out = []
+  var i = 0
+  while i < headers.length() {
+    const (name, value) = headers[i]
+    out = out.append((name.lower(), normalize_value(value)))
+    i = i + 1
+  }
+  return sort_pairs(out)
+}
+
+// Every name once, in canonical order, ";"-joined.
+def signed_header_names(headers Array[(String, String)]) String {
+  const sorted = normalize_headers(headers)
+  var out = ""
+  var i = 0
+  while i < sorted.length() {
+    const name = sorted[i][0]
+    var repeated = false
+    var j = 0
+    while j < i {
+      if sorted[j][0] == name {
+        repeated = true
+      }
+      j = j + 1
+    }
+    if !repeated {
+      if out != "" {
+        out = out + ";"
+      }
+      out = out + name
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// One line per name; a repeated name's values are comma-joined, the spec's
+// treatment of duplicates.
+def canonical_headers(headers Array[(String, String)]) String {
+  const sorted = normalize_headers(headers)
+  var out = ""
+  var i = 0
+  while i < sorted.length() {
+    const name = sorted[i][0]
+    var value = sorted[i][1]
+    var j = i + 1
+    while j < sorted.length() && sorted[j][0] == name {
+      value = value + "," + sorted[j][1]
+      j = j + 1
+    }
+    out = out + name + ":" + value + "\n"
+    i = j
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// The signing steps.
+
+def sha256_hex(text String) String {
+  return crypto.hex_encode(crypto.sha2.sha256(text.to_bytes()))
+}
+
+def canonical_request(method String, path String, query String, headers Array[(String, String)], payload_hash String) String {
+  return (
+    method + "\n"
+    + canonical_uri(path) + "\n"
+    + query + "\n"
+    + canonical_headers(headers) + "\n"
+    + signed_header_names(headers) + "\n"
+    + payload_hash
+  )
+}
+
+def string_to_sign(at time.Time, credential_scope String, request String) String {
+  return (
+    algorithm + "\n"
+    + amz_date(at) + "\n"
+    + credential_scope + "\n"
+    + sha256_hex(request)
+  )
+}
+
+def signing_key(secret_key String, date String, region String, service String) Bytes {
+  const k_date = crypto.hash.hmac_sha256((algorithm_tag + secret_key).to_bytes(), date.to_bytes())
+  const k_region = crypto.hash.hmac_sha256(k_date, region.to_bytes())
+  const k_service = crypto.hash.hmac_sha256(k_region, service.to_bytes())
+  return crypto.hash.hmac_sha256(k_service, terminal.to_bytes())
+}
+
+def signature(credentials Credentials, at time.Time, to_sign String) String {
+  const key = signing_key(credentials.secret_key, date_stamp(at), credentials.region, credentials.service)
+  return crypto.hex_encode(crypto.hash.hmac_sha256(key, to_sign.to_bytes()))
+}
+
+def authorization(credentials Credentials, date String, signed String, sig String) String {
+  return (
+    algorithm + " Credential=" + credentials.access_key + "/" + scope(credentials, date)
+    + ", SignedHeaders=" + signed
+    + ", Signature=" + sig
+  )
+}
+
+// Signs a request for the Authorization header. Adds x-amz-date (and the
+// session token, when configured), so the date the scope uses and the date
+// the server sees cannot disagree. Answers the headers to send, Authorization
+// last.
+def sign_request(credentials Credentials, method String, path String, query Array[(String, String)], headers Array[(String, String)], payload_hash String, at time.Time) Array[(String, String)] {
+  var with_date = []
+  var i = 0
+  while i < headers.length() {
+    const (name, value) = headers[i]
+    if name.lower() != "x-amz-date" && name.lower() != "authorization" && name.lower() != "x-amz-security-token" {
+      with_date = with_date.append((name, value))
+    }
+    i = i + 1
+  }
+  with_date = with_date.append(("x-amz-date", amz_date(at)))
+  if credentials.session_token != "" {
+    with_date = with_date.append(("x-amz-security-token", credentials.session_token))
+  }
+  const request = canonical_request(method, path, canonical_query(query), with_date, payload_hash)
+  const to_sign = string_to_sign(at, scope(credentials, date_stamp(at)), request)
+  const sig = signature(credentials, at, to_sign)
+  return with_date.append(("authorization", authorization(credentials, date_stamp(at), signed_header_names(with_date), sig)))
+}
+
+// Presigns a request as a URL: the canonical query carries the parameters and
+// the signature is appended last. The payload is UNSIGNED-PAYLOAD and only the
+// host header is signed, S3's rule for a shareable link.
+def presign(credentials Credentials, method String, scheme String, host String, path String, expires_in Int64, at time.Time) PresignedUrl {
+  const date = date_stamp(at)
+  var params = [
+    ("X-Amz-Algorithm", algorithm),
+    ("X-Amz-Credential", credentials.access_key + "/" + scope(credentials, date)),
+    ("X-Amz-Date", amz_date(at)),
+    ("X-Amz-Expires", expires_in.to_string()),
+    ("X-Amz-SignedHeaders", "host")
+  ]
+  if credentials.session_token != "" {
+    params = params.append(("X-Amz-Security-Token", credentials.session_token))
+  }
+  const query = canonical_query(params)
+  const encoded_path = canonical_uri(path)
+  const headers = [("host", host)]
+  const request = canonical_request(method, encoded_path, query, headers, unsigned_payload)
+  const to_sign = string_to_sign(at, scope(credentials, date), request)
+  const sig = signature(credentials, at, to_sign)
+  const url = (
+    scheme + "://" + host + encoded_path
+    + "?" + query
+    + "&X-Amz-Signature=" + sig
+  )
+  return PresignedUrl.new(url, at.unix_ms() / 1000, expires_in)
+}
+
+def max_presign_seconds() Int64 {
+  return max_expires
+}

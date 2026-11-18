@@ -18,6 +18,7 @@
 | [registry-db.md](registry-db.md) | SQLite schema, migrations, pragmas, readiness, and the split test story (M2/T2.2). | `registry/db.emo`, `registry/db_selftest.emo` |
 | [registry-oci.md](registry-oci.md) | Manifest/index/config model, descriptor validation, canonical encoding, platform selection (M2/T2.3). | `registry/oci.emo` |
 | [registry-blobstore.md](registry-blobstore.md) | Blob abstraction, local filesystem backend, atomic writes, range reads, presign fallback (M2/T2.4). | `registry/blobstore.emo` |
+| [registry-sigv4.md](registry-sigv4.md) | AWS SigV4 header signing and presigned URLs, encoding rules, official vectors (M2/T2.5). | `registry/sigv4.emo` |
 
 ## M1 flow
 

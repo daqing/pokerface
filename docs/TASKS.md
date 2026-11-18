@@ -350,7 +350,7 @@ Exit criteria:
 | [x] | T2.2 | SQLite data layer and migrations | T2.1 | 2-3h |
 | [x] | T2.3 | OCI manifest / index model and validation | T1.5 | 2-3h |
 | [x] | T2.4 | BlobStore interface and local filesystem backend | T2.1 | 2h |
-| [ ] | T2.5 | AWS SigV4 signing and presigned URLs | T2.1 | 3h |
+| [x] | T2.5 | AWS SigV4 signing and presigned URLs | T2.1 | 3h |
 | [ ] | T2.6 | S3 / MinIO BlobStore adapter | T2.4, T2.5 | 3h |
 | [ ] | T2.7 | `/v2/` base protocol and error format | T2.1, T2.2 | 1-2h |
 | [ ] | T2.8 | Manifest GET / HEAD and tag / digest resolution | T2.2, T2.3, T2.7 | 3h |
@@ -433,6 +433,8 @@ Suggested tables:
 **Acceptance**: Signatures match the AWS test vectors; presigned URLs work within their validity window and fail after expiry; URI encoding follows SigV4; keys and signatures never appear in logs.
 
 **Depends on**: T2.1 · **Estimate**: 3h
+
+> **Notes** (2026-11-18, ~2h): Done. `registry/sigv4.emo` implements the whole algorithm as pure functions over an injected `time.Time`: canonical request (encoded URI, canonical query, normalized headers, signed names, payload hash), string to sign, the HMAC key chain, and the signature. Two entry points: `sign_request` adds `x-amz-date` (replacing any caller value), the session token, and `authorization` last; `presign` builds the query-string form (`UNSIGNED-PAYLOAD`, `host` signed, `X-Amz-Signature` appended last) and returns a `PresignedUrl` whose `valid_at(now)` covers exactly `[signed_at, signed_at + expires_in)`. Encoding follows SigV4 (`%20`, uppercase hex per UTF-8 byte, `/` kept in the URI but `%2F` in query values, pairs sorted by encoded name then value; headers lowercased, trimmed, whitespace-collapsed, sorted, duplicate names comma-joined). **Vectors matched on the first run**: aws-sig-v4-test-suite `get-vanilla` (`5fa00fa3…`), `get-vanilla-query-order-key` (`eedbc4e2…`), and the S3 presign example (`aeeed9bb…`), which together exercise the canonical request, encoding, date scope, and HMAC chain. 12 tests in `test/registry_sigv4.emo` cover the vectors plus encoding, query/header canonicalization, session tokens in both modes, caller date/authorization replacement, clock/secret sensitivity, the window's boundary second, and UTF-8 paths; `emo test` 290/290. The module logs nothing and the secret appears only as HMAC key material; a test pins that a presigned URL never contains the secret. Gotchas: there is no `else if`, `Bytes.get` already returns Int64 (no `to_int64`), and arrays have no sort — the canonical sorter is an insertion sort over encoded pairs (fine for the handful of parameters). Follow-ups: request retries/logging live in T2.6, which must redact Authorization and presigned URLs.
 
 #### T2.6 S3 / MinIO BlobStore Adapter
 
