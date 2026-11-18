@@ -81,7 +81,7 @@ Exit criteria:
 | [x] | T1.9 | Wire up the `resolve` command | T1.4-T1.8 | 2h |
 | [x] | T1.10 | Registry authentication and manifest client | T1.5, T1.8 | 3h |
 | [x] | T1.11 | Blob downloader: retries, verification, resume | T1.10 | 3-4h |
-| [ ] | T1.12 | Assemble an OCI image layout | T1.10, T1.11 | 2-3h |
+| [x] | T1.12 | Assemble an OCI image layout | T1.10, T1.11 | 2-3h |
 | [ ] | T1.13 | Runtime import adapter | T1.12 | 3h |
 | [ ] | T1.14 | Wire up the `pull` command and failure fallbacks | T1.9-T1.13 | 3h |
 | [ ] | T1.15 | Local cache and offline mode | T1.7, T1.14 | 2-3h |
@@ -264,6 +264,8 @@ images:
 **Acceptance**: `skopeo inspect oci:<dir>` can read the layout (when skopeo is installed); every descriptor's digest / size matches the actual file; missing blobs produce a clear error; `--keep` preserves the temp directory.
 
 **Depends on**: T1.10, T1.11 · **Estimate**: 2-3h
+
+> **Notes** (2026-11-18, ~2h): Done. `src/oci.emo` turns downloaded manifest/config/layer bytes into `oci-layout`, `index.json` (with the `org.opencontainers.image.ref.name` tag annotation), and `blobs/sha256/<hex>`. Assembly is verify-first: the manifest bytes are checked against the advertised digest, every config/layer descriptor is paired with a `BlobSource` before anything is written (a missing source, a declared-size disagreement, or an unreferenced extra is a clear error), copies hash and count while streaming into `<dest>.part` and rename only after digest+size match, and `index.json` is written last — so an on-disk layout never references a corrupted or absent blob. Identical existing blobs are reused, making re-assembly idempotent. `validate(dir)` re-derives everything from disk (layout version, index descriptors, manifest config/layers, nested indexes) and reports unique blob/byte counts; missing, corrupted, and size-mismatched blobs each name the descriptor that referenced them. `new_temp_layout(keep)` + `TempLayout.cleanup()` provide the `--keep` behavior T1.14 wires to its option; a kept directory can therefore be inspected after a failed import. Fixtures: `test/fixtures/oci/` is a genuinely valid single-layer image (gzipped tar + config with the matching `diff_ids`), so `skopeo inspect oci:<dir>:latest` reads it and returns the manifest digest — verified manually against skopeo 1.25. Tests: 15 in `test/oci_layout.emo` (parse errors, assemble/validate, idempotency, bad manifest digest, missing/corrupt/unreferenced sources, validate catching missing/corrupt blobs and bad layout versions, temp keep/cleanup, and the skopeo leg that skips on exit 127). Docs: `docs/spec/oci-layout.md`. Gotchas: `;` is not a statement separator in Emo (`E2025`) — split statements onto lines; `json.object`/`json.array` factories take explicit tuple/array literals; `file.read` is byte-safe, so the gzip fixture round-trips as a String; `src.blob.digest_hex` is reused for digest-shape validation.
 
 #### T1.13 Runtime Import Adapter
 

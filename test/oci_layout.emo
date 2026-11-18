@@ -1,0 +1,397 @@
+// T1.12 tests for the OCI layout assembler — run with `emo test`.
+//
+// The fixtures under test/fixtures/oci/ form a real single-layer OCI image:
+// a gzipped tar layer, a matching image config, and a manifest whose digests
+// were computed from those exact bytes. Loader discipline (T1.9/T1.10): this
+// file is not test/oci.emo, and every cross-module constructor call lives
+// inside a def.
+
+const oci_mod = src.oci
+const fixture_dir = "test/fixtures/oci"
+
+def temp_base_dir() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def oci_tmp(name String) String {
+  return temp_base_dir() + "pokerface-oci-test-" + os.getpid().to_string() + "-" + name
+}
+
+def sha_hex(body String) String {
+  return crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+def digest_of(body String) String {
+  return "sha256:" + sha_hex(body)
+}
+
+def read_fixture(name String) String {
+  case file.read(fixture_dir + "/" + name) {
+    (R.ok, text) then { return text }
+    (R.error, why) then {
+      expect_fail("cannot read fixture " + name + ": " + why)
+      return ""
+    }
+  }
+}
+
+def fixture_manifest() String {
+  return read_fixture("manifest.json")
+}
+
+def fixture_config() String {
+  return read_fixture("config.json")
+}
+
+def fixture_layer() String {
+  return read_fixture("layer-0.tar.gz")
+}
+
+def fixture_sources() Array[src.oci.BlobSource] {
+  const config = fixture_config()
+  const layer = fixture_layer()
+  return [
+    src.oci.BlobSource.new(digest_of(config), config.length(), fixture_dir + "/config.json"),
+    src.oci.BlobSource.new(digest_of(layer), layer.length(), fixture_dir + "/layer-0.tar.gz")
+  ]
+}
+
+def config_only_sources() Array[src.oci.BlobSource] {
+  const config = fixture_config()
+  return [src.oci.BlobSource.new(digest_of(config), config.length(), fixture_dir + "/config.json")]
+}
+
+def fixture_spec(tag String) src.oci.LayoutSpec {
+  const body = fixture_manifest()
+  return src.oci.LayoutSpec.new("application/vnd.oci.image.manifest.v1+json", body, digest_of(body), tag, fixture_sources())
+}
+
+def spec_with_sources(tag String, sources Array[src.oci.BlobSource]) src.oci.LayoutSpec {
+  const body = fixture_manifest()
+  return src.oci.LayoutSpec.new("application/vnd.oci.image.manifest.v1+json", body, digest_of(body), tag, sources)
+}
+
+def expect_contains(text String, needle String) {
+  if text.index_of(needle) < 0 {
+    expect_fail("expected '" + needle + "' in: " + text)
+  }
+}
+
+def expect_file_exists(path String) {
+  case file.read(path) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("expected " + path + " to exist: " + why) }
+  }
+}
+
+def expect_file_missing(path String) {
+  case file.read(path) {
+    (R.ok, _) then { expect_fail("expected " + path + " to be absent") }
+    (R.error, _) then { expect_true(true) }
+  }
+}
+
+def expect_dir_exists(path String) {
+  case os.list_dir(path) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("expected directory " + path + ": " + why) }
+  }
+}
+
+def expect_dir_missing(path String) {
+  case os.list_dir(path) {
+    (R.ok, _) then { expect_fail("expected directory " + path + " to be absent") }
+    (R.error, _) then { expect_true(true) }
+  }
+}
+
+def blob_path(dir String, digest String) String {
+  return dir + "/blobs/sha256/" + digest.substring(7, digest.length() - 7)
+}
+
+def test_parse_fixture_manifest() {
+  case oci_mod.parse_manifest(fixture_manifest()) {
+    (R.ok, manifest) then {
+      expect_equal("application/vnd.oci.image.manifest.v1+json", manifest.media_type)
+      expect_equal(digest_of(fixture_config()), manifest.config.digest)
+      expect_equal(fixture_config().length(), manifest.config.size)
+      expect_equal("application/vnd.oci.image.config.v1+json", manifest.config.media_type)
+      expect_equal(1, manifest.layers.length())
+      expect_equal(digest_of(fixture_layer()), manifest.layers[0].digest)
+      expect_equal(fixture_layer().length(), manifest.layers[0].size)
+    }
+    (R.error, why) then { expect_fail("fixture manifest should parse: " + why) }
+  }
+}
+
+def test_parse_rejects_missing_config() {
+  const body = "{\"schemaVersion\":2,\"layers\":[]}"
+  case oci_mod.parse_manifest(body) {
+    (R.ok, _) then { expect_fail("expected a missing-config error") }
+    (R.error, why) then {
+      expect_contains(why, "config")
+      expect_contains(why, "missing required field")
+    }
+  }
+}
+
+def test_parse_rejects_bad_schema_version() {
+  const body = "{\"schemaVersion\":1,\"config\":{\"digest\":\"" + digest_of(fixture_config()) + "\",\"size\":" + fixture_config().length().to_string() + "},\"layers\":[]}"
+  case oci_mod.parse_manifest(body) {
+    (R.ok, _) then { expect_fail("expected a schemaVersion error") }
+    (R.error, why) then { expect_contains(why, "schemaVersion must be 2") }
+  }
+}
+
+def test_assemble_writes_standard_layout() {
+  const dir = oci_tmp("assemble")
+  const body = fixture_manifest()
+  const config = fixture_config()
+  const layer = fixture_layer()
+  case oci_mod.assemble(dir, fixture_spec("latest")) {
+    (R.error, why) then { expect_fail("assemble failed: " + why) }
+    (R.ok, result) then {
+      expect_equal(dir, result.dir)
+      expect_equal("latest", result.tag)
+      expect_equal("application/vnd.oci.image.manifest.v1+json", result.manifest_media_type)
+      expect_equal(digest_of(body), result.manifest_digest)
+      expect_equal(body.length(), result.manifest_size)
+      expect_equal(3, result.blob_count)
+      expect_equal(body.length() + config.length() + layer.length(), result.blob_bytes)
+    }
+  }
+  expect_file_exists(dir + "/oci-layout")
+  expect_file_exists(dir + "/index.json")
+  expect_file_exists(blob_path(dir, digest_of(body)))
+  expect_file_exists(blob_path(dir, digest_of(config)))
+  expect_file_exists(blob_path(dir, digest_of(layer)))
+  expect_file_missing(blob_path(dir, digest_of(layer)) + ".part")
+
+  case oci_mod.read_index(dir) {
+    (R.ok, entries) then {
+      expect_equal(1, entries.length())
+      expect_equal("latest", entries[0].tag)
+      expect_equal(digest_of(body), entries[0].digest)
+      expect_equal(body.length(), entries[0].size)
+      expect_equal("application/vnd.oci.image.manifest.v1+json", entries[0].media_type)
+    }
+    (R.error, why) then { expect_fail("index should parse: " + why) }
+  }
+
+  case oci_mod.validate(dir) {
+    (R.ok, report) then {
+      expect_equal(1, report.manifests)
+      expect_equal(3, report.blobs)
+      expect_equal(body.length() + config.length() + layer.length(), report.bytes)
+    }
+    (R.error, why) then { expect_fail("layout should validate: " + why) }
+  }
+}
+
+def test_layout_is_idempotent() {
+  const dir = oci_tmp("idempotent")
+  case oci_mod.assemble(dir, fixture_spec("latest")) {
+    (R.error, why) then { expect_fail("first assemble failed: " + why) }
+    (R.ok, first) then {
+      case oci_mod.assemble(dir, fixture_spec("latest")) {
+        (R.error, why) then { expect_fail("second assemble failed: " + why) }
+        (R.ok, second) then {
+          expect_equal(first.manifest_digest, second.manifest_digest)
+          expect_equal(first.blob_count, second.blob_count)
+        }
+      }
+    }
+  }
+  case oci_mod.validate(dir) {
+    (R.error, why) then { expect_fail("layout should validate after reassembly: " + why) }
+    (R.ok, report) then { expect_equal(3, report.blobs) }
+  }
+}
+
+def test_manifest_digest_mismatch_rejected() {
+  const dir = oci_tmp("manifestbaddigest")
+  const body = fixture_manifest()
+  const wrong = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  const spec = src.oci.LayoutSpec.new("application/vnd.oci.image.manifest.v1+json", body, wrong, "latest", fixture_sources())
+  case oci_mod.assemble(dir, spec) {
+    (R.ok, _) then { expect_fail("expected a manifest digest mismatch") }
+    (R.error, why) then {
+      expect_contains(why, "manifest digest mismatch")
+      expect_contains(why, wrong)
+    }
+  }
+  expect_file_missing(dir + "/index.json")
+}
+
+def test_missing_source_blob_is_reported() {
+  const dir = oci_tmp("missingsource")
+  case oci_mod.assemble(dir, spec_with_sources("latest", config_only_sources())) {
+    (R.ok, _) then { expect_fail("expected a missing-blob error") }
+    (R.error, why) then {
+      expect_contains(why, "missing blob")
+      expect_contains(why, digest_of(fixture_layer()))
+      expect_contains(why, "layers[0]")
+      expect_contains(why, "no downloaded file")
+    }
+  }
+  expect_file_missing(dir + "/index.json")
+}
+
+def test_corrupted_source_never_enters_layout() {
+  const dir = oci_tmp("corruptsource")
+  const layer = fixture_layer()
+  const wrong = "X" + layer.substring(1, layer.length() - 1)
+  const wrong_path = oci_tmp("corruptsource-wave")
+  const (R.ok, _) = file.write(wrong_path, wrong)
+  const sources = [
+    src.oci.BlobSource.new(digest_of(fixture_config()), fixture_config().length(), fixture_dir + "/config.json"),
+    src.oci.BlobSource.new(digest_of(layer), layer.length(), wrong_path)
+  ]
+  case oci_mod.assemble(dir, spec_with_sources("latest", sources)) {
+    (R.ok, _) then { expect_fail("expected a copied-bytes digest mismatch") }
+    (R.error, why) then {
+      expect_contains(why, "digest mismatch")
+      expect_contains(why, "layers[0]")
+    }
+  }
+  expect_file_missing(blob_path(dir, digest_of(layer)))
+  expect_file_missing(blob_path(dir, digest_of(layer)) + ".part")
+  expect_file_missing(dir + "/index.json")
+}
+
+def test_unreferenced_source_is_rejected() {
+  const dir = oci_tmp("extrasource")
+  const extra = "extra bytes no descriptor refers to"
+  const extra_path = oci_tmp("extrasource-extra")
+  const (R.ok, _) = file.write(extra_path, extra)
+  const sources = fixture_sources().append(src.oci.BlobSource.new(digest_of(extra), extra.length(), extra_path))
+  case oci_mod.assemble(dir, spec_with_sources("latest", sources)) {
+    (R.ok, _) then { expect_fail("expected an unreferenced-blob error") }
+    (R.error, why) then {
+      expect_contains(why, "not referenced by the manifest")
+      expect_contains(why, digest_of(extra))
+    }
+  }
+}
+
+def test_validate_detects_missing_blob() {
+  const dir = oci_tmp("validatemissing")
+  case oci_mod.assemble(dir, fixture_spec("latest")) {
+    (R.error, why) then { expect_fail("assemble failed: " + why) }
+    (R.ok, _) then { }
+  }
+  os.unlink(blob_path(dir, digest_of(fixture_layer())))
+  case oci_mod.validate(dir) {
+    (R.ok, _) then { expect_fail("expected a missing-blob error") }
+    (R.error, why) then {
+      expect_contains(why, "missing blob")
+      expect_contains(why, digest_of(fixture_layer()))
+      expect_contains(why, "layers[0]")
+    }
+  }
+}
+
+def test_validate_detects_corrupted_blob() {
+  const dir = oci_tmp("validatecorrupt")
+  case oci_mod.assemble(dir, fixture_spec("latest")) {
+    (R.error, why) then { expect_fail("assemble failed: " + why) }
+    (R.ok, _) then { }
+  }
+  const layer = fixture_layer()
+  const wrong = "Y" + layer.substring(1, layer.length() - 1)
+  const (R.ok, _) = file.write(blob_path(dir, digest_of(layer)), wrong)
+  case oci_mod.validate(dir) {
+    (R.ok, _) then { expect_fail("expected a digest mismatch") }
+    (R.error, why) then {
+      expect_contains(why, "digest mismatch")
+      expect_contains(why, digest_of(layer))
+    }
+  }
+}
+
+def test_validate_rejects_unknown_layout_version() {
+  const dir = oci_tmp("badtversion")
+  case oci_mod.assemble(dir, fixture_spec("latest")) {
+    (R.error, why) then { expect_fail("assemble failed: " + why) }
+    (R.ok, _) then { }
+  }
+  const (R.ok, _) = file.write(dir + "/oci-layout", "{\"imageLayoutVersion\":\"9.9.9\"}\n")
+  case oci_mod.validate(dir) {
+    (R.ok, _) then { expect_fail("expected an imageLayoutVersion error") }
+    (R.error, why) then {
+      expect_contains(why, "unsupported imageLayoutVersion")
+      expect_contains(why, "9.9.9")
+    }
+  }
+}
+
+def test_validate_rejects_missing_oci_layout() {
+  const dir = oci_tmp("nolayoutfile")
+  case oci_mod.validate(dir) {
+    (R.ok, _) then { expect_fail("expected a missing oci-layout error") }
+    (R.error, why) then {
+      expect_contains(why, "is not an OCI image layout")
+      expect_contains(why, "oci-layout is missing")
+    }
+  }
+}
+
+def test_temp_layout_cleanup_and_keep() {
+  case oci_mod.new_temp_layout(false) {
+    (R.ok, temp) then {
+      const (R.ok, _) = file.write(temp.dir + "/scratch.txt", "x")
+      case temp.cleanup() {
+        (R.ok, _) then { expect_dir_missing(temp.dir) }
+        (R.error, why) then { expect_fail("cleanup failed: " + why) }
+      }
+    }
+    (R.error, why) then { expect_fail("new_temp_layout failed: " + why) }
+  }
+  case oci_mod.new_temp_layout(true) {
+    (R.ok, kept) then {
+      case kept.cleanup() {
+        (R.ok, _) then { expect_dir_exists(kept.dir) }
+        (R.error, why) then { expect_fail("keep cleanup failed: " + why) }
+      }
+      const discarding = src.oci.TempLayout.new(kept.dir, false)
+      const (R.ok, _) = discarding.cleanup()
+      expect_dir_missing(kept.dir)
+    }
+    (R.error, why) then { expect_fail("new_temp_layout failed: " + why) }
+  }
+}
+
+// Acceptance: skopeo can read the layout when it is installed. A missing
+// binary exits 127 through the execvp path, which counts as a skip.
+def test_live_skopeo_inspect() {
+  const dir = oci_tmp("skopeo")
+  case oci_mod.assemble(dir, fixture_spec("latest")) {
+    (R.error, why) then { expect_fail("assemble failed: " + why) }
+    (R.ok, result) then {
+      const runner = src.git.RealRunner.new()
+      const argv = ["skopeo", "inspect", "--format", "{{.Digest}}", "oci:" + dir + ":latest"]
+      case runner.run(argv, 30.0) {
+        (R.ok, out) then { expect_contains(out, result.manifest_digest) }
+        (R.error, why) then {
+          if why.index_of("exited with code 127") >= 0 {
+            expect_true(true)
+          } else {
+            expect_fail("skopeo inspect failed: " + why)
+          }
+        }
+      }
+    }
+  }
+}

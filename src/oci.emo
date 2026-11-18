@@ -1,0 +1,909 @@
+// T1.12: assemble a standard OCI image layout from an already-downloaded
+// image manifest, its config, and its layers — oci-layout, index.json, and
+// content-addressed blobs/sha256/<hex>. Every blob is verified against its
+// descriptor (digest and size) while it is copied into place, temp bytes
+// live in <dest>.part until verification passes, and index.json is written
+// last, so a layout on disk never references an absent or corrupted blob.
+// Spec: docs/spec/oci-layout.md.
+
+require "os"
+require "file"
+require "crypto"
+require "json"
+
+const oci_layout_version = "1.0.0"
+const oci_layout_file = "oci-layout"
+const oci_index_file = "index.json"
+const oci_blob_dir = "blobs/sha256"
+const oci_index_media_type = "application/vnd.oci.image.index.v1+json"
+const oci_manifest_media_type = "application/vnd.oci.image.manifest.v1+json"
+const oci_docker_manifest_media_type = "application/vnd.docker.distribution.manifest.v2+json"
+const oci_docker_list_media_type = "application/vnd.docker.distribution.manifest.list.v2+json"
+const oci_ref_name_annotation = "org.opencontainers.image.ref.name"
+const oci_chunk_size = 65536
+const oci_temp_prefix = "pokerface-oci-"
+
+class Descriptor {
+  def init(media_type String, digest String, size Int64) {
+    self.media_type = media_type
+    self.digest = digest
+    self.size = size
+  }
+}
+
+class ManifestInfo {
+  def init(media_type String, config Descriptor, layers Array[Descriptor]) {
+    self.media_type = media_type
+    self.config = config
+    self.layers = layers
+  }
+}
+
+// One blob's local source: the file download_blob wrote, plus the descriptor
+// it is supposed to satisfy.
+class BlobSource {
+  def init(digest String, size Int64, path String) {
+    self.digest = digest
+    self.size = size
+    self.path = path
+  }
+}
+
+class LayoutSpec {
+  def init(manifest_media_type String, manifest_body String, manifest_digest String, tag String, blobs Array[BlobSource]) {
+    self.manifest_media_type = manifest_media_type
+    self.manifest_body = manifest_body
+    self.manifest_digest = manifest_digest
+    self.tag = tag
+    self.blobs = blobs
+  }
+}
+
+class LayoutResult {
+  def init(dir String, tag String, manifest_media_type String, manifest_digest String, manifest_size Int64, blob_count Int64, blob_bytes Int64) {
+    self.dir = dir
+    self.tag = tag
+    self.manifest_media_type = manifest_media_type
+    self.manifest_digest = manifest_digest
+    self.manifest_size = manifest_size
+    self.blob_count = blob_count
+    self.blob_bytes = blob_bytes
+  }
+}
+
+class PlannedBlob {
+  def init(source BlobSource, label String) {
+    self.source = source
+    self.label = label
+  }
+}
+
+class LayoutEntry {
+  def init(media_type String, digest String, size Int64, tag String) {
+    self.media_type = media_type
+    self.digest = digest
+    self.size = size
+    self.tag = tag
+  }
+}
+
+class LayoutReport {
+  def init(manifests Int64, blobs Int64, bytes Int64) {
+    self.manifests = manifests
+    self.blobs = blobs
+    self.bytes = bytes
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Manifest and index parsing.
+
+// Parses an image manifest body. schemaVersion must be 2; the config
+// descriptor is required; layers may be empty but must be an array.
+def parse_manifest(body String) (R, ManifestInfo) {
+  case json.decode(body) {
+    (R.error, why) then { return (R.error, "oci: manifest is not valid JSON: " + why) }
+    (R.ok, doc) then {
+      if doc.is(json.JsonObject) {
+        case require_schema_version(doc, "manifest") {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, _) then { }
+        }
+        var media_type = ""
+        case member_string(doc, "mediaType") {
+          (R.ok, value) then { media_type = value }
+          (R.error, _) then { media_type = "" }
+        }
+        case member(doc, "config") {
+          (R.error, why) then { return (R.error, "oci: manifest: config: " + why) }
+          (R.ok, config_value) then {
+            case parse_descriptor(config_value, "manifest: config") {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, config) then {
+                case member(doc, "layers") {
+                  (R.error, why) then { return (R.error, "oci: manifest: layers: " + why) }
+                  (R.ok, layers_value) then {
+                    if layers_value.is(json.JsonArray) {
+                      return parse_layers(layers_value.items(), 0, [], media_type, config)
+                    }
+                    return (R.error, "oci: manifest: layers: expected an array")
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      return (R.error, "oci: manifest: expected a JSON object at the top level")
+    }
+  }
+}
+
+def parse_layers(items Array[json.Json], index Int64, out Array[Descriptor], media_type String, config Descriptor) (R, ManifestInfo) {
+  if index >= items.length() {
+    return (R.ok, ManifestInfo.new(media_type, config, out))
+  }
+  case parse_descriptor(items[index], "manifest: layers[" + index.to_string() + "]") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, descriptor) then {
+      return parse_layers(items, index + 1, out.append(descriptor), media_type, config)
+    }
+  }
+}
+
+def parse_descriptor(value json.Json, label String) (R, Descriptor) {
+  if value.is(json.JsonObject) {
+    var media_type = ""
+    case member_string(value, "mediaType") {
+      (R.ok, text) then { media_type = text }
+      (R.error, _) then { media_type = "" }
+    }
+    case member_string(value, "digest") {
+      (R.error, why) then { return (R.error, "oci: " + label + ": digest: " + why) }
+      (R.ok, digest) then {
+        if src.blob.digest_hex(digest) == "" {
+          return (R.error, "oci: " + label + ": digest: must be 'sha256:' followed by 64 lowercase hex characters, got '" + digest + "'")
+        }
+        case member_size(value, "size") {
+          (R.error, why) then { return (R.error, "oci: " + label + ": size: " + why) }
+          (R.ok, size) then { return (R.ok, Descriptor.new(media_type, digest, size)) }
+        }
+      }
+    }
+  }
+  return (R.error, "oci: " + label + ": expected a mapping")
+}
+
+def require_schema_version(doc json.Json, what String) (R, Bool) {
+  case member(doc, "schemaVersion") {
+    (R.error, why) then { return (R.error, "oci: " + what + ": schemaVersion: " + why) }
+    (R.ok, value) then {
+      if value.is(json.JsonInt) {
+        if value.as_int() == 2 {
+          return (R.ok, true)
+        }
+        return (R.error, "oci: " + what + ": schemaVersion must be 2, got " + value.as_int().to_string())
+      }
+      return (R.error, "oci: " + what + ": schemaVersion must be an integer")
+    }
+  }
+}
+
+// Safe member lookup — Json.get raises on a missing key, which Emo cannot
+// catch, so every optional field goes through this scan (the registry
+// client's T1.10 pattern).
+def member(doc json.Json, key String) (R, json.Json) {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (k, v) = entries[i]
+      if k == key {
+        return (R.ok, v)
+      }
+      i = i + 1
+    }
+    return (R.error, "missing required field")
+  }
+  return (R.error, "expected a mapping")
+}
+
+def member_string(doc json.Json, key String) (R, String) {
+  case member(doc, key) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, value) then {
+      if value.is(json.JsonString) {
+        return (R.ok, value.as_string())
+      }
+      return (R.error, "expected a string")
+    }
+  }
+}
+
+def member_size(doc json.Json, key String) (R, Int64) {
+  case member(doc, key) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, value) then {
+      if value.is(json.JsonInt) {
+        if value.as_int() >= 0 {
+          return (R.ok, value.as_int())
+        }
+        return (R.error, "expected a non-negative integer")
+      }
+      return (R.error, "expected an integer")
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Layout assembly.
+
+// Writes spec's manifest, config, and layers into a standard OCI image
+// layout under dir, tagged spec.tag. Every source blob is verified against
+// its descriptor while copying; the manifest bytes are verified against
+// spec.manifest_digest when it is non-empty. oci-layout and index.json are
+// written only after every blob is in place.
+def assemble(dir String, spec LayoutSpec) (R, LayoutResult) {
+  const computed = "sha256:" + crypto.hex_encode(crypto.sha2.sha256(spec.manifest_body.to_bytes()))
+  if spec.manifest_digest != "" && spec.manifest_digest != computed {
+    return (R.error, "oci: manifest digest mismatch — expected " + spec.manifest_digest + ", body hashes to " + computed)
+  }
+  if spec.tag == "" {
+    return (R.error, "oci: a tag is required for the index.json ref.name annotation")
+  }
+  case parse_manifest(spec.manifest_body) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, manifest) then {
+      case collect_sources(manifest, spec.blobs) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, planned) then {
+          case ensure_layout_dirs(dir) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, _) then {
+              case install_sources(dir, planned, 0, 0, 0) {
+                (R.error, why) then { return (R.error, why) }
+                (R.ok, installed) then {
+                  const (count, bytes) = installed
+                  case install_manifest_blob(dir, spec.manifest_body, computed) {
+                    (R.error, why) then { return (R.error, why) }
+                    (R.ok, _) then {
+                      case write_layout_files(dir, spec, manifest_media_type(spec, manifest), computed, spec.manifest_body.length()) {
+                        (R.error, why) then { return (R.error, why) }
+                        (R.ok, _) then {
+                          return (R.ok, LayoutResult.new(
+                            dir,
+                            spec.tag,
+                            manifest_media_type(spec, manifest),
+                            computed,
+                            spec.manifest_body.length(),
+                            count + 1,
+                            bytes + spec.manifest_body.length()
+                          ))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+def manifest_media_type(spec LayoutSpec, manifest ManifestInfo) String {
+  if spec.manifest_media_type != "" {
+    return spec.manifest_media_type
+  }
+  if manifest.media_type != "" {
+    return manifest.media_type
+  }
+  return oci_manifest_media_type
+}
+
+// Pairs every descriptor the manifest references (config first, then layer
+// order) with the matching source; a missing source, a size disagreement, or
+// an extra unreferenced source is a clear error before anything is written.
+def collect_sources(manifest ManifestInfo, sources Array[BlobSource]) (R, Array[PlannedBlob]) {
+  var planned = []
+  case collect_one(manifest.config, sources, "manifest: config", planned) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, list) then { planned = list }
+  }
+  var i = 0
+  while i < manifest.layers.length() {
+    case collect_one(manifest.layers[i], sources, "manifest: layers[" + i.to_string() + "]", planned) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, list) then { planned = list }
+    }
+    i = i + 1
+  }
+  var j = 0
+  while j < sources.length() {
+    if !source_planned(planned, sources[j].digest) {
+      return (R.error, "oci: blob " + sources[j].digest + " (" + sources[j].path + ") is not referenced by the manifest")
+    }
+    j = j + 1
+  }
+  return (R.ok, planned)
+}
+
+def collect_one(descriptor Descriptor, sources Array[BlobSource], label String, planned Array[PlannedBlob]) (R, Array[PlannedBlob]) {
+  if source_planned(planned, descriptor.digest) {
+    return (R.ok, planned)
+  }
+  var i = 0
+  while i < sources.length() {
+    const source = sources[i]
+    if source.digest == descriptor.digest {
+      if source.size != descriptor.size {
+        return (R.error, "oci: blob " + descriptor.digest + " (" + label + "): descriptor says " + descriptor.size.to_string() + " bytes, the downloaded file was declared as " + source.size.to_string())
+      }
+      return (R.ok, planned.append(PlannedBlob.new(source, label)))
+    }
+    i = i + 1
+  }
+  return (R.error, "oci: missing blob " + descriptor.digest + " (" + label + "): no downloaded file was provided")
+}
+
+def source_planned(planned Array[PlannedBlob], digest String) Bool {
+  var i = 0
+  while i < planned.length() {
+    if planned[i].source.digest == digest {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+def ensure_layout_dirs(dir String) (R, Bool) {
+  case ensure_dir(dir) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case ensure_dir(dir + "/blobs") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case ensure_dir(dir + "/" + oci_blob_dir) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  return (R.ok, true)
+}
+
+def ensure_dir(path String) (R, Bool) {
+  case os.mkdir(path) {
+    (R.ok, _) then { return (R.ok, true) }
+    (R.error, _) then {
+      case os.list_dir(path) {
+        (R.ok, _) then { return (R.ok, true) }
+        (R.error, why) then { return (R.error, "oci: cannot create directory " + path + ": " + why) }
+      }
+    }
+  }
+}
+
+def install_sources(dir String, planned Array[PlannedBlob], index Int64, count Int64, bytes Int64) (R, (Int64, Int64)) {
+  if index >= planned.length() {
+    return (R.ok, (count, bytes))
+  }
+  const entry = planned[index]
+  case install_blob(dir, entry.source.path, entry.source.digest, entry.source.size, entry.label) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then {
+      return install_sources(dir, planned, index + 1, count + 1, bytes + entry.source.size)
+    }
+  }
+}
+
+// Copies source into blobs/sha256/<hex> unless an identical blob is already
+// there. Bytes go to <dest>.part; the digest and size are checked before the
+// rename, so a corrupted copy never enters the layout.
+def install_blob(dir String, source String, expected_digest String, expected_size Int64, label String) (R, String) {
+  const hex = src.blob.digest_hex(expected_digest)
+  if hex == "" {
+    return (R.error, "oci: " + label + ": '" + expected_digest + "' is not a sha256 digest")
+  }
+  const dest = dir + "/" + oci_blob_dir + "/" + hex
+  case blob_matches(dest, expected_digest, expected_size) {
+    (R.ok, true) then { return (R.ok, dest) }
+    (R.ok, false) then { }
+    (R.error, _) then { }
+  }
+  return copy_blob(source, dest, expected_digest, expected_size, label)
+}
+
+def copy_blob(source String, dest String, expected_digest String, expected_size Int64, label String) (R, String) {
+  case os.open_read(source) {
+    (R.error, why) then {
+      return (R.error, "oci: missing blob " + expected_digest + " (" + label + "): cannot read " + source + ": " + why)
+    }
+    (R.ok, in_fd) then {
+      const part = dest + ".part"
+      case os.open_write(part) {
+        (R.error, why) then {
+          const (_, _) = os.close(in_fd)
+          return (R.error, "oci: cannot create " + part + ": " + why)
+        }
+        (R.ok, out_fd) then {
+          const digest = crypto.sha2.new()
+          var size = 0
+          var failure = ""
+          while true {
+            case os.read(in_fd, oci_chunk_size) {
+              (R.error, why) then {
+                failure = "read from " + source + " failed: " + why
+                break
+              }
+              (R.ok, chunk) then {
+                if chunk == "" {
+                  break
+                }
+                case os.write(out_fd, chunk) {
+                  (R.error, why) then {
+                    failure = "write to " + part + " failed: " + why
+                    break
+                  }
+                  (R.ok, _) then {
+                    digest.write(chunk.to_bytes())
+                    size = size + chunk.length()
+                  }
+                }
+              }
+            }
+          }
+          const (_, _) = os.close(in_fd)
+          const (_, _) = os.close(out_fd)
+          if failure != "" {
+            os.unlink(part)
+            return (R.error, "oci: " + label + ": " + failure)
+          }
+          const actual = "sha256:" + crypto.hex_encode(digest.sum())
+          if actual != expected_digest {
+            os.unlink(part)
+            return (R.error, "oci: " + label + ": digest mismatch — descriptor says " + expected_digest + ", copied bytes hash to " + actual)
+          }
+          if size != expected_size {
+            os.unlink(part)
+            return (R.error, "oci: " + label + ": size mismatch — descriptor says " + expected_size.to_string() + " bytes, the source has " + size.to_string())
+          }
+          case os.rename(part, dest) {
+            (R.error, why) then {
+              os.unlink(part)
+              return (R.error, "oci: cannot move " + part + " into place: " + why)
+            }
+            (R.ok, _) then {
+              return (R.ok, dest)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// The manifest itself is a blob too; it is written from the bytes already on
+// hand so no round trip through a source file is needed.
+def install_manifest_blob(dir String, body String, digest String) (R, String) {
+  const hex = src.blob.digest_hex(digest)
+  const dest = dir + "/" + oci_blob_dir + "/" + hex
+  case blob_matches(dest, digest, body.length()) {
+    (R.ok, true) then { return (R.ok, dest) }
+    (R.ok, false) then { }
+    (R.error, _) then { }
+  }
+  const part = dest + ".part"
+  case file.write(part, body) {
+    (R.error, why) then { return (R.error, "oci: cannot write " + part + ": " + why) }
+    (R.ok, _) then {
+      case os.rename(part, dest) {
+        (R.error, why) then {
+          os.unlink(part)
+          return (R.error, "oci: cannot move " + part + " into place: " + why)
+        }
+        (R.ok, _) then { return (R.ok, dest) }
+      }
+    }
+  }
+}
+
+def blob_matches(path String, digest String, size Int64) (R, Bool) {
+  case hash_file(path) {
+    (R.ok, info) then {
+      const (actual, actual_size) = info
+      if actual == digest && actual_size == size {
+        return (R.ok, true)
+      }
+      return (R.ok, false)
+    }
+    (R.error, why) then { return (R.error, why) }
+  }
+}
+
+def hash_file(path String) (R, (String, Int64)) {
+  const digest = crypto.sha2.new()
+  case os.open_read(path) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, fd) then {
+      var size = 0
+      while true {
+        case os.read(fd, oci_chunk_size) {
+          (R.error, why) then {
+            const (_, _) = os.close(fd)
+            return (R.error, why)
+          }
+          (R.ok, chunk) then {
+            if chunk == "" {
+              break
+            }
+            digest.write(chunk.to_bytes())
+            size = size + chunk.length()
+          }
+        }
+      }
+      const (_, _) = os.close(fd)
+      return (R.ok, ("sha256:" + crypto.hex_encode(digest.sum()), size))
+    }
+  }
+  return (R.error, "oci: unreachable hash path")
+}
+
+def write_layout_files(dir String, spec LayoutSpec, media_type String, digest String, size Int64) (R, Bool) {
+  case file.write(dir + "/" + oci_layout_file, oci_layout_json()) {
+    (R.error, why) then { return (R.error, "oci: cannot write " + dir + "/" + oci_layout_file + ": " + why) }
+    (R.ok, _) then { }
+  }
+  const index_text = index_json(media_type, digest, size, spec.tag)
+  case file.write(dir + "/" + oci_index_file, index_text) {
+    (R.error, why) then { return (R.error, "oci: cannot write " + dir + "/" + oci_index_file + ": " + why) }
+    (R.ok, _) then { return (R.ok, true) }
+  }
+}
+
+def oci_layout_json() String {
+  const doc = json.object([("imageLayoutVersion", json.string(oci_layout_version))])
+  return json.encode_pretty(doc) + "\n"
+}
+
+def index_json(media_type String, digest String, size Int64, tag String) String {
+  const descriptor = json.object([
+    ("mediaType", json.string(media_type)),
+    ("digest", json.string(digest)),
+    ("size", json.int64(size)),
+    ("annotations", json.object([(oci_ref_name_annotation, json.string(tag))]))
+  ])
+  const doc = json.object([
+    ("schemaVersion", json.int64(2)),
+    ("mediaType", json.string(oci_index_media_type)),
+    ("manifests", json.array([descriptor]))
+  ])
+  return json.encode_pretty(doc) + "\n"
+}
+
+// ---------------------------------------------------------------------------
+// Layout validation.
+
+// Verifies a layout on disk: oci-layout's version, then every descriptor in
+// index.json (and every config/layer descriptor of each referenced manifest)
+// against the blob's actual digest and size. Answers the unique blob count
+// and byte total.
+def validate(dir String) (R, LayoutReport) {
+  case check_layout_version(dir) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case read_index(dir) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, entries) then {
+      const seen = SeenBlobs.new()
+      case validate_entries(dir, entries, 0, seen) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, manifests) then {
+          return (R.ok, LayoutReport.new(manifests, seen.count.read(), seen.bytes.read()))
+        }
+      }
+    }
+  }
+}
+
+class SeenBlobs {
+  def init() {
+    self.digests = Box.new(ArrayBuilder.new())
+    self.count = Box.new(0)
+    self.bytes = Box.new(0)
+  }
+
+  def add(digest String, size Int64) Bool {
+    const list = self.digests.read()
+    const items = list.to_array()
+    var i = 0
+    while i < items.length() {
+      if items[i] == digest {
+        return false
+      }
+      i = i + 1
+    }
+    list.push(digest)
+    self.count.replace(self.count.read() + 1)
+    self.bytes.replace(self.bytes.read() + size)
+    return true
+  }
+}
+
+// Counts manifests top-level entries; nested index entries add to the count
+// as manifests too. Blob counting is deduplicated by digest.
+def validate_entries(dir String, entries Array[LayoutEntry], index Int64, seen SeenBlobs) (R, Int64) {
+  if index >= entries.length() {
+    return (R.ok, 0)
+  }
+  const entry = entries[index]
+  const label = "index.json: manifests[" + index.to_string() + "]"
+  case verify_blob(dir, entry.digest, entry.size, label, seen) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case validate_entry_kind(dir, entry, label, seen) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, nested) then {
+      case validate_entries(dir, entries, index + 1, seen) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, rest) then { return (R.ok, nested + rest) }
+      }
+    }
+  }
+}
+
+def validate_entry_kind(dir String, entry LayoutEntry, label String, seen SeenBlobs) (R, Int64) {
+  if is_manifest_type(entry.media_type) {
+    case read_blob_body(dir, entry.digest, label) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, body) then {
+        case parse_manifest(body) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, manifest) then {
+            case verify_blob(dir, manifest.config.digest, manifest.config.size, label + ".config", seen) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, _) then { return validate_layers(dir, manifest.layers, 0, label, seen) }
+            }
+          }
+        }
+      }
+    }
+  }
+  if is_index_type(entry.media_type) {
+    case read_blob_body(dir, entry.digest, label) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, body) then {
+        case parse_index_entries(body, label) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, nested) then { return validate_entries(dir, nested, 0, seen) }
+        }
+      }
+    }
+  }
+  return (R.error, "oci: " + label + ": unsupported media type '" + entry.media_type + "'")
+}
+
+def validate_layers(dir String, layers Array[Descriptor], index Int64, label String, seen SeenBlobs) (R, Int64) {
+  if index >= layers.length() {
+    return (R.ok, 1)
+  }
+  const layer = layers[index]
+  case verify_blob(dir, layer.digest, layer.size, label + ".layers[" + index.to_string() + "]", seen) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { return validate_layers(dir, layers, index + 1, label, seen) }
+  }
+}
+
+def verify_blob(dir String, digest String, size Int64, label String, seen SeenBlobs) (R, Bool) {
+  const hex = src.blob.digest_hex(digest)
+  if hex == "" {
+    return (R.error, "oci: " + label + ": '" + digest + "' is not a sha256 digest")
+  }
+  const path = dir + "/" + oci_blob_dir + "/" + hex
+  case hash_file(path) {
+    (R.error, why) then {
+      return (R.error, "oci: missing blob " + digest + " (" + label + "): " + path + " cannot be read: " + why)
+    }
+    (R.ok, info) then {
+      const (actual, actual_size) = info
+      if actual != digest {
+        return (R.error, "oci: blob " + digest + " (" + label + "): digest mismatch — the file hashes to " + actual)
+      }
+      if size >= 0 && actual_size != size {
+        return (R.error, "oci: blob " + digest + " (" + label + "): size mismatch — descriptor says " + size.to_string() + " bytes, the file has " + actual_size.to_string())
+      }
+      seen.add(digest, actual_size)
+      return (R.ok, true)
+    }
+  }
+}
+
+def check_layout_version(dir String) (R, Bool) {
+  case file.read(dir + "/" + oci_layout_file) {
+    (R.error, why) then {
+      return (R.error, "oci: " + dir + " is not an OCI image layout: " + oci_layout_file + " is missing (" + why + ")")
+    }
+    (R.ok, text) then {
+      case json.decode(text) {
+        (R.error, why) then { return (R.error, "oci: " + oci_layout_file + ": invalid JSON — " + why) }
+        (R.ok, doc) then {
+          case member_string(doc, "imageLayoutVersion") {
+            (R.error, why) then { return (R.error, "oci: " + oci_layout_file + ": imageLayoutVersion: " + why) }
+            (R.ok, version_text) then {
+              if version_text == oci_layout_version {
+                return (R.ok, true)
+              }
+              return (R.error, "oci: " + oci_layout_file + ": unsupported imageLayoutVersion '" + version_text + "' (this client writes " + oci_layout_version + ")")
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+def read_index(dir String) (R, Array[LayoutEntry]) {
+  case file.read(dir + "/" + oci_index_file) {
+    (R.error, why) then { return (R.error, "oci: " + dir + ": " + oci_index_file + " is missing (" + why + ")") }
+    (R.ok, text) then { return parse_index_entries(text, "index.json") }
+  }
+}
+
+def parse_index_entries(text String, label String) (R, Array[LayoutEntry]) {
+  case json.decode(text) {
+    (R.error, why) then { return (R.error, "oci: " + label + ": invalid JSON — " + why) }
+    (R.ok, doc) then {
+      if doc.is(json.JsonObject) {
+        case require_schema_version(doc, label) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, _) then { }
+        }
+        case member(doc, "manifests") {
+          (R.error, why) then { return (R.error, "oci: " + label + ": manifests: " + why) }
+          (R.ok, manifests) then {
+            if manifests.is(json.JsonArray) {
+              return parse_index_items(manifests.items(), 0, [], label)
+            }
+            return (R.error, "oci: " + label + ": manifests: expected an array")
+          }
+        }
+      }
+      return (R.error, "oci: " + label + ": expected a JSON object at the top level")
+    }
+  }
+}
+
+def parse_index_items(items Array[json.Json], index Int64, out Array[LayoutEntry], label String) (R, Array[LayoutEntry]) {
+  if index >= items.length() {
+    return (R.ok, out)
+  }
+  const item_label = label + ": manifests[" + index.to_string() + "]"
+  case parse_descriptor(items[index], item_label) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, descriptor) then {
+      case annotation_ref_name(items[index]) {
+        (R.ok, tag) then {
+          const entry = LayoutEntry.new(descriptor.media_type, descriptor.digest, descriptor.size, tag)
+          return parse_index_items(items, index + 1, out.append(entry), label)
+        }
+        (R.error, _) then {
+          const entry = LayoutEntry.new(descriptor.media_type, descriptor.digest, descriptor.size, "")
+          return parse_index_items(items, index + 1, out.append(entry), label)
+        }
+      }
+    }
+  }
+}
+
+def annotation_ref_name(descriptor json.Json) (R, String) {
+  case member(descriptor, "annotations") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, annotations) then {
+      return member_string(annotations, oci_ref_name_annotation)
+    }
+  }
+}
+
+def read_blob_body(dir String, digest String, label String) (R, String) {
+  const hex = src.blob.digest_hex(digest)
+  case file.read(dir + "/" + oci_blob_dir + "/" + hex) {
+    (R.error, why) then { return (R.error, "oci: " + label + ": cannot read blob " + digest + ": " + why) }
+    (R.ok, body) then { return (R.ok, body) }
+  }
+}
+
+def is_manifest_type(media_type String) Bool {
+  return media_type == oci_manifest_media_type || media_type == oci_docker_manifest_media_type
+}
+
+def is_index_type(media_type String) Bool {
+  return media_type == oci_index_media_type || media_type == oci_docker_list_media_type
+}
+
+// ---------------------------------------------------------------------------
+// Temporary layouts. A pull writes into a temp directory and imports from
+// there (T1.13/T1.14); --keep leaves it on disk for debugging, the default
+// removes the whole tree after a successful or failed run.
+
+class TempLayout {
+  def init(dir String, keep Bool) {
+    self.dir = dir
+    self.keep = keep
+  }
+
+  def cleanup() (R, Bool) {
+    if self.keep {
+      return (R.ok, true)
+    }
+    // A TempLayout normally comes from new_temp_layout; refuse to recurse
+    // into a directory that does not carry the generated name shape.
+    if self.dir.index_of("/" + oci_temp_prefix) < 0 {
+      return (R.error, "oci: refusing to remove " + self.dir + ": not a pokerface temporary layout")
+    }
+    return remove_tree(self.dir)
+  }
+}
+
+def new_temp_layout(keep Bool) (R, TempLayout) {
+  const base = temp_base_dir()
+  var i = 0
+  while i < 1000 {
+    const candidate = base + oci_temp_prefix + os.getpid().to_string() + "-" + i.to_string()
+    case os.mkdir(candidate) {
+      (R.ok, _) then { return (R.ok, TempLayout.new(candidate, keep)) }
+      (R.error, _) then { i = i + 1 }
+    }
+  }
+  return (R.error, "oci: cannot create a temporary layout directory under " + base)
+}
+
+def temp_base_dir() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+// Never follows a path: list_dir tells a directory from a file, and only the
+// entries this layout created are removed.
+def remove_tree(path String) (R, Bool) {
+  case os.list_dir(path) {
+    (R.error, why) then { return (R.error, "oci: cannot list " + path + ": " + why) }
+    (R.ok, entries) then {
+      var i = 0
+      while i < entries.length() {
+        const child = path + "/" + entries[i]
+        case os.list_dir(child) {
+          (R.ok, _) then {
+            case remove_tree(child) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, _) then { }
+            }
+          }
+          (R.error, _) then {
+            os.unlink(child)
+          }
+        }
+        i = i + 1
+      }
+      case os.rmdir(path) {
+        (R.ok, _) then { return (R.ok, true) }
+        (R.error, why) then { return (R.error, "oci: cannot remove " + path + ": " + why) }
+      }
+    }
+  }
+}

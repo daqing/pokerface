@@ -81,7 +81,7 @@
 | [x] | T1.9 | `resolve` 命令串联 | T1.4-T1.8 | 2h |
 | [x] | T1.10 | Registry 认证与 Manifest 客户端 | T1.5、T1.8 | 3h |
 | [x] | T1.11 | Blob 下载器：重试、校验、续传 | T1.10 | 3-4h |
-| [ ] | T1.12 | OCI 镜像布局组装 | T1.10、T1.11 | 2-3h |
+| [x] | T1.12 | OCI 镜像布局组装 | T1.10、T1.11 | 2-3h |
 | [ ] | T1.13 | 运行时导入适配 | T1.12 | 3h |
 | [ ] | T1.14 | `pull` 命令串联与失败回退 | T1.9-T1.13 | 3h |
 | [ ] | T1.15 | 本地缓存与离线模式 | T1.7、T1.14 | 2-3h |
@@ -264,6 +264,8 @@ images:
 **验收**：`skopeo inspect oci:<dir>` 可读取（本机有 skopeo 时）；所有 descriptor 的 digest / size 与实际文件一致；缺少 Blob 时明确报错；支持 `--keep` 保留临时目录。
 
 **依赖**：T1.10、T1.11 · **预估**：2-3h
+
+> **备注**（2026-11-18，约 2h）：完成。`src/oci.emo` 把已下载的 Manifest、config、layer 字节组装为标准 OCI Layout：`oci-layout`、带 `org.opencontainers.image.ref.name` tag 注解的 `index.json`、以及 `blobs/sha256/<hex>`。组装遵循“先校验后写入”：Manifest 字节先与外部声明的 digest 比对；每个 config/layer descriptor 在写盘前必须配到 `BlobSource`（缺少来源、声明大小不一致、多出未被引用的来源都会明确报错）；拷贝时边流式写入 `<dest>.part` 边计算 SHA-256 和字节数，digest+size 都匹配后才 rename；`index.json` 最后写入——磁盘上的布局永远不会引用损坏或缺失的 Blob。已存在且一致的 Blob 直接复用，重复组装是幂等的。`validate(dir)` 完全从磁盘重新校验（布局版本、index descriptor、Manifest 的 config/layers、嵌套 index），并报告去重后的 Blob/字节数；缺失、损坏、大小不符都会点名引用它的 descriptor。`new_temp_layout(keep)` + `TempLayout.cleanup()` 提供 `--keep` 语义，T1.14 会把它接到命令行选项上，导入失败后可以保留现场排查。Fixture：`test/fixtures/oci/` 是一个真正合法的单层镜像（gzip tar + `diff_ids` 匹配的 config），`skopeo inspect oci:<dir>:latest` 可直接读取并返回 Manifest digest——已用 skopeo 1.25 手工验证。测试：`test/oci_layout.emo` 共 15 个（解析错误、组装/校验、幂等、Manifest digest 不符、来源缺失/损坏/多余、validate 捕获缺失与损坏 Blob 及错误布局版本、临时目录 keep/cleanup、以及 skopeo 退出码 127 时跳过的真实调用）。文档：`docs/spec/oci-layout.md`。踩坑：Emo 里 `;` 不是语句分隔符（`E2025`），多条语句要换行；`json.object`/`json.array` 工厂接收显式的元组/数组字面量；`file.read` 是字节安全的，gzip fixture 可作为 String 原样往返；digest 形状校验复用了 `src.blob.digest_hex`。
 
 #### T1.13 运行时导入适配
 
