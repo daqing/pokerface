@@ -240,7 +240,7 @@ def test_the_router_dispatches_manifest_routes() {
     "/tmp/pf-manifests-router/shutdown",
     "<test>"
   )
-  const service = registry.router.Service.new(config, ManifestFakeDb.new(), ManifestFakeBlob.new(), store)
+  const service = registry.router.Service.new(config, ManifestFakeDb.new(), ManifestFakeBlob.new(), ManifestFakeBlobStore.new(), ManifestFakeBlobLinks.new(), store)
   const response = registry.router.handle(make_request("GET", "/v2/acme/app/manifests/latest"), service)
   expect_equal(200, response.status)
   expect_equal(body, response.body)
@@ -267,5 +267,47 @@ class ManifestFakeBlob {
 
   def probe() (R, String) {
     return (R.ok, "fs:/tmp/fake")
+  }
+}
+
+class ManifestFakeBlobStore {
+  def init() {
+  }
+
+  def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put")
+  }
+
+  def put_file(digest String, source String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put_file")
+  }
+
+  def get(digest String) (R, String) {
+    return (R.error, "fake: get")
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    return (R.error, "fake: range")
+  }
+
+  def head(digest String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, -1, false))
+  }
+
+  def delete(digest String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def presign_get(digest String, ttl_seconds Int64) String {
+    return ""
+  }
+}
+
+class ManifestFakeBlobLinks {
+  def init() {
+  }
+
+  def linked(repository String, digest String) (R, registry.blobs.BlobLink) {
+    return (R.ok, registry.blobs.absent_link())
   }
 }

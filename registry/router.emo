@@ -9,10 +9,12 @@
 require "httpd"
 
 class Service {
-  def init(config registry.config.RegistryConfig, db registry.health.DbHealth, blob registry.blobstore.BlobHealth, manifests registry.manifests.ManifestStore) {
+  def init(config registry.config.RegistryConfig, db registry.health.DbHealth, blob registry.blobstore.BlobHealth, blob_store registry.blobstore.BlobStore, blob_links registry.blobs.BlobLinks, manifests registry.manifests.ManifestStore) {
     self.config = config
     self.db = db
     self.blob = blob
+    self.blob_store = blob_store
+    self.blob_links = blob_links
     self.manifests = manifests
   }
 }
@@ -22,6 +24,9 @@ def handle(req httpd.Request, service Service) httpd.Response {
 }
 
 def route(req httpd.Request, service Service) httpd.Response {
+  if registry.blobs.is_route(req.path) {
+    return registry.blobs.handle(req, service.blob_links, service.blob_store)
+  }
   if registry.manifests.is_route(req.path) {
     return registry.manifests.handle(req, service.manifests)
   }

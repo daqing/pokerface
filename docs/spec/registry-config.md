@@ -100,6 +100,7 @@ values name the variable.
 | `GET /readyz` | 200 `ready` when every readiness check passes; 503 `not ready: <check>: <reason>; …` otherwise. |
 | `GET /v2/` | 200 `{}` with `Docker-Distribution-API-Version: registry/2.0`; other methods 405 with `Allow` ([registry-api.md](registry-api.md)). |
 | `GET/HEAD /v2/<name>/manifests/<reference>` | The stored manifest by tag or digest ([registry-manifests.md](registry-manifests.md)). |
+| `GET/HEAD /v2/<name>/blobs/<digest>` | The blob, or a 307 presigned redirect on S3 ([registry-blobs.md](registry-blobs.md)). |
 | anything else | 404 as an OCI error (`NAME_UNKNOWN`). Every response carries `X-Request-Id`. |
 
 Readiness checks in v0.1:

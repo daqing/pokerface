@@ -354,7 +354,7 @@ images:
 | [x] | T2.6 | S3 / MinIO BlobStore 适配 | T2.4、T2.5 | 3h |
 | [x] | T2.7 | `/v2/` 基础协议与错误格式 | T2.1、T2.2 | 1-2h |
 | [x] | T2.8 | Manifest GET / HEAD 与 tag / digest 解析 | T2.2、T2.3、T2.7 | 3h |
-| [ ] | T2.9 | Blob GET 与 307 预签名重定向 | T2.4、T2.6、T2.8 | 2-3h |
+| [x] | T2.9 | Blob GET 与 307 预签名重定向 | T2.4、T2.6、T2.8 | 2-3h |
 | [ ] | T2.10 | Blob 上传：POST / PUT | T2.4、T2.7 | 3h |
 | [ ] | T2.11 | 分块上传与断点续传：PATCH / GET / DELETE | T2.10 | 3h |
 | [ ] | T2.12 | Manifest PUT 与 tag 更新 | T2.3、T2.10、T2.11 | 2-3h |
@@ -481,6 +481,8 @@ images:
 **验收**：307 的 Location 可直接下载且过期失效；本地后端返回正确 `Content-Length` 与 `Docker-Content-Digest`；不存在返回 404 `BLOB_UNKNOWN`；客户端可通过两种模式完成下载。
 
 **依赖**：T2.4、T2.6、T2.8 · **预估**：2-3h
+
+> **备注**（2026-11-18，约 2h）：已完成。`registry/blobs.emo` 提供 `GET|HEAD /v2/<name>/blobs/<digest>`：路径按 `/blobs/` 切分（仓库名可含斜杠），先校验 digest（非法 → 400 `DIGEST_INVALID`），再要求 `blobs` 表把 digest 关联到该仓库、且后端对象存在——任一缺失都是 404 `BLOB_UNKNOWN`，detail 为 `<repo>@<digest>`。S3 模式下 GET 返回 307 + 预签名 Location（不经 registry 代理字节）；文件系统模式下 `presign_get` 返回 ""，路由回退到本地字节，带 `Content-Type`、`Docker-Content-Digest`、`Content-Length`。HEAD 从不重定向，直接返回元数据，优先用存储的大小记录，缺失时回退到数据库记录的大小。两种方法都先查 store 的 head，这样“数据库有记录但对象缺失”在本服务返回 404 而不是把 404 推给 CDN。链接查询是 `BlobLinks` 接口（`DbBlobLinks` 每请求短连接）；Service 现在分别携带 blob 健康探针与完整 BlobStore，`serve` 因此把具体 store 传两次——具体类型→接口是结构化兼容，health 仍只需要 `BlobHealth`。测试：`test/registry_blobs.emo` 14 个路由测试，编译版 `db_selftest` 新增 4 项 `DbBlobLinks` 检查；`emo test` 351/351，db selftest 75/75。已通过真实 HTTP 验证两种模式：fs GET/HEAD 返回精确字节/长度与 digest 头，缺失与非法 digest 是 OCI 404/400，POST 是 405 带 `Allow`；配合 S3 fixture，GET 返回 307，跟随 Location（fixture 会验签）成功下载对象，HEAD 是不带 Location 的直接 200。踩坑：本地路径同样会调用 `presign_get` 再回退（T2.4 的契约），测试要预期这次调用；httpd 对 307 打印的 reason phrase 是 "Unknown"（HTTP 上合法，包内没有该短语）。
 
 #### T2.10 Blob 上传：POST / PUT
 

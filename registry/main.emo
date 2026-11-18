@@ -74,7 +74,7 @@ def main() Int64 {
             eprint(why + "\n")
             return 1
           }
-          (R.ok, store) then { return serve(config, store) }
+          (R.ok, store) then { return serve(config, store, store) }
         }
       }
       // s3: the bucket is checked here, so a missing bucket or bad
@@ -84,13 +84,13 @@ def main() Int64 {
           eprint(why + "\n")
           return 1
         }
-        (R.ok, store) then { return serve(config, store) }
+        (R.ok, store) then { return serve(config, store, store) }
       }
     }
   }
 }
 
-def serve(config registry.config.RegistryConfig, blob registry.blobstore.BlobHealth) Int64 {
+def serve(config registry.config.RegistryConfig, blob_health registry.blobstore.BlobHealth, blob_store registry.blobstore.BlobStore) Int64 {
   // A stale marker from a previous run must not shut this one down.
   os.unlink(config.shutdown_file)
   const (R.ok, _) = os.signal_ignore(os.sig_term)
@@ -105,7 +105,8 @@ def serve(config registry.config.RegistryConfig, blob registry.blobstore.BlobHea
       const port = listener.port()
       const db_health = registry.db.Health.new(config.db_path)
       const manifests = registry.manifests.DbManifests.new(config.db_path)
-      const service = registry.router.Service.new(config, db_health, blob, manifests)
+      const blob_links = registry.blobs.DbBlobLinks.new(config.db_path)
+      const service = registry.router.Service.new(config, db_health, blob_health, blob_store, blob_links, manifests)
       const handler = -> (req httpd.Request) {
         return registry.router.handle(req, service)
       }

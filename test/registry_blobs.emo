@@ -1,0 +1,360 @@
+// T2.9 tests for the blob route — run with `emo test`.
+//
+// The link lookup and the blob store are fakes, so both backends' shapes run
+// in the interpreter: the local one serves bytes, the S3 one answers 307 with
+// a presigned Location, and HEAD never redirects.
+
+const blobs = registry.blobs
+const api = registry.api
+const blobstore = registry.blobstore
+
+require "httpd"
+require "json"
+
+const digest_value = "sha256:0f343b0931126a20f133d67c2b018a3a2a3f2f5e3a5b8a4a1f2e3d4c5b6a7980"
+
+class FakeLinks {
+  def init(found Bool, size Int64, failure String) {
+    self.found = found
+    self.size = size
+    self.failure = failure
+  }
+
+  def linked(repository String, digest String) (R, registry.blobs.BlobLink) {
+    if self.failure != "" {
+      return (R.error, self.failure)
+    }
+    return (R.ok, registry.blobs.BlobLink.new(self.found, self.size))
+  }
+}
+
+class FakeBlobStore {
+  def init(exists Bool, size Int64, body String, presign String, failure String) {
+    self.exists = exists
+    self.size = size
+    self.body = body
+    self.presign = presign
+    self.failure = failure
+    self.heads = Box.new(0)
+    self.gets = Box.new(0)
+    self.presigns = Box.new(0)
+  }
+
+  def head(digest String) (R, registry.blobstore.BlobInfo) {
+    self.heads.replace(self.heads.read() + 1)
+    if self.failure != "" {
+      return (R.error, self.failure)
+    }
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, self.size, self.exists))
+  }
+
+  def get(digest String) (R, String) {
+    self.gets.replace(self.gets.read() + 1)
+    if self.failure != "" {
+      return (R.error, self.failure)
+    }
+    if !self.exists {
+      return (R.error, blobstore.not_found(digest))
+    }
+    return (R.ok, self.body)
+  }
+
+  def presign_get(digest String, ttl_seconds Int64) String {
+    self.presigns.replace(self.presigns.read() + 1)
+    return self.presign
+  }
+
+  def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put")
+  }
+
+  def put_file(digest String, source String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put_file")
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    return (R.error, "fake: range")
+  }
+
+  def delete(digest String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def head_count() Int64 {
+    return self.heads.read()
+  }
+
+  def get_count() Int64 {
+    return self.gets.read()
+  }
+
+  def presign_count() Int64 {
+    return self.presigns.read()
+  }
+}
+
+def make_request(method String, path String) httpd.Request {
+  return httpd.Request.new(
+    method: method,
+    target: path,
+    path: path,
+    query: Map.new(),
+    proto: "HTTP/1.1",
+    headers: [],
+    body: "",
+    params: Map.new()
+  )
+}
+
+def header_value(headers Array[(String, String)], name String) String {
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == name.lower() {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+def error_field(body String, field String) String {
+  case json.decode(body) {
+    (R.error, _) then { return "" }
+    (R.ok, doc) then { return scan_errors(doc, field) }
+  }
+}
+
+def scan_errors(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == "errors" {
+        if value.is(json.JsonArray) {
+          const items = value.items()
+          if items.length() > 0 {
+            return scan_member(items[0], field)
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+def scan_member(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == field {
+        if value.is(json.JsonString) {
+          return value.as_string()
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+def local_store_exists() FakeBlobStore {
+  return FakeBlobStore.new(true, 5, "hello", "", "")
+}
+
+def s3_store(presign String) FakeBlobStore {
+  return FakeBlobStore.new(true, 5, "hello", presign, "")
+}
+
+def test_local_get_serves_the_bytes() {
+  const store = local_store_exists()
+  const response = blobs.handle(make_request("GET", "/v2/acme/team/app/blobs/" + digest_value), FakeLinks.new(true, 5, ""), store)
+  expect_equal(200, response.status)
+  expect_equal("hello", response.body)
+  expect_equal("application/octet-stream", header_value(response.headers, "content-type"))
+  expect_equal(digest_value, header_value(response.headers, "docker-content-digest"))
+  expect_equal("5", header_value(response.headers, "content-length"))
+  expect_equal(1, store.head_count())
+  // The local backend answers "" and the route falls back to get().
+  expect_equal(1, store.presign_count())
+  expect_equal(1, store.get_count())
+}
+
+def test_s3_get_redirects_with_a_presigned_location() {
+  const url = "https://minio.local/bucket/blobs/sha256:abc?X-Amz-Signature=deadbeef"
+  const store = s3_store(url)
+  const response = blobs.handle(make_request("GET", "/v2/acme/app/blobs/" + digest_value), FakeLinks.new(true, 5, ""), store)
+  expect_equal(307, response.status)
+  expect_equal(url, header_value(response.headers, "location"))
+  expect_equal(digest_value, header_value(response.headers, "docker-content-digest"))
+  expect_equal("", response.body)
+  expect_equal(1, store.presign_count())
+  expect_equal(0, store.get_count())
+}
+
+def test_head_never_redirects() {
+  const store = s3_store("https://minio.local/bucket/blob?X-Amz-Signature=deadbeef")
+  const response = blobs.handle(make_request("HEAD", "/v2/acme/app/blobs/" + digest_value), FakeLinks.new(true, 5, ""), store)
+  expect_equal(200, response.status)
+  expect_equal("", response.body)
+  expect_equal("5", header_value(response.headers, "content-length"))
+  expect_equal("", header_value(response.headers, "location"))
+  expect_equal(0, store.presign_count())
+  expect_equal(0, store.get_count())
+}
+
+def test_head_falls_back_to_the_recorded_size() {
+  const store = FakeBlobStore.new(true, -1, "hello", "", "")
+  const response = blobs.handle(make_request("HEAD", "/v2/acme/app/blobs/" + digest_value), FakeLinks.new(true, 42, ""), store)
+  expect_equal(200, response.status)
+  expect_equal("42", header_value(response.headers, "content-length"))
+}
+
+def test_missing_links_are_404s() {
+  const store = local_store_exists()
+  const response = blobs.handle(make_request("GET", "/v2/acme/app/blobs/" + digest_value), FakeLinks.new(false, -1, ""), store)
+  expect_equal(404, response.status)
+  expect_equal(api.code_blob_unknown, error_field(response.body, "code"))
+  expect_equal(0, store.head_count())
+}
+
+def test_a_linked_blob_missing_from_the_store_is_404() {
+  const store = FakeBlobStore.new(false, -1, "", "", "")
+  const response = blobs.handle(make_request("GET", "/v2/acme/app/blobs/" + digest_value), FakeLinks.new(true, 5, ""), store)
+  expect_equal(404, response.status)
+  expect_equal(api.code_blob_unknown, error_field(response.body, "code"))
+}
+
+def test_link_failures_are_500s() {
+  const store = local_store_exists()
+  const response = blobs.handle(make_request("GET", "/v2/acme/app/blobs/" + digest_value), FakeLinks.new(true, 5, "database is down"), store)
+  expect_equal(500, response.status)
+  expect_equal(api.code_unknown, error_field(response.body, "code"))
+}
+
+def test_store_failures_are_500s() {
+  const store = FakeBlobStore.new(true, 5, "hello", "", "s3 is unreachable")
+  const response = blobs.handle(make_request("GET", "/v2/acme/app/blobs/" + digest_value), FakeLinks.new(true, 5, ""), store)
+  expect_equal(500, response.status)
+  expect_true(error_field(response.body, "detail").index_of("s3 is unreachable") >= 0)
+}
+
+class GoneStore {
+  def init() {
+  }
+
+  def head(digest String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, 5, true))
+  }
+
+  def get(digest String) (R, String) {
+    return (R.error, blobstore.not_found(digest))
+  }
+
+  def presign_get(digest String, ttl_seconds Int64) String {
+    return ""
+  }
+
+  def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put")
+  }
+
+  def put_file(digest String, source String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put_file")
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    return (R.error, "fake: range")
+  }
+
+  def delete(digest String) (R, Bool) {
+    return (R.ok, false)
+  }
+}
+
+def test_a_store_not_found_during_get_is_404() {
+  const response = blobs.handle(make_request("GET", "/v2/acme/app/blobs/" + digest_value), FakeLinks.new(true, 5, ""), GoneStore.new())
+  expect_equal(404, response.status)
+  expect_equal(api.code_blob_unknown, error_field(response.body, "code"))
+}
+
+def test_invalid_digests_are_400s() {
+  const response = blobs.handle(make_request("GET", "/v2/acme/app/blobs/sha256:abc"), FakeLinks.new(true, 5, ""), local_store_exists())
+  expect_equal(400, response.status)
+  expect_equal(api.code_digest_invalid, error_field(response.body, "code"))
+}
+
+def test_unsupported_methods_are_405s() {
+  const response = blobs.handle(make_request("POST", "/v2/acme/app/blobs/" + digest_value), FakeLinks.new(true, 5, ""), local_store_exists())
+  expect_equal(405, response.status)
+  expect_equal("GET, HEAD", header_value(response.headers, "allow"))
+}
+
+def test_path_shapes() {
+  expect_true(blobs.is_route("/v2/acme/app/blobs/" + digest_value))
+  expect_true(!blobs.is_route("/v2/acme/app/manifests/latest"))
+  const parts = blobs.split("/v2/acme/team/app/blobs/" + digest_value)
+  expect_equal("acme/team/app", parts[0])
+  expect_equal(digest_value, parts[1])
+  expect_equal("", blobs.split("/v2/acme/app/blobs/a/b")[0])
+}
+
+def test_the_router_dispatches_blob_routes() {
+  const config = registry.config.RegistryConfig.new(
+    registry.config.RegistryListen.new("127.0.0.1", 5000),
+    "/tmp/pf-blobs-router",
+    "/tmp/pf-blobs-router/registry.db",
+    registry.config.RegistryStore.new("fs", "/tmp/pf-blobs-router/blobs", registry.config.default_s3()),
+    registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
+    "/tmp/pf-blobs-router/shutdown",
+    "<test>"
+  )
+  const service = registry.router.Service.new(
+    config,
+    BlobFakeDb.new(),
+    BlobFakeHealth.new(),
+    local_store_exists(),
+    FakeLinks.new(true, 5, ""),
+    BlobFakeManifests.new()
+  )
+  const response = registry.router.handle(make_request("GET", "/v2/acme/app/blobs/" + digest_value), service)
+  expect_equal(200, response.status)
+  expect_equal("hello", response.body)
+  expect_equal("registry/2.0", header_value(response.headers, "docker-distribution-api-version"))
+  expect_true(header_value(response.headers, "x-request-id") != "")
+}
+
+class BlobFakeDb {
+  def init() {
+  }
+
+  def ping() Bool {
+    return true
+  }
+
+  def path() String {
+    return "/tmp/fake.db"
+  }
+}
+
+class BlobFakeHealth {
+  def init() {
+  }
+
+  def probe() (R, String) {
+    return (R.ok, "fs:/tmp/fake")
+  }
+}
+
+class BlobFakeManifests {
+  def init() {
+  }
+
+  def lookup(repository String, reference String) (R, registry.manifests.ManifestPayload) {
+    return (R.ok, registry.manifests.absent_payload())
+  }
+}

@@ -22,6 +22,7 @@
 | [registry-s3.md](registry-s3.md) | S3/MinIO backend, addressing, signed requests, retries, presigning, startup bucket check (M2/T2.6). | `registry/s3_blobstore.emo` |
 | [registry-api.md](registry-api.md) | `/v2/` probe, OCI error envelope and codes, request ids, routing (M2/T2.7). | `registry/api.emo`, `registry/router.emo` |
 | [registry-manifests.md](registry-manifests.md) | Manifest GET/HEAD by tag or digest, Accept, integrity, 404s (M2/T2.8). | `registry/manifests.emo` |
+| [registry-blobs.md](registry-blobs.md) | Blob GET/HEAD, 307 presigned redirects, link checks (M2/T2.9). | `registry/blobs.emo` |
 
 ## M1 flow
 

@@ -91,6 +91,7 @@ def main() Int64 {
   check_tags(report, db)
   check_blobs(report, db)
   check_manifest_store(report, db, path)
+  check_blob_links(report, db, path)
   check_uploads(report, db)
   check_cascades(report, db)
   db.close()
@@ -211,6 +212,29 @@ def check_manifest_store(report Report, db registry.db.Database, path String) {
   }
   case store.lookup("nope/nope", "latest") {
     (R.ok, payload) then { report.check(!payload.found, "an unknown repository is absent") }
+    (R.error, why) then { report.check(false, "unknown-repository lookup failed: " + why) }
+  }
+}
+
+// The T2.9 link lookup: a blob row is the repository's claim on the digest.
+def check_blob_links(report Report, db registry.db.Database, path String) {
+  const repo = db.ensure_repository("links/check")
+  const digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  report.check(db.put_blob(repo, digest, 1234), "put_blob links the digest")
+  const links = registry.blobs.DbBlobLinks.new(path)
+  case links.linked("links/check", digest) {
+    (R.ok, link) then {
+      report.check(link.found, "a linked blob is found")
+      report.check(link.size == 1234, "the linked size round-trips")
+    }
+    (R.error, why) then { report.check(false, "blob link lookup failed: " + why) }
+  }
+  case links.linked("links/check", "sha256:3333333333333333333333333333333333333333333333333333333333333333") {
+    (R.ok, link) then { report.check(!link.found, "an unlinked digest is absent") }
+    (R.error, why) then { report.check(false, "unlinked lookup failed: " + why) }
+  }
+  case links.linked("nope/nope", digest) {
+    (R.ok, link) then { report.check(!link.found, "an unknown repository has no links") }
     (R.error, why) then { report.check(false, "unknown-repository lookup failed: " + why) }
   }
 }

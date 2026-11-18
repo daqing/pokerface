@@ -1,0 +1,158 @@
+// T2.9: `GET|HEAD /v2/<name>/blobs/<digest>`. The local backend answers the
+// bytes itself; the S3 backend answers 307 with a presigned Location, so the
+// client downloads from the object store instead of through the registry.
+// HEAD always answers metadata directly — a redirect on HEAD would force a
+// second request just to learn a length.
+//
+// A blob must be linked to the repository (the `blobs` table owns that
+// relation) and must exist in the backend; either miss is 404 BLOB_UNKNOWN.
+// The digest is validated before any lookup, so `sha256:` garbage cannot reach
+// a store path. HEAD and GET both consult the backend's head first: a presigned
+// URL for a missing object would otherwise answer 404 at the CDN, not here.
+//
+// The link lookup is an interface (BlobLinks), like the manifest store, so the
+// route runs in the interpreter against a fake; DbBlobLinks is the SQLite
+// implementation, opening a short-lived connection per request.
+// Spec: docs/spec/registry-blobs.md.
+
+require "httpd"
+require "json"
+
+const route_prefix = "/v2/"
+const route_marker = "/blobs/"
+const content_type = "application/octet-stream"
+
+class BlobLink {
+  def init(found Bool, size Int64) {
+    self.found = found
+    self.size = size
+  }
+}
+
+def absent_link() BlobLink {
+  return BlobLink.new(false, -1)
+}
+
+interface BlobLinks {
+  def linked(repository String, digest String) (R, BlobLink)
+}
+
+class DbBlobLinks {
+  def init(db_path String) {
+    self.db_path = db_path
+  }
+
+  def linked(repository String, digest String) (R, BlobLink) {
+    const db = registry.db.connect(self.db_path)
+    const repository_id = db.repository_id(repository)
+    if repository_id == 0 {
+      db.close()
+      return (R.ok, absent_link())
+    }
+    const size = db.blob_size(repository_id, digest)
+    db.close()
+    if size < 0 {
+      return (R.ok, absent_link())
+    }
+    return (R.ok, BlobLink.new(true, size))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Routing.
+
+def is_route(path String) Bool {
+  if !path.starts_with(route_prefix) {
+    return false
+  }
+  return path.index_of(route_marker) >= 0
+}
+
+// "/v2/acme/app/blobs/sha256:..." → ("acme/app", "sha256:...")
+def split(path String) (String, String) {
+  if !path.starts_with(route_prefix) {
+    return ("", "")
+  }
+  const rest = path.substring(route_prefix.length(), path.length() - route_prefix.length())
+  const at = rest.index_of(route_marker)
+  if at <= 0 {
+    return ("", "")
+  }
+  const repository = rest.substring(0, at)
+  const digest = rest.substring(at + route_marker.length(), rest.length() - at - route_marker.length())
+  if digest == "" || digest.index_of("/") >= 0 {
+    return ("", "")
+  }
+  return (repository, digest)
+}
+
+def handle(req httpd.Request, links BlobLinks, store registry.blobstore.BlobStore) httpd.Response {
+  if req.method != "GET" && req.method != "HEAD" {
+    return registry.api.method_not_allowed("GET, HEAD")
+  }
+  const parts = split(req.path)
+  const repository = parts[0]
+  const digest = parts[1]
+  if repository == "" || digest == "" {
+    return registry.api.not_found(registry.api.code_blob_unknown, "blob unknown", req.path)
+  }
+  if registry.digest.hex(digest) == "" {
+    return registry.api.bad_request(registry.api.code_digest_invalid, "invalid digest", digest)
+  }
+  case links.linked(repository, digest) {
+    (R.error, why) then { return registry.api.server_error("blob lookup failed", why) }
+    (R.ok, link) then {
+      if !link.found {
+        return registry.api.not_found(registry.api.code_blob_unknown, "blob unknown", repository + "@" + digest)
+      }
+      case store.head(digest) {
+        (R.error, why) then { return registry.api.server_error("blob store lookup failed", why) }
+        (R.ok, info) then {
+          if !info.exists {
+            return registry.api.not_found(registry.api.code_blob_unknown, "blob unknown", repository + "@" + digest)
+          }
+          if req.method == "HEAD" {
+            return head_response(digest, size_of(info.size, link.size))
+          }
+          const url = store.presign_get(digest, 0)
+          if url != "" {
+            return httpd.response(307, [("Location", url), ("Docker-Content-Digest", digest)], "")
+          }
+          case store.get(digest) {
+            (R.error, why) then {
+              if registry.blobstore.is_not_found(why) {
+                return registry.api.not_found(registry.api.code_blob_unknown, "blob unknown", repository + "@" + digest)
+              }
+              return registry.api.server_error("blob read failed", why)
+            }
+            (R.ok, body) then {
+              return httpd.response(200, [
+                ("Content-Type", content_type),
+                ("Docker-Content-Digest", digest),
+                ("Content-Length", body.to_bytes().length().to_string())
+              ], body)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+def size_of(store_size Int64, link_size Int64) Int64 {
+  if store_size >= 0 {
+    return store_size
+  }
+  return link_size
+}
+
+def head_response(digest String, size Int64) httpd.Response {
+  var headers = [
+    ("Content-Type", content_type),
+    ("Docker-Content-Digest", digest)
+  ]
+  if size >= 0 {
+    headers = headers.append(("Content-Length", size.to_string()))
+  }
+  return httpd.response(200, headers, "")
+}

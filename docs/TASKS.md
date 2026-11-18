@@ -354,7 +354,7 @@ Exit criteria:
 | [x] | T2.6 | S3 / MinIO BlobStore adapter | T2.4, T2.5 | 3h |
 | [x] | T2.7 | `/v2/` base protocol and error format | T2.1, T2.2 | 1-2h |
 | [x] | T2.8 | Manifest GET / HEAD and tag / digest resolution | T2.2, T2.3, T2.7 | 3h |
-| [ ] | T2.9 | Blob GET and 307 presigned redirect | T2.4, T2.6, T2.8 | 2-3h |
+| [x] | T2.9 | Blob GET and 307 presigned redirect | T2.4, T2.6, T2.8 | 2-3h |
 | [ ] | T2.10 | Blob upload: POST / PUT | T2.4, T2.7 | 3h |
 | [ ] | T2.11 | Chunked upload and resumable transfers: PATCH / GET / DELETE | T2.10 | 3h |
 | [ ] | T2.12 | Manifest PUT and tag updates | T2.3, T2.10, T2.11 | 2-3h |
@@ -481,6 +481,8 @@ Suggested tables:
 **Acceptance**: The URL in the 307 `Location` downloads directly and expires; the local backend returns the correct `Content-Length` and `Docker-Content-Digest`; missing blobs return 404 `BLOB_UNKNOWN`; the client works in both modes.
 
 **Depends on**: T2.4, T2.6, T2.8 · **Estimate**: 2-3h
+
+> **Notes** (2026-11-18, ~2h): Done. `registry/blobs.emo` serves `GET|HEAD /v2/<name>/blobs/<digest>`: the path splits on `/blobs/` (repository names may contain slashes), the digest is validated first (400 `DIGEST_INVALID`), and the route requires both a `blobs` row linking the digest to the repository and a present object in the backend — either miss is 404 `BLOB_UNKNOWN` with `<repo>@<digest>`. On S3, GET answers 307 with a presigned Location (no bytes proxied); on the filesystem, `presign_get` returns "" and the route falls back to the local bytes with `Content-Type`, `Docker-Content-Digest`, and `Content-Length`. HEAD never redirects and answers metadata directly, preferring the store's size record and falling back to the DB's. Both methods consult the store's head first, so a presigned URL for a missing object is a 404 here rather than at the CDN. The link lookup is a `BlobLinks` interface (`DbBlobLinks` opens a short-lived SQLite connection per request); the Service now carries the blob health probe and the full blob store separately, so `serve` takes the concrete store twice — concrete→interface passes structurally, and health stays a `BlobHealth`. Tests: 14 route tests in `test/registry_blobs.emo` plus 4 checks in the compiled `db_selftest` for `DbBlobLinks`; `emo test` 351/351, db selftest 75/75. Manually verified on the wire in both modes: fs GET/HEAD return the exact bytes/length with the digest header, missing and invalid digests are the OCI 404/400, POST is 405 with `Allow`; with the S3 fixture, GET returns a 307 whose Location (signature verified by the fixture) downloads the object on follow, and HEAD is a direct 200 without Location. Gotchas: the local path calls `presign_get` too and falls back — the fallback contract from T2.4 — so a test must expect that call; httpd prints 307 with reason phrase "Unknown" (valid HTTP; the package has no phrase for it).
 
 #### T2.10 Blob Upload: POST / PUT
 

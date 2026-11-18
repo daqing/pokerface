@@ -78,6 +78,48 @@ class ApiFakeBlob {
   }
 }
 
+class ApiFakeBlobStore {
+  def init() {
+  }
+
+  def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put")
+  }
+
+  def put_file(digest String, source String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put_file")
+  }
+
+  def get(digest String) (R, String) {
+    return (R.error, "fake: get")
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    return (R.error, "fake: range")
+  }
+
+  def head(digest String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, -1, false))
+  }
+
+  def delete(digest String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def presign_get(digest String, ttl_seconds Int64) String {
+    return ""
+  }
+}
+
+class ApiFakeBlobLinks {
+  def init() {
+  }
+
+  def linked(repository String, digest String) (R, registry.blobs.BlobLink) {
+    return (R.ok, registry.blobs.absent_link())
+  }
+}
+
 def make_request(method String, path String) httpd.Request {
   return make_request_with(method, path, [])
 }
@@ -96,7 +138,7 @@ def make_request_with(method String, path String, headers Array[(String, String)
 }
 
 def make_service(name String) registry.router.Service {
-  return registry.router.Service.new(make_config(name), ApiFakeDb.new(true), ApiFakeBlob.new(true), ApiFakeManifests.new())
+  return registry.router.Service.new(make_config(name), ApiFakeDb.new(true), ApiFakeBlob.new(true), ApiFakeBlobStore.new(), ApiFakeBlobLinks.new(), ApiFakeManifests.new())
 }
 
 def route(method String, path String) httpd.Response {
