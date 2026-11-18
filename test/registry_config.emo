@@ -1,0 +1,235 @@
+// T2.1 tests for the registry configuration — run with `emo test`.
+
+const reg_config = registry.config
+
+require "file"
+
+def reg_tmp_base() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def reg_tmp(name String) String {
+  return reg_tmp_base() + "pokerface-registry-cfg-" + os.getpid().to_string() + "-" + name
+}
+
+def write_config(path String, text String) {
+  case file.write(path, text) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("cannot write " + path + ": " + why) }
+  }
+}
+
+class RegFakeEnv {
+  def init(values Map[String, String]) {
+    self.values = values
+  }
+
+  def getenv(name String) (R, String) {
+    if self.values.has(name) {
+      return (R.ok, self.values.get(name))
+    }
+    return (R.error, "os: getenv " + name + ": is not set")
+  }
+}
+
+def env_empty() RegFakeEnv {
+  return RegFakeEnv.new(Map.new())
+}
+
+def full_config() String {
+  return (
+    "listen:\n"
+    + "  host: 127.0.0.1\n"
+    + "  port: 5100\n"
+    + "data_dir: /tmp/reg-data\n"
+    + "store:\n"
+    + "  backend: fs\n"
+    + "  root: /tmp/reg-blobs\n"
+    + "limits:\n"
+    + "  max_body_bytes: 2048\n"
+    + "  max_header_bytes: 1024\n"
+    + "  read_timeout: 10\n"
+    + "  idle_timeout: 2\n"
+    + "shutdown_file: /tmp/reg-stop\n"
+  )
+}
+
+def expect_config_ok(result (R, registry.config.RegistryConfig), label String) registry.config.RegistryConfig {
+  case result {
+    (R.ok, config) then { return config }
+    (R.error, why) then {
+      expect_fail(label + " failed: " + why)
+      return registry.config.RegistryConfig.new(
+        registry.config.RegistryListen.new("", 0),
+        "",
+        registry.config.RegistryStore.new("", ""),
+        registry.config.RegistryLimits.new(0, 0, 0, 0),
+        "",
+        ""
+      )
+    }
+  }
+}
+
+def test_full_config_parses() {
+  const path = reg_tmp("full.yaml")
+  write_config(path, full_config())
+  const config = expect_config_ok(reg_config.load(env_empty(), path), "load")
+  expect_equal("127.0.0.1", config.listen.host)
+  expect_equal(5100, config.listen.port)
+  expect_equal("/tmp/reg-data", config.data_dir)
+  expect_equal("fs", config.store.backend)
+  expect_equal("/tmp/reg-blobs", config.store.root)
+  expect_equal(2048, config.limits.max_body_bytes)
+  expect_equal(1024, config.limits.max_header_bytes)
+  expect_equal(10, config.limits.read_timeout)
+  expect_equal(2, config.limits.idle_timeout)
+  expect_equal("/tmp/reg-stop", config.shutdown_file)
+  expect_equal(path, config.config_path)
+}
+
+def test_defaults_apply_to_an_empty_mapping() {
+  const path = reg_tmp("empty.yaml")
+  write_config(path, "{}\n")
+  const config = expect_config_ok(reg_config.load(env_empty(), path), "load")
+  expect_equal("127.0.0.1", config.listen.host)
+  expect_equal(5000, config.listen.port)
+  expect_equal("./data", config.data_dir)
+  expect_equal("fs", config.store.backend)
+  expect_equal("./data/blobs", config.store.root)
+  expect_equal(16777216, config.limits.max_body_bytes)
+  expect_equal("./data/registry.shutdown", config.shutdown_file)
+}
+
+def test_missing_config_is_a_clear_error() {
+  const path = reg_tmp("missing.yaml")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, _) then { expect_fail("expected a missing-config error") }
+    (R.error, why) then {
+      expect_true(why.index_of("config " + path + " not found") >= 0)
+      expect_true(why.index_of("--config") >= 0)
+    }
+  }
+}
+
+def test_env_path_is_used_when_no_flag() {
+  const path = reg_tmp("envpath.yaml")
+  write_config(path, full_config())
+  const env = RegFakeEnv.new(Map.new(("POKERFACE_REGISTRY_CONFIG", path)))
+  const config = expect_config_ok(reg_config.load(env, ""), "load")
+  expect_equal(5100, config.listen.port)
+  expect_equal(path, config.config_path)
+}
+
+def test_flag_path_wins_over_env_path() {
+  const flag = reg_tmp("flagwin.yaml")
+  const env_path = reg_tmp("envlose.yaml")
+  write_config(flag, full_config())
+  write_config(env_path, "listen:\n  port: 5999\n")
+  const env = RegFakeEnv.new(Map.new(("POKERFACE_REGISTRY_CONFIG", env_path)))
+  const config = expect_config_ok(reg_config.load(env, flag), "load")
+  expect_equal(5100, config.listen.port)
+}
+
+def test_env_overrides_file_values() {
+  const path = reg_tmp("envover.yaml")
+  write_config(path, full_config())
+  const env = RegFakeEnv.new(Map.new(
+    ("POKERFACE_REGISTRY_LISTEN", "0.0.0.0:6000"),
+    ("POKERFACE_REGISTRY_DATA_DIR", "/tmp/env-data"),
+    ("POKERFACE_REGISTRY_STORE_BACKEND", "s3"),
+    ("POKERFACE_REGISTRY_STORE_ROOT", "bucket/key"),
+    ("POKERFACE_REGISTRY_MAX_BODY_BYTES", "4096"),
+    ("POKERFACE_REGISTRY_MAX_HEADER_BYTES", "2048"),
+    ("POKERFACE_REGISTRY_READ_TIMEOUT", "7"),
+    ("POKERFACE_REGISTRY_IDLE_TIMEOUT", "3"),
+    ("POKERFACE_REGISTRY_SHUTDOWN_FILE", "/tmp/env-stop")
+  ))
+  const config = expect_config_ok(reg_config.load(env, path), "load")
+  expect_equal("0.0.0.0", config.listen.host)
+  expect_equal(6000, config.listen.port)
+  expect_equal("/tmp/env-data", config.data_dir)
+  expect_equal("s3", config.store.backend)
+  expect_equal("bucket/key", config.store.root)
+  expect_equal(4096, config.limits.max_body_bytes)
+  expect_equal(2048, config.limits.max_header_bytes)
+  expect_equal(7, config.limits.read_timeout)
+  expect_equal(3, config.limits.idle_timeout)
+  expect_equal("/tmp/env-stop", config.shutdown_file)
+}
+
+def test_unknown_fields_are_rejected() {
+  const path = reg_tmp("unknown.yaml")
+  write_config(path, "bogus: 1\n")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, _) then { expect_fail("expected an unknown-field error") }
+    (R.error, why) then { expect_true(why.index_of("bogus: unknown field") >= 0) }
+  }
+  write_config(path, "listen:\n  bogus: 1\n")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, _) then { expect_fail("expected a nested unknown-field error") }
+    (R.error, why) then { expect_true(why.index_of("listen.bogus: unknown field") >= 0) }
+  }
+}
+
+def test_invalid_values_are_rejected() {
+  const path = reg_tmp("invalid.yaml")
+  write_config(path, "listen:\n  port: 70000\n")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, _) then { expect_fail("expected a port error") }
+    (R.error, why) then { expect_true(why.index_of("between 0 and 65535") >= 0) }
+  }
+  write_config(path, "store:\n  backend: nope\n")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, _) then { expect_fail("expected a backend error") }
+    (R.error, why) then { expect_true(why.index_of("unknown backend 'nope'") >= 0) }
+  }
+  write_config(path, "limits:\n  max_body_bytes: 0\n")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, _) then { expect_fail("expected a limit error") }
+    (R.error, why) then { expect_true(why.index_of("max_body_bytes: must be positive") >= 0) }
+  }
+  write_config(path, "listen:\n  host: \"\"\n")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, _) then { expect_fail("expected a host error") }
+    (R.error, why) then { expect_true(why.index_of("listen.host: must not be empty") >= 0) }
+  }
+}
+
+def test_invalid_env_values_are_rejected() {
+  const path = reg_tmp("badenv.yaml")
+  write_config(path, "{}\n")
+  const bad_listen = RegFakeEnv.new(Map.new(("POKERFACE_REGISTRY_LISTEN", "nope")))
+  case reg_config.load(bad_listen, path) {
+    (R.ok, _) then { expect_fail("expected a listen error") }
+    (R.error, why) then { expect_true(why.index_of("POKERFACE_REGISTRY_LISTEN") >= 0) }
+  }
+  const bad_int = RegFakeEnv.new(Map.new(("POKERFACE_REGISTRY_MAX_BODY_BYTES", "lots")))
+  case reg_config.load(bad_int, path) {
+    (R.ok, _) then { expect_fail("expected an integer error") }
+    (R.error, why) then { expect_true(why.index_of("POKERFACE_REGISTRY_MAX_BODY_BYTES") >= 0) }
+  }
+}
+
+def test_summary_contains_the_effective_values() {
+  const path = reg_tmp("summary.yaml")
+  write_config(path, full_config())
+  const config = expect_config_ok(reg_config.load(env_empty(), path), "load")
+  const text = reg_config.summary(config)
+  expect_true(text.index_of("listen=127.0.0.1:5100") >= 0)
+  expect_true(text.index_of("store=fs:/tmp/reg-blobs") >= 0)
+  expect_true(text.index_of("max_body=2048") >= 0)
+  expect_true(text.index_of("shutdown_file=/tmp/reg-stop") >= 0)
+}

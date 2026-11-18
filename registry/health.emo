@@ -1,0 +1,129 @@
+// T2.1: health and readiness for the registry service. /healthz is liveness
+// (the process is answering); /readyz runs the configured checks — the data
+// directory and the blob store must be usable — and answers 503 with the
+// failed check names when they are not. T2.2 adds the database check, T2.6 the
+// S3 store.
+
+require "os"
+require "file"
+require "httpd"
+
+class HealthCheck {
+  def init(name String, ok Bool, detail String) {
+    self.name = name
+    self.ok = ok
+    self.detail = detail
+  }
+}
+
+def health_response() httpd.Response {
+  return httpd.response(200, [("Content-Type", "text/plain; charset=utf-8")], "ok\n")
+}
+
+def ready_response(config registry.config.RegistryConfig) httpd.Response {
+  const results = checks(config)
+  var failed = ""
+  var count = 0
+  var i = 0
+  while i < results.length() {
+    if !results[i].ok {
+      if count > 0 {
+        failed = failed + "; "
+      }
+      failed = failed + results[i].name + ": " + results[i].detail
+      count = count + 1
+    }
+    i = i + 1
+  }
+  if count == 0 {
+    return httpd.response(200, [("Content-Type", "text/plain; charset=utf-8")], "ready\n")
+  }
+  return httpd.response(503, [("Content-Type", "text/plain; charset=utf-8")], "not ready: " + failed + "\n")
+}
+
+def ready(config registry.config.RegistryConfig) Bool {
+  const results = checks(config)
+  var i = 0
+  while i < results.length() {
+    if !results[i].ok {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+def checks(config registry.config.RegistryConfig) Array[HealthCheck] {
+  return [data_dir_check(config.data_dir), store_check(config.store)]
+}
+
+def data_dir_check(path String) HealthCheck {
+  case ensure_writable(path) {
+    (R.ok, _) then { return HealthCheck.new("data_dir", true, path) }
+    (R.error, why) then { return HealthCheck.new("data_dir", false, path + " (" + why + ")") }
+  }
+}
+
+def store_check(store registry.config.RegistryStore) HealthCheck {
+  if store.backend == "fs" {
+    case ensure_writable(store.root) {
+      (R.ok, _) then { return HealthCheck.new("store", true, "fs:" + store.root) }
+      (R.error, why) then { return HealthCheck.new("store", false, "fs:" + store.root + " (" + why + ")") }
+    }
+  }
+  if store.backend == "s3" {
+    return HealthCheck.new("store", false, "s3 backend is not implemented until T2.6 (" + store.root + ")")
+  }
+  return HealthCheck.new("store", false, "unknown backend '" + store.backend + "'")
+}
+
+// Creates the directory when absent and proves it is writable with a probe
+// file (unique per process, removed immediately). Read-only mounts, a path
+// occupied by a file, and missing permissions all fail here.
+def ensure_writable(path String) (R, Bool) {
+  case os.mkdir(path) {
+    (R.ok, _) then { }
+    (R.error, _) then {
+      case os.list_dir(path) {
+        (R.ok, _) then { }
+        (R.error, why) then { return (R.error, "not a directory: " + why) }
+      }
+    }
+  }
+  const probe = path + "/.readyz-" + os.getpid().to_string()
+  case file.write(probe, "ok") {
+    (R.error, why) then { return (R.error, "not writable: " + why) }
+    (R.ok, _) then {
+      os.unlink(probe)
+      return (R.ok, true)
+    }
+  }
+}
+
+// T2.1 routing: the two health endpoints plus a placeholder /v2/ so a
+// standard registry probe succeeds before T2.7 lands.
+def handle(req httpd.Request, config registry.config.RegistryConfig) httpd.Response {
+  if req.path == "/healthz" {
+    if req.method != "GET" {
+      return method_not_allowed()
+    }
+    return health_response()
+  }
+  if req.path == "/readyz" {
+    if req.method != "GET" {
+      return method_not_allowed()
+    }
+    return ready_response(config)
+  }
+  if req.path == "/v2/" {
+    if req.method != "GET" {
+      return method_not_allowed()
+    }
+    return httpd.response(200, [("Content-Type", "application/json")], "{}")
+  }
+  return httpd.response(404, [("Content-Type", "text/plain; charset=utf-8")], "not found\n")
+}
+
+def method_not_allowed() httpd.Response {
+  return httpd.response(405, [("Allow", "GET"), ("Content-Type", "text/plain; charset=utf-8")], "method not allowed\n")
+}

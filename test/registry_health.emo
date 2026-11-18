@@ -1,0 +1,114 @@
+// T2.1 tests for health/readiness — run with `emo test`.
+
+const reg_health = registry.health
+const reg_config = registry.config
+
+require "file"
+require "httpd"
+
+def health_tmp_base() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def health_tmp(name String) String {
+  return health_tmp_base() + "pokerface-registry-health-" + os.getpid().to_string() + "-" + name
+}
+
+def make_config(data_dir String, store_root String, backend String) registry.config.RegistryConfig {
+  return registry.config.RegistryConfig.new(
+    registry.config.RegistryListen.new("127.0.0.1", 5000),
+    data_dir,
+    registry.config.RegistryStore.new(backend, store_root),
+    registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
+    data_dir + "/registry.shutdown",
+    "<test>"
+  )
+}
+
+def dir_exists(path String) Bool {
+  case os.list_dir(path) {
+    (R.ok, _) then { return true }
+    (R.error, _) then { return false }
+  }
+}
+
+def write_blocking_file(path String) {
+  case file.write(path, "not a directory") {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("cannot create " + path + ": " + why) }
+  }
+}
+
+def test_health_is_always_ok() {
+  const response = reg_health.health_response()
+  expect_equal(200, response.status)
+  expect_equal("ok\n", response.body)
+}
+
+def test_ready_when_directories_are_writable() {
+  const data = health_tmp("data")
+  const store = health_tmp("store")
+  const config = make_config(data, store, "fs")
+  const response = reg_health.ready_response(config)
+  expect_equal(200, response.status)
+  expect_equal("ready\n", response.body)
+  expect_true(reg_health.ready(config))
+  expect_true(dir_exists(data))
+  expect_true(dir_exists(store))
+  case os.list_dir(data) {
+    (R.ok, entries) then { expect_equal(0, entries.length()) }
+    (R.error, why) then { expect_fail("cannot list " + data + ": " + why) }
+  }
+}
+
+def test_ready_is_503_when_data_dir_is_not_usable() {
+  const blocked = health_tmp("blocked-data")
+  write_blocking_file(blocked)
+  const store = health_tmp("store-ok")
+  const config = make_config(blocked, store, "fs")
+  expect_true(!reg_health.ready(config))
+  const response = reg_health.ready_response(config)
+  expect_equal(503, response.status)
+  expect_true(response.body.index_of("data_dir") >= 0)
+}
+
+def test_ready_is_503_when_store_is_not_usable() {
+  const data = health_tmp("data-ok")
+  const blocked = health_tmp("blocked-store")
+  write_blocking_file(blocked)
+  const config = make_config(data, blocked, "fs")
+  expect_true(!reg_health.ready(config))
+  const response = reg_health.ready_response(config)
+  expect_equal(503, response.status)
+  expect_true(response.body.index_of("store") >= 0)
+}
+
+def test_s3_store_is_not_ready_until_implemented() {
+  const data = health_tmp("data-s3")
+  const config = make_config(data, "bucket/key", "s3")
+  expect_true(!reg_health.ready(config))
+  const response = reg_health.ready_response(config)
+  expect_equal(503, response.status)
+  expect_true(response.body.index_of("s3 backend is not implemented") >= 0)
+}
+
+def test_method_not_allowed() {
+  const response = reg_health.method_not_allowed()
+  expect_equal(405, response.status)
+  const (name, value) = response.headers[0]
+  expect_equal("Allow", name)
+  expect_equal("GET", value)
+  expect_equal("method not allowed\n", response.body)
+}

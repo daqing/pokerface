@@ -1,0 +1,22 @@
+# Registry service configuration (T2.1).
+# Copy to ./registry.yaml, or pass this file with --config.
+
+listen:
+  host: 127.0.0.1
+  port: 5000
+
+data_dir: ./data
+
+store:
+  backend: fs
+  root: ./data/blobs
+
+limits:
+  max_body_bytes: 16777216
+  max_header_bytes: 1048576
+  read_timeout: 30
+  idle_timeout: 5
+
+# Optional; defaults to <data_dir>/registry.shutdown. scripts/run-registry.sh
+# overrides it with POKERFACE_REGISTRY_SHUTDOWN_FILE.
+# shutdown_file: ./data/registry.shutdown

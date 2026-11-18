@@ -1,0 +1,510 @@
+// T2.1: registry service configuration — YAML file + environment overrides,
+// strict field checking, and one validated value the entry point can trust.
+// Spec: docs/spec/registry-config.md.
+
+require "yaml"
+require "file"
+
+const default_host = "127.0.0.1"
+const default_port = 5000
+const default_data_dir = "./data"
+const default_store_backend = "fs"
+const default_store_root = "./data/blobs"
+const default_max_body_bytes = 16777216
+const default_max_header_bytes = 1048576
+const default_read_timeout = 30
+const default_idle_timeout = 5
+const shutdown_file_name = "registry.shutdown"
+const known_backends = ["fs", "s3"]
+
+class RegistryListen {
+  def init(host String, port Int64) {
+    self.host = host
+    self.port = port
+  }
+}
+
+class RegistryLimits {
+  def init(max_body_bytes Int64, max_header_bytes Int64, read_timeout Int64, idle_timeout Int64) {
+    self.max_body_bytes = max_body_bytes
+    self.max_header_bytes = max_header_bytes
+    self.read_timeout = read_timeout
+    self.idle_timeout = idle_timeout
+  }
+}
+
+class RegistryStore {
+  def init(backend String, root String) {
+    self.backend = backend
+    self.root = root
+  }
+}
+
+class RegistryConfig {
+  def init(listen RegistryListen, data_dir String, store RegistryStore, limits RegistryLimits, shutdown_file String, config_path String) {
+    self.listen = listen
+    self.data_dir = data_dir
+    self.store = store
+    self.limits = limits
+    self.shutdown_file = shutdown_file
+    self.config_path = config_path
+  }
+}
+
+def cfg_error(path String, message String) String {
+  return "registry: " + path + ": " + message
+}
+
+def defaults(config_path String) RegistryConfig {
+  return RegistryConfig.new(
+    RegistryListen.new(default_host, default_port),
+    default_data_dir,
+    RegistryStore.new(default_store_backend, default_store_root),
+    RegistryLimits.new(default_max_body_bytes, default_max_header_bytes, default_read_timeout, default_idle_timeout),
+    "",
+    config_path
+  )
+}
+
+// Path precedence: --config > POKERFACE_REGISTRY_CONFIG > ./registry.yaml.
+// Unlike the client, the service requires a configuration file: a missing one
+// is a startup error naming the path.
+def load(env src.settings.EnvSource, config_flag String) (R, RegistryConfig) {
+  case resolve_path(env, config_flag) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, path) then {
+      case file.read(path) {
+        (R.error, why) then {
+          return (R.error, "registry: config " + path + " not found: " + why + " (create " + path + " or pass --config)")
+        }
+        (R.ok, text) then {
+          case from_text(text, path) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, parsed) then { return apply_env(parsed, env) }
+          }
+        }
+      }
+    }
+  }
+}
+
+def resolve_path(env src.settings.EnvSource, config_flag String) (R, String) {
+  if config_flag != "" {
+    return (R.ok, config_flag)
+  }
+  var from_env = ""
+  case env.getenv("POKERFACE_REGISTRY_CONFIG") {
+    (R.ok, v) then { from_env = v }
+    (R.error, _) then { from_env = "" }
+  }
+  if from_env != "" {
+    return (R.ok, from_env)
+  }
+  return (R.ok, "registry.yaml")
+}
+
+def from_text(text String, path String) (R, RegistryConfig) {
+  case yaml.decode(text) {
+    (R.error, why) then { return (R.error, cfg_error(path, "invalid YAML — " + why)) }
+    (R.ok, doc) then { return from_yaml(doc, path) }
+  }
+}
+
+def from_yaml(doc yaml.Yaml, path String) (R, RegistryConfig) {
+  if doc.is(yaml.YamlObject) {
+    var config = defaults(path)
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      case key {
+        "listen" then {
+          case parse_listen(value, path) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, listen) then { config = with_listen(config, listen) }
+          }
+        }
+        "data_dir" then {
+          case string_value(value, path, "data_dir") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { config = with_data_dir(config, text) }
+          }
+        }
+        "store" then {
+          case parse_store(value, path) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, store) then { config = with_store(config, store) }
+          }
+        }
+        "limits" then {
+          case parse_limits(value, path) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, limits) then { config = with_limits(config, limits) }
+          }
+        }
+        "shutdown_file" then {
+          case string_value(value, path, "shutdown_file") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { config = with_shutdown_file(config, text) }
+          }
+        }
+        _ then {
+          return (R.error, cfg_error(path, key + ": unknown field (known: listen, data_dir, store, limits, shutdown_file)"))
+        }
+      }
+      i = i + 1
+    }
+    return (R.ok, config)
+  }
+  return (R.error, cfg_error(path, "expected a mapping at the top level, got " + kind_word(doc.kind())))
+}
+
+def parse_listen(value yaml.Yaml, path String) (R, RegistryListen) {
+  if value.is(yaml.YamlObject) {
+    var host = default_host
+    var port = default_port
+    const entries = value.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, v) = entries[i]
+      case key {
+        "host" then {
+          case string_value(v, path, "listen.host") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { host = text }
+          }
+        }
+        "port" then {
+          case int_value(v, path, "listen.port") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, n) then { port = n }
+          }
+        }
+        _ then {
+          return (R.error, cfg_error(path, "listen." + key + ": unknown field (known: host, port)"))
+        }
+      }
+      i = i + 1
+    }
+    return (R.ok, RegistryListen.new(host, port))
+  }
+  return (R.error, cfg_error(path, "listen: expected a mapping"))
+}
+
+def parse_store(value yaml.Yaml, path String) (R, RegistryStore) {
+  if value.is(yaml.YamlObject) {
+    var backend = default_store_backend
+    var root = default_store_root
+    const entries = value.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, v) = entries[i]
+      case key {
+        "backend" then {
+          case string_value(v, path, "store.backend") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { backend = text }
+          }
+        }
+        "root" then {
+          case string_value(v, path, "store.root") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { root = text }
+          }
+        }
+        _ then {
+          return (R.error, cfg_error(path, "store." + key + ": unknown field (known: backend, root)"))
+        }
+      }
+      i = i + 1
+    }
+    return (R.ok, RegistryStore.new(backend, root))
+  }
+  return (R.error, cfg_error(path, "store: expected a mapping"))
+}
+
+def parse_limits(value yaml.Yaml, path String) (R, RegistryLimits) {
+  if value.is(yaml.YamlObject) {
+    var max_body = default_max_body_bytes
+    var max_header = default_max_header_bytes
+    var read_timeout = default_read_timeout
+    var idle_timeout = default_idle_timeout
+    const entries = value.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, v) = entries[i]
+      case key {
+        "max_body_bytes" then {
+          case int_value(v, path, "limits.max_body_bytes") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, n) then { max_body = n }
+          }
+        }
+        "max_header_bytes" then {
+          case int_value(v, path, "limits.max_header_bytes") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, n) then { max_header = n }
+          }
+        }
+        "read_timeout" then {
+          case int_value(v, path, "limits.read_timeout") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, n) then { read_timeout = n }
+          }
+        }
+        "idle_timeout" then {
+          case int_value(v, path, "limits.idle_timeout") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, n) then { idle_timeout = n }
+          }
+        }
+        _ then {
+          return (R.error, cfg_error(path, "limits." + key + ": unknown field (known: max_body_bytes, max_header_bytes, read_timeout, idle_timeout)"))
+        }
+      }
+      i = i + 1
+    }
+    return (R.ok, RegistryLimits.new(max_body, max_header, read_timeout, idle_timeout))
+  }
+  return (R.error, cfg_error(path, "limits: expected a mapping"))
+}
+
+def string_value(value yaml.Yaml, path String, field String) (R, String) {
+  if value.is(yaml.YamlString) {
+    return (R.ok, value.as_string())
+  }
+  return (R.error, cfg_error(path, field + ": expected a string, got " + kind_word(value.kind())))
+}
+
+def int_value(value yaml.Yaml, path String, field String) (R, Int64) {
+  if value.is(yaml.YamlInt) {
+    return (R.ok, value.as_int())
+  }
+  return (R.error, cfg_error(path, field + ": expected an integer, got " + kind_word(value.kind())))
+}
+
+def kind_word(kind yaml.YamlKind) String {
+  case kind {
+    yaml.YamlKind.ynull then { return "null" }
+    yaml.YamlKind.ybool then { return "a boolean" }
+    yaml.YamlKind.yint then { return "an integer" }
+    yaml.YamlKind.yfloat then { return "a number" }
+    yaml.YamlKind.ystring then { return "a string" }
+    yaml.YamlKind.yarray then { return "an array" }
+    yaml.YamlKind.yobject then { return "a mapping" }
+  }
+}
+
+// Environment overrides are applied after the file, then the whole value is
+// validated once so a bad combination is reported in one place.
+def apply_env(config RegistryConfig, env src.settings.EnvSource) (R, RegistryConfig) {
+  var listen = config.listen
+  var data_dir = config.data_dir
+  var store = config.store
+  var limits = config.limits
+  var shutdown_file = config.shutdown_file
+  case env.getenv("POKERFACE_REGISTRY_LISTEN") {
+    (R.ok, v) then {
+      if v != "" {
+        case parse_listen_text(v) {
+          (R.error, why) then { return (R.error, "registry: POKERFACE_REGISTRY_LISTEN: " + why) }
+          (R.ok, parsed) then { listen = parsed }
+        }
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_DATA_DIR") {
+    (R.ok, v) then {
+      if v != "" {
+        data_dir = v
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_STORE_BACKEND") {
+    (R.ok, v) then {
+      if v != "" {
+        store = RegistryStore.new(v, store.root)
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_STORE_ROOT") {
+    (R.ok, v) then {
+      if v != "" {
+        store = RegistryStore.new(store.backend, v)
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_MAX_BODY_BYTES") {
+    (R.ok, v) then {
+      if v != "" {
+        case parse_int_env("POKERFACE_REGISTRY_MAX_BODY_BYTES", v) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, n) then { limits = RegistryLimits.new(n, limits.max_header_bytes, limits.read_timeout, limits.idle_timeout) }
+        }
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_MAX_HEADER_BYTES") {
+    (R.ok, v) then {
+      if v != "" {
+        case parse_int_env("POKERFACE_REGISTRY_MAX_HEADER_BYTES", v) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, n) then { limits = RegistryLimits.new(limits.max_body_bytes, n, limits.read_timeout, limits.idle_timeout) }
+        }
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_READ_TIMEOUT") {
+    (R.ok, v) then {
+      if v != "" {
+        case parse_int_env("POKERFACE_REGISTRY_READ_TIMEOUT", v) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, n) then { limits = RegistryLimits.new(limits.max_body_bytes, limits.max_header_bytes, n, limits.idle_timeout) }
+        }
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_IDLE_TIMEOUT") {
+    (R.ok, v) then {
+      if v != "" {
+        case parse_int_env("POKERFACE_REGISTRY_IDLE_TIMEOUT", v) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, n) then { limits = RegistryLimits.new(limits.max_body_bytes, limits.max_header_bytes, limits.read_timeout, n) }
+        }
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_SHUTDOWN_FILE") {
+    (R.ok, v) then {
+      if v != "" {
+        shutdown_file = v
+      }
+    }
+    (R.error, _) then { }
+  }
+  const merged = RegistryConfig.new(listen, data_dir, store, limits, shutdown_file, config.config_path)
+  return validate(merged)
+}
+
+def parse_listen_text(text String) (R, RegistryListen) {
+  const colon = text.index_of(":")
+  if colon <= 0 || colon >= text.length() - 1 {
+    return (R.error, "expected host:port, got '" + text + "'")
+  }
+  const host = text.substring(0, colon)
+  const port_text = text.substring(colon + 1, text.length() - colon - 1)
+  if !all_digits(port_text) {
+    return (R.error, "port is not a number: '" + port_text + "'")
+  }
+  return (R.ok, RegistryListen.new(host, port_text.to_int64()))
+}
+
+def parse_int_env(name String, text String) (R, Int64) {
+  if !all_digits(text) {
+    return (R.error, "registry: " + name + ": expected a non-negative integer, got '" + text + "'")
+  }
+  return (R.ok, text.to_int64())
+}
+
+def all_digits(text String) Bool {
+  if text == "" {
+    return false
+  }
+  var i = 0
+  while i < text.length() {
+    const c = text.substring(i, 1)
+    if c != "0" && c != "1" && c != "2" && c != "3" && c != "4" && c != "5" && c != "6" && c != "7" && c != "8" && c != "9" {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+def validate(config RegistryConfig) (R, RegistryConfig) {
+  if config.listen.host == "" {
+    return (R.error, cfg_error(config.config_path, "listen.host: must not be empty"))
+  }
+  if config.listen.port < 0 || config.listen.port > 65535 {
+    return (R.error, cfg_error(config.config_path, "listen.port: must be between 0 and 65535"))
+  }
+  if config.data_dir == "" {
+    return (R.error, cfg_error(config.config_path, "data_dir: must not be empty"))
+  }
+  if !in_array(known_backends, config.store.backend) {
+    return (R.error, cfg_error(config.config_path, "store.backend: unknown backend '" + config.store.backend + "' (known: fs, s3)"))
+  }
+  if config.store.root == "" {
+    return (R.error, cfg_error(config.config_path, "store.root: must not be empty"))
+  }
+  if config.limits.max_body_bytes <= 0 {
+    return (R.error, cfg_error(config.config_path, "limits.max_body_bytes: must be positive"))
+  }
+  if config.limits.max_header_bytes <= 0 {
+    return (R.error, cfg_error(config.config_path, "limits.max_header_bytes: must be positive"))
+  }
+  if config.limits.read_timeout < 0 {
+    return (R.error, cfg_error(config.config_path, "limits.read_timeout: must not be negative"))
+  }
+  if config.limits.idle_timeout < 0 {
+    return (R.error, cfg_error(config.config_path, "limits.idle_timeout: must not be negative"))
+  }
+  var shutdown_file = config.shutdown_file
+  if shutdown_file == "" {
+    shutdown_file = config.data_dir + "/" + shutdown_file_name
+  }
+  return (R.ok, RegistryConfig.new(config.listen, config.data_dir, config.store, config.limits, shutdown_file, config.config_path))
+}
+
+def in_array(items Array[String], wanted String) Bool {
+  var i = 0
+  while i < items.length() {
+    if items[i] == wanted {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Small rebuilders keep RegistryConfig immutable without a mutable builder.
+def with_listen(config RegistryConfig, listen RegistryListen) RegistryConfig {
+  return RegistryConfig.new(listen, config.data_dir, config.store, config.limits, config.shutdown_file, config.config_path)
+}
+
+def with_data_dir(config RegistryConfig, data_dir String) RegistryConfig {
+  return RegistryConfig.new(config.listen, data_dir, config.store, config.limits, config.shutdown_file, config.config_path)
+}
+
+def with_store(config RegistryConfig, store RegistryStore) RegistryConfig {
+  return RegistryConfig.new(config.listen, config.data_dir, store, config.limits, config.shutdown_file, config.config_path)
+}
+
+def with_limits(config RegistryConfig, limits RegistryLimits) RegistryConfig {
+  return RegistryConfig.new(config.listen, config.data_dir, config.store, limits, config.shutdown_file, config.config_path)
+}
+
+def with_shutdown_file(config RegistryConfig, shutdown_file String) RegistryConfig {
+  return RegistryConfig.new(config.listen, config.data_dir, config.store, config.limits, shutdown_file, config.config_path)
+}
+
+def summary(config RegistryConfig) String {
+  return (
+    "registry: listen=" + config.listen.host + ":" + config.listen.port.to_string()
+    + " data_dir=" + config.data_dir
+    + " store=" + config.store.backend + ":" + config.store.root
+    + " max_body=" + config.limits.max_body_bytes.to_string()
+    + " max_header=" + config.limits.max_header_bytes.to_string()
+    + " read_timeout=" + config.limits.read_timeout.to_string()
+    + " idle_timeout=" + config.limits.idle_timeout.to_string()
+    + " shutdown_file=" + config.shutdown_file
+  )
+}

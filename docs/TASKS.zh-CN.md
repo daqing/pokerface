@@ -346,7 +346,7 @@ images:
 
 | 状态 | ID | 任务 | 依赖 | 预估 |
 | --- | --- | --- | --- | --- |
-| [ ] | T2.1 | 服务骨架、配置与健康检查 | T1.2 | 2h |
+| [x] | T2.1 | 服务骨架、配置与健康检查 | T1.2 | 2h |
 | [ ] | T2.2 | SQLite 数据层与迁移 | T2.1 | 2-3h |
 | [ ] | T2.3 | OCI Manifest / Index 模型与校验 | T1.5 | 2-3h |
 | [ ] | T2.4 | BlobStore 接口与本地文件后端 | T2.1 | 2h |
@@ -377,6 +377,8 @@ images:
 **验收**：`emo build` 通过；`/healthz` 返回 200；数据库或对象存储不可用时 `/readyz` 返回非 200；收到 SIGTERM 后停止接收新请求并完成在途请求；配置缺失时有明确错误。
 
 **依赖**：T1.2 · **预估**：2h
+
+> **备注**（2026-11-18，约 2h）：完成。`registry/config.emo` 加载必需的 YAML（`--config` > `POKERFACE_REGISTRY_CONFIG` > `./registry.yaml`），逐层拒绝未知字段，支持环境变量覆盖，并产出一个已校验的配置值（listen 127.0.0.1:5000、data_dir、fs/s3 store、body/header/超时限制、shutdown 文件）。`registry/health.emo` 提供 `GET /healthz`（200 ok）、`GET /readyz`（用带 pid 的探针文件检查可写的 `data_dir` 与 fs store root；s3 在 T2.6 前报未就绪；503 body 逐项说明原因）、T2.7 之前的 `/v2/` 200 占位、非 GET 405、其余 404。`registry/main.emo` 用 `httpd.serve_with` 绑定，应用配置的 max body/header 与 read/idle 超时，向 stdout 打印供 supervisor 使用的 `LISTEN=`/`SHUTDOWN_FILE=`，并一直服务到 shutdown 标记出现。**停机**：Emo 没有自定义信号处理器，因此服务忽略 SIGTERM/SIGINT，轮询 `<shutdown_file>`；新增的 `scripts/run-registry.sh` 负责接收信号——收到 TERM/INT 后写入标记并等待，服务的 `stop()` 关闭监听、`wait()` 完成在途请求（空闲 keep-alive 由 `idle_timeout` 兜底）。`registry/registry.example.yaml` 与 `docs/spec/registry-config.md` 记录字段、环境变量、端点、检查项与信号约束。测试：配置 10 个（解析/默认/优先级/环境变量/未知字段/非法值）+ 健康 6 个；`emo test` 236/236。已手工验证：launcher 启动服务，`/healthz`、`/readyz`、`/v2/` 均 200，`POST /healthz` 405；把 `data_dir` 指向普通文件后 `/readyz` 返回 503 并带路径与原因；对 launcher 发 SIGTERM 后日志出现 `shutting down`/`stopped` 且端口关闭；配置缺失时退出 1 并给出路径与两种补救方式。踩坑：`httpd.serve_with` 需要独立的箭头块（`const handler = -> (req httpd.Request) { … }`），附着式 block 只能填最后一个参数；超时选项用 `Int64.to_float64()`；按验收要求配置文件是必需的，相对路径相对进程 cwd；直接对服务二进制发信号会被忽略（设计如此），supervisor 必须走 launcher 或自己 touch 标记。
 
 #### T2.2 SQLite 数据层与迁移
 

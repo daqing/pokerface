@@ -1,7 +1,7 @@
-# Specification Index (M1)
+# Specification Index
 
-> The client's v0.1 contracts. M1 (T1.1-T1.17) is implemented by the modules
-> named below; M2 adds the registry/server side.
+> The client's v0.1 contracts (M1, complete) and the server side as it lands
+> (M2, in progress).
 
 | Spec | Covers | Implemented by |
 | --- | --- | --- |
@@ -14,6 +14,7 @@
 | [oci-layout.md](oci-layout.md) | Writing/validating `oci-layout`, `index.json`, `blobs/sha256`. | `src/oci.emo` |
 | [runtime-import.md](runtime-import.md) | Docker/Podman/containerd import via skopeo, verification, cleanup. | `src/runtime.emo` |
 | [cache.md](cache.md) | Cache layout, marker, TTL/size limits, `cache ls/rm/verify`. | `src/cache.emo`, `src/commands/cache.emo` |
+| [registry-config.md](registry-config.md) | Registry service config, health/readiness, request limits, shutdown (M2/T2.1). | `registry/config.emo`, `registry/health.emo`, `registry/main.emo` |
 
 ## M1 flow
 

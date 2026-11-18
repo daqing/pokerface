@@ -346,7 +346,7 @@ Exit criteria:
 
 | Status | ID | Task | Depends on | Estimate |
 | --- | --- | --- | --- | --- |
-| [ ] | T2.1 | Service skeleton, configuration, and health checks | T1.2 | 2h |
+| [x] | T2.1 | Service skeleton, configuration, and health checks | T1.2 | 2h |
 | [ ] | T2.2 | SQLite data layer and migrations | T2.1 | 2-3h |
 | [ ] | T2.3 | OCI manifest / index model and validation | T1.5 | 2-3h |
 | [ ] | T2.4 | BlobStore interface and local filesystem backend | T2.1 | 2h |
@@ -377,6 +377,8 @@ Exit criteria:
 **Acceptance**: `emo build` passes; `/healthz` returns 200; `/readyz` returns non-200 when the database or object store is unavailable; SIGTERM stops accepting new requests and finishes in-flight ones; missing configuration produces a clear error.
 
 **Depends on**: T1.2 · **Estimate**: 2h
+
+> **Notes** (2026-11-18, ~2h): Done. `registry/config.emo` loads a required YAML file (`--config` > `POKERFACE_REGISTRY_CONFIG` > `./registry.yaml`) with strict per-level unknown-field checks, env overrides, and one validated value (listen 127.0.0.1:5000, data_dir, fs/s3 store, body/header/timeout limits, shutdown file). `registry/health.emo` serves `GET /healthz` (200 ok), `GET /readyz` (writable `data_dir` + fs store root probed with a per-pid file; s3 reports not-ready until T2.6; 503 body names each failure), a `/v2/` 200 placeholder for T2.7, 405 on non-GET, 404 otherwise. `registry/main.emo` binds with `httpd.serve_with` using the configured max body/header bytes and read/idle timeouts, prints `LISTEN=`/`SHUTDOWN_FILE=` on stdout for supervisors, and serves until the shutdown marker appears. **Shutdown**: Emo has no custom signal handler, so the server ignores SIGTERM/SIGINT and polls `<shutdown_file>`; the new `scripts/run-registry.sh` owns the signals — on TERM/INT it touches the marker and waits, and the server's `stop()` closes the listener while `wait()` drains in-flight requests (idle keep-alives bounded by `idle_timeout`). `registry/registry.example.yaml` and `docs/spec/registry-config.md` document fields, env vars, endpoints, checks, and the signal constraint. Tests: 10 config cases (parse/defaults/precedence/env/unknown/invalid) + 6 health cases; `emo test` 236/236. Manually verified: the launcher starts the service, `/healthz`, `/readyz`, and `/v2/` return 200, `POST /healthz` returns 405, a file-blocking `data_dir` makes `/readyz` 503 with the path and reason, SIGTERM to the launcher logs `shutting down`/`stopped` and closes the port, and a missing config exits 1 with the path plus both remedies. Gotchas: `httpd.serve_with` needs a standalone arrow block (`const handler = -> (req httpd.Request) { … }`) because the attached form only fills the last argument; `Int64.to_float64()` feeds the timeout options; the config file is required (per the acceptance) and relative paths are cwd-relative; a signal sent directly to the server binary is ignored by design — supervisors must use the launcher or touch the marker.
 
 #### T2.2 SQLite Data Layer and Migrations
 

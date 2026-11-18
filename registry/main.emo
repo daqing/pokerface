@@ -1,0 +1,125 @@
+// T2.1: registry service entry point. Loads a YAML/env configuration, binds
+// the configured address, serves the health endpoints (and a /v2/ placeholder
+// until T2.7), and stops cleanly when the shutdown file appears.
+//
+// Emo exposes no custom signal handler, so SIGTERM/SIGINT are ignored by the
+// server process and a launcher (scripts/run-registry.sh) turns the signal
+// into the shutdown file the main loop watches. httpd's stop() closes the
+// listener and wait() drains in-flight requests.
+
+require "os"
+require "file"
+require "net"
+require "httpd"
+require "time"
+
+def usage_text() String {
+  return "usage: registry [--config <path>]\n"
+}
+
+def main() Int64 {
+  var config_path = ""
+  const argv = os.argv()
+  var i = 1
+  while i < argv.length() {
+    const arg = argv[i]
+    case arg {
+      "--help" then {
+        println(usage_text())
+        return 0
+      }
+      "-h" then {
+        println(usage_text())
+        return 0
+      }
+      "--config" then {
+        if i + 1 >= argv.length() {
+          eprint("registry: --config expects a path\n")
+          return 2
+        }
+        i = i + 1
+        config_path = argv[i]
+      }
+      _ when arg.starts_with("--config=") then {
+        config_path = arg.substring(9, arg.length() - 9)
+      }
+      _ then {
+        eprint("registry: unknown option " + arg + "\n" + usage_text())
+        return 2
+      }
+    }
+    i = i + 1
+  }
+
+  case registry.config.load(src.settings.RealEnv.new(), config_path) {
+    (R.error, why) then {
+      eprint(why + "\n")
+      return 1
+    }
+    (R.ok, config) then {
+      return serve(config)
+    }
+  }
+}
+
+def serve(config registry.config.RegistryConfig) Int64 {
+  // A stale marker from a previous run must not shut this one down.
+  os.unlink(config.shutdown_file)
+  const (R.ok, _) = os.signal_ignore(os.sig_term)
+  const (R.ok, _) = os.signal_ignore(os.sig_int)
+
+  case net.listen(config.listen.host, config.listen.port) {
+    (R.error, why) then {
+      eprint("registry: cannot listen on " + config.listen.host + ":" + config.listen.port.to_string() + ": " + why + "\n")
+      return 1
+    }
+    (R.ok, listener) then {
+      const port = listener.port()
+      const handler = -> (req httpd.Request) {
+        return registry.health.handle(req, config)
+      }
+      const server = httpd.serve_with(listener, handler, server_options(config))
+      // Raw writes: supervisors/scripts poll these readiness lines.
+      const (_, _) = os.write(1, "LISTEN=" + config.listen.host + ":" + port.to_string() + "\n")
+      const (_, _) = os.write(1, "SHUTDOWN_FILE=" + config.shutdown_file + "\n")
+      eprint(registry.config.summary(config) + "\n")
+      eprint("registry: listening on " + config.listen.host + ":" + port.to_string() + "\n")
+
+      while !shutdown_requested(config.shutdown_file) {
+        time.sleep(0.1)
+      }
+      os.unlink(config.shutdown_file)
+      eprint("registry: shutting down\n")
+      const (_, _) = server.stop()
+      server.wait()
+      eprint("registry: stopped\n")
+      return 0
+    }
+  }
+}
+
+def server_options(config registry.config.RegistryConfig) httpd.ServerOptions {
+  var options = httpd.server_options()
+  options = options.with_max_body_bytes(config.limits.max_body_bytes)
+  options = options.with_max_header_bytes(config.limits.max_header_bytes)
+  if config.limits.read_timeout > 0 {
+    options = options.with_read_timeout(config.limits.read_timeout.to_float64())
+  }
+  if config.limits.idle_timeout > 0 {
+    options = options.with_idle_timeout(config.limits.idle_timeout.to_float64())
+  }
+  return options
+}
+
+def shutdown_requested(path String) Bool {
+  case file.read(path) {
+    (R.ok, _) then { return true }
+    (R.error, _) then { return false }
+  }
+}
+
+def eprint(text String) {
+  const (_, _) = os.write(2, text)
+}
+
+os._exit(main())
