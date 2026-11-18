@@ -129,7 +129,7 @@ def scan_member(doc json.Json, field String) String {
 def test_get_by_tag_returns_the_bytes_and_headers() {
   const body = sample_body()
   const store = FakeManifests.new(sample_payload(manifest_media_type, body))
-  const response = manifests.handle(make_request("GET", "/v2/acme/team/app/manifests/latest"), store)
+  const response = manifests.handle(make_request("GET", "/v2/acme/team/app/manifests/latest"), store, ManifestFakeBlobLinks.new(), ManifestFakeWriter.new())
   expect_equal(200, response.status)
   expect_equal(body, response.body)
   expect_equal(manifest_media_type, header_value(response.headers, "content-type"))
@@ -141,7 +141,7 @@ def test_get_by_tag_returns_the_bytes_and_headers() {
 def test_get_by_digest_uses_the_digest_reference() {
   const body = sample_body()
   const store = FakeManifests.new(sample_payload(manifest_media_type, body))
-  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/" + sha(body)), store)
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/" + sha(body)), store, ManifestFakeBlobLinks.new(), ManifestFakeWriter.new())
   expect_equal(200, response.status)
   expect_equal("acme/app|" + sha(body), store.seen_text())
 }
@@ -149,7 +149,7 @@ def test_get_by_digest_uses_the_digest_reference() {
 def test_head_has_no_body_but_names_the_length() {
   const body = sample_body()
   const store = FakeManifests.new(sample_payload(manifest_media_type, body))
-  const response = manifests.handle(make_request("HEAD", "/v2/acme/app/manifests/latest"), store)
+  const response = manifests.handle(make_request("HEAD", "/v2/acme/app/manifests/latest"), store, ManifestFakeBlobLinks.new(), ManifestFakeWriter.new())
   expect_equal(200, response.status)
   expect_equal("", response.body)
   expect_equal(body.to_bytes().length(), header_value(response.headers, "content-length").to_int64())
@@ -158,7 +158,7 @@ def test_head_has_no_body_but_names_the_length() {
 
 def test_missing_manifests_are_oci_404s() {
   const store = FakeManifests.new(registry.manifests.absent_payload())
-  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/latest"), store)
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/latest"), store, ManifestFakeBlobLinks.new(), ManifestFakeWriter.new())
   expect_equal(404, response.status)
   expect_equal(api.code_manifest_unknown, error_field(response.body, "code"))
   expect_equal("manifest unknown", error_field(response.body, "message"))
@@ -166,7 +166,7 @@ def test_missing_manifests_are_oci_404s() {
 }
 
 def test_lookup_failures_are_500s() {
-  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/latest"), FailingManifests.new())
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/latest"), FailingManifests.new(), ManifestFakeBlobLinks.new(), ManifestFakeWriter.new())
   expect_equal(500, response.status)
   expect_equal(api.code_unknown, error_field(response.body, "code"))
   expect_true(error_field(response.body, "detail").index_of("database is down") >= 0)
@@ -175,7 +175,7 @@ def test_lookup_failures_are_500s() {
 def test_a_digest_mismatch_is_refused() {
   const body = sample_body()
   const wrong = registry.manifests.ManifestPayload.new(true, sha("something else"), manifest_media_type, body)
-  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/latest"), FakeManifests.new(wrong))
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/latest"), FakeManifests.new(wrong), ManifestFakeBlobLinks.new(), ManifestFakeWriter.new())
   expect_equal(500, response.status)
   expect_true(error_field(response.body, "detail").index_of("hashes to") >= 0)
 }
@@ -185,45 +185,45 @@ def test_accept_is_honored() {
   const payload = sample_payload(manifest_media_type, body)
   const path = "/v2/acme/app/manifests/latest"
   const listed = make_request_with("GET", path, [("Accept", manifest_media_type + ", */*")])
-  expect_equal(200, manifests.handle(listed, FakeManifests.new(payload)).status)
+  expect_equal(200, manifests.handle(listed, FakeManifests.new(payload), ManifestFakeBlobLinks.new(), ManifestFakeWriter.new()).status)
   const with_params = make_request_with("GET", path, [("Accept", "text/plain;q=0.9, " + manifest_media_type + ";q=1")])
-  expect_equal(200, manifests.handle(with_params, FakeManifests.new(payload)).status)
+  expect_equal(200, manifests.handle(with_params, FakeManifests.new(payload), ManifestFakeBlobLinks.new(), ManifestFakeWriter.new()).status)
   const star = make_request_with("GET", path, [("Accept", "*/*")])
-  expect_equal(200, manifests.handle(star, FakeManifests.new(payload)).status)
+  expect_equal(200, manifests.handle(star, FakeManifests.new(payload), ManifestFakeBlobLinks.new(), ManifestFakeWriter.new()).status)
   const wrong = make_request_with("GET", path, [("Accept", "application/vnd.docker.distribution.manifest.v2+json")])
-  const refused = manifests.handle(wrong, FakeManifests.new(payload))
+  const refused = manifests.handle(wrong, FakeManifests.new(payload), ManifestFakeBlobLinks.new(), ManifestFakeWriter.new())
   expect_equal(404, refused.status)
   expect_equal(api.code_manifest_unknown, error_field(refused.body, "code"))
   const mixed = make_request_with("GET", path, [("Accept", "Application/Vnd.Oci.Image.Manifest.V1+Json")])
-  expect_equal(200, manifests.handle(mixed, FakeManifests.new(payload)).status)
+  expect_equal(200, manifests.handle(mixed, FakeManifests.new(payload), ManifestFakeBlobLinks.new(), ManifestFakeWriter.new()).status)
 }
 
 def test_an_index_is_returned_intact() {
   const body = "{\"schemaVersion\":2,\"mediaType\":\"" + index_media_type + "\",\"manifests\":[{\"digest\":\"" + sha("x") + "\",\"size\":1}]}"
-  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/latest"), FakeManifests.new(sample_payload(index_media_type, body)))
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/latest"), FakeManifests.new(sample_payload(index_media_type, body)), ManifestFakeBlobLinks.new(), ManifestFakeWriter.new())
   expect_equal(200, response.status)
   expect_equal(body, response.body)
   expect_equal(index_media_type, header_value(response.headers, "content-type"))
 }
 
 def test_invalid_digests_are_400s() {
-  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/sha256:abc"), FakeManifests.new(registry.manifests.absent_payload()))
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/sha256:abc"), FakeManifests.new(registry.manifests.absent_payload()), ManifestFakeBlobLinks.new(), ManifestFakeWriter.new())
   expect_equal(400, response.status)
   expect_equal(api.code_digest_invalid, error_field(response.body, "code"))
 }
 
 def test_unsupported_methods_are_405s() {
-  const response = manifests.handle(make_request("POST", "/v2/acme/app/manifests/latest"), FakeManifests.new(registry.manifests.absent_payload()))
+  const response = manifests.handle(make_request("POST", "/v2/acme/app/manifests/latest"), FakeManifests.new(registry.manifests.absent_payload()), ManifestFakeBlobLinks.new(), ManifestFakeWriter.new())
   expect_equal(405, response.status)
-  expect_equal("GET, HEAD", header_value(response.headers, "allow"))
+  expect_equal("GET, HEAD, PUT", header_value(response.headers, "allow"))
   expect_equal(api.code_unsupported, error_field(response.body, "code"))
 }
 
 def test_bad_path_shapes_are_404s() {
   const store = FakeManifests.new(registry.manifests.absent_payload())
-  expect_equal(404, manifests.handle(make_request("GET", "/v2/acme/app/manifests/"), store).status)
-  expect_equal(404, manifests.handle(make_request("GET", "/v2//manifests/latest"), store).status)
-  expect_equal(404, manifests.handle(make_request("GET", "/v2/acme/app/manifests/tag/extra"), store).status)
+  expect_equal(404, manifests.handle(make_request("GET", "/v2/acme/app/manifests/"), store, ManifestFakeBlobLinks.new(), ManifestFakeWriter.new()).status)
+  expect_equal(404, manifests.handle(make_request("GET", "/v2//manifests/latest"), store, ManifestFakeBlobLinks.new(), ManifestFakeWriter.new()).status)
+  expect_equal(404, manifests.handle(make_request("GET", "/v2/acme/app/manifests/tag/extra"), store, ManifestFakeBlobLinks.new(), ManifestFakeWriter.new()).status)
   expect_true(!manifests.is_route("/v2/acme/app/tags/list"))
   expect_true(manifests.is_route("/v2/acme/app/manifests/latest"))
 }
@@ -240,7 +240,7 @@ def test_the_router_dispatches_manifest_routes() {
     "/tmp/pf-manifests-router/shutdown",
     "<test>"
   )
-  const service = registry.router.Service.new(config, ManifestFakeDb.new(), ManifestFakeBlob.new(), ManifestFakeBlobStore.new(), ManifestFakeBlobLinks.new(), store, ManifestFakeUploads.new())
+  const service = registry.router.Service.new(config, ManifestFakeDb.new(), ManifestFakeBlob.new(), ManifestFakeBlobStore.new(), ManifestFakeBlobLinks.new(), store, ManifestFakeUploads.new(), ManifestFakeWriter.new())
   const response = registry.router.handle(make_request("GET", "/v2/acme/app/manifests/latest"), service)
   expect_equal(200, response.status)
   expect_equal(body, response.body)
@@ -338,5 +338,18 @@ class ManifestFakeUploads {
 
   def part_path(id String) (R, String) {
     return (R.ok, "/tmp/fake-part")
+  }
+}
+
+class ManifestFakeWriter {
+  def init() {
+  }
+
+  def put(repository String, media_type String, body String) (R, String) {
+    return (R.ok, "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+  }
+
+  def tag(repository String, tag String, digest String) (R, Bool) {
+    return (R.ok, true)
   }
 }

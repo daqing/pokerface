@@ -149,6 +149,19 @@ class ApiFakeUploads {
   }
 }
 
+class ApiFakeWriter {
+  def init() {
+  }
+
+  def put(repository String, media_type String, body String) (R, String) {
+    return (R.ok, "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+  }
+
+  def tag(repository String, tag String, digest String) (R, Bool) {
+    return (R.ok, true)
+  }
+}
+
 def make_request(method String, path String) httpd.Request {
   return make_request_with(method, path, [])
 }
@@ -167,7 +180,7 @@ def make_request_with(method String, path String, headers Array[(String, String)
 }
 
 def make_service(name String) registry.router.Service {
-  return registry.router.Service.new(make_config(name), ApiFakeDb.new(true), ApiFakeBlob.new(true), ApiFakeBlobStore.new(), ApiFakeBlobLinks.new(), ApiFakeManifests.new(), ApiFakeUploads.new())
+  return registry.router.Service.new(make_config(name), ApiFakeDb.new(true), ApiFakeBlob.new(true), ApiFakeBlobStore.new(), ApiFakeBlobLinks.new(), ApiFakeManifests.new(), ApiFakeUploads.new(), ApiFakeWriter.new())
 }
 
 def route(method String, path String) httpd.Response {

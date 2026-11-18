@@ -1217,7 +1217,8 @@ def test_the_router_dispatches_the_upload_methods() {
         store,
         links,
         UploadFakeManifests.new(),
-        sessions
+        sessions,
+        UploadFakeWriter.new()
       )
       const opened = registry.router.handle(make_request("POST", "/v2/acme/app/blobs/uploads/"), service)
       expect_equal(202, opened.status)
@@ -1279,5 +1280,18 @@ class UploadFakeManifests {
 
   def lookup(repository String, reference String) (R, registry.manifests.ManifestPayload) {
     return (R.ok, registry.manifests.absent_payload())
+  }
+}
+
+class UploadFakeWriter {
+  def init() {
+  }
+
+  def put(repository String, media_type String, body String) (R, String) {
+    return (R.ok, "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+  }
+
+  def tag(repository String, tag String, digest String) (R, Bool) {
+    return (R.ok, true)
   }
 }

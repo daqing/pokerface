@@ -357,7 +357,7 @@ images:
 | [x] | T2.9 | Blob GET 与 307 预签名重定向 | T2.4、T2.6、T2.8 | 2-3h |
 | [x] | T2.10 | Blob 上传：POST / PUT | T2.4、T2.7 | 3h |
 | [x] | T2.11 | 分块上传与断点续传：PATCH / GET / DELETE | T2.10 | 3h |
-| [ ] | T2.12 | Manifest PUT 与 tag 更新 | T2.3、T2.10、T2.11 | 2-3h |
+| [x] | T2.12 | Manifest PUT 与 tag 更新 | T2.3、T2.10、T2.11 | 2-3h |
 | [ ] | T2.13 | 解析 / 元数据 API | T2.8、T2.12 | 2h |
 | [ ] | T2.14 | 认证与 Token 服务 | T2.7 | 3-4h |
 | [ ] | T2.15 | 缓存头、ETag 与 CDN 行为 | T2.8、T2.9 | 2h |
@@ -517,6 +517,8 @@ images:
 **验收**：`oras push` / `skopeo copy` 可推送成功；引用缺失返回 `MANIFEST_BLOB_UNKNOWN`；tag 更新是原子的；返回 `Docker-Content-Digest`；失败时旧 tag 不被覆盖。
 
 **依赖**：T2.3、T2.10、T2.11 · **预估**：2-3h
+
+> **备注**（2026-11-19，约 2.5h）：已完成。`registry/manifests.emo` 增加写半边：`PUT /v2/<name>/manifests/<tag|digest>` 把请求体**原样**存储在其摘要之下（`ManifestWriter` 接口；`DbManifests.put` 哈希后 `INSERT OR IGNORE`——重复推送保持单行），tag 引用则用单条 `INSERT OR REPLACE` 指向（原子；失败从不扰动旧 tag）。所有校验先于任何写入：经 T2.3 的 `parse_document` 解析（Content-Type 与 body 的 `mediaType` 必须一致，二者可互相补位 → 400 `MANIFEST_INVALID`）、digest 引用必须等于请求体的哈希（400 `DIGEST_INVALID` 带两侧摘要）、tag 必须满足 OCI 语法 `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`（400 `TAG_INVALID`）、仓库名因 PUT 会建行而校验（400 `NAME_INVALID`）。文档引用的一切内容必须已存在：manifest 的 config + layers 对仓库的 blob 关联校验，index 的子项对已存 manifest 校验——首个缺失即 `404 MANIFEST_BLOB_UNKNOWN` 带摘要且什么都没写；校验内部的查询失败单独返回 500，与缺失区分。`subject` 描述符有意不校验（规范要求接受 subject 缺席的 manifest；T2.3 解析器直接丢弃）。成功：`201` + `Location` + `Docker-Content-Digest`。Service 增加 `manifest_writer`（同一个 `DbManifests` 实例兼作两接口），三个 T2.x 测试文件的构造与 GET 测试的 `handle` 调用同步加参。测试：`test/registry_manifest_put.emo` 22 例（tag/digest 推送、不匹配、解析/类型/不一致 400、tag 语法、名称语法、缺 config/layer/子项 → 404 带摘要、空 layers、subject 接受、tag 移动序列、store/tag/link 失败 500、405 与 `Allow: GET, HEAD, PUT`、路由分发）+ db_selftest 10 项（原样回读、摘要应答、重推无操作、tag 指向/更新、未知仓库 tag 拒绝）；`emo test` 425/425，db selftest 114/114。**实测：`skopeo copy oci:… docker://127.0.0.1:…` 推送现在全流程成功**（blob 上传是 T2.11；此前失败的 manifest 步骤落在本次），按 tag 的 GET/HEAD 返回原样字节与 `Docker-Content-Digest`，curl PUT 空 layers manifest 移动了 tag（201，服务新摘要）。踩坑：引用检查辅助函数需要三态应答（存在/缺失/失败）——二元组把 link 存储失败与缺失 blob 混为一谈，本该 500 的答成 404；测试抓到。
 
 #### T2.13 解析 / 元数据 API
 

@@ -93,6 +93,7 @@ def main() Int64 {
   check_blobs(report, db)
   check_manifest_store(report, db, path)
   check_blob_links(report, db, path)
+  check_manifest_writer(report, db, path)
   check_upload_sessions(report, db, path)
   check_uploads(report, db)
   check_cascades(report, db)
@@ -245,6 +246,52 @@ def check_blob_links(report Report, db registry.db.Database, path String) {
 // bookkeeping and real part files, completion (with the blob link and the
 // part-file cleanup), cancellation, and the expiry sweep that rides along
 // with every start.
+// The T2.12 write half: verbatim bytes under the computed digest, re-put as
+// a no-op, and atomic tag updates.
+def check_manifest_writer(report Report, db registry.db.Database, path String) {
+  const writer = registry.manifests.DbManifests.new(path)
+  const body = "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{},\"layers\":[]}"
+  var digest = ""
+  case writer.put("writer/check", "application/vnd.oci.image.manifest.v1+json", body) {
+    (R.ok, d) then {
+      digest = d
+      report.check(d == "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes())),
+        "put answers the body's digest")
+    }
+    (R.error, why) then { report.check(false, "manifest put failed: " + why) }
+  }
+  report.check(db.repository_exists("writer/check"), "put created the repository row")
+  const repo = db.repository_id("writer/check")
+  report.text(db.manifest_body(repo, digest), body, "the manifest bytes round-trip verbatim")
+  report.number(db.manifest_size(repo, digest), body.to_bytes().length(), "the manifest size is recorded")
+  case writer.put("writer/check", "application/vnd.oci.image.manifest.v1+json", body) {
+    (R.ok, d) then {
+      report.check(d == digest, "re-put answers the same digest")
+      report.number(db.list_manifest_digests(repo).length(), 1, "re-put keeps a single row")
+    }
+    (R.error, why) then { report.check(false, "re-put failed: " + why) }
+  }
+  case writer.tag("writer/check", "v1", digest) {
+    (R.ok, _) then { report.text(db.tag_digest(repo, "v1"), digest, "the tag points at the digest") }
+    (R.error, why) then { report.check(false, "tag write failed: " + why) }
+  }
+  var second = ""
+  case writer.put("writer/check", "application/vnd.oci.image.index.v1+json", "{\"schemaVersion\":2}") {
+    (R.ok, d) then { second = d }
+    (R.error, why) then { report.check(false, "second put failed: " + why) }
+  }
+  case writer.tag("writer/check", "v1", second) {
+    (R.ok, _) then { report.text(db.tag_digest(repo, "v1"), second, "the tag update moves to the new digest") }
+    (R.error, why) then { report.check(false, "tag update failed: " + why) }
+  }
+  report.number(db.list_tags(repo).length(), 1, "the update did not leave a second tag row")
+  case writer.tag("writer/missing", "v1", digest) {
+    (R.ok, _) then { report.check(false, "tagging an unknown repository was accepted") }
+    (R.error, why) then { report.check(why.index_of("does not exist") >= 0, "tagging an unknown repository names it") }
+  }
+  report.check(db.delete_repository(repo), "the writer/check repository cleans up")
+}
+
 def check_upload_sessions(report Report, db registry.db.Database, path String) {
   const dir = path + "-uploads"
   const sessions = registry.uploads.DbUploadSessions.new(path, dir)

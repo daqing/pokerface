@@ -41,6 +41,17 @@ interface ManifestStore {
   def lookup(repository String, reference String) (R, ManifestPayload)
 }
 
+// T2.12: the write half. `put` stores the bytes verbatim under their digest
+// (re-putting a digest is a no-op) and answers the digest; `tag` points a
+// tag at a digest — a single INSERT OR REPLACE, so a tag update is atomic
+// and a failure never disturbs the old tag. The manifest row must exist
+// before the tag write (the composite foreign key demands it), which the
+// PUT handler's ordering guarantees.
+interface ManifestWriter {
+  def put(repository String, media_type String, body String) (R, String)
+  def tag(repository String, tag String, digest String) (R, Bool)
+}
+
 // SQLite-backed lookup. The database is opened and closed per request.
 class DbManifests {
   def init(db_path String) {
@@ -70,6 +81,29 @@ class DbManifests {
     const media_type = db.manifest_media_type(repository_id, digest)
     db.close()
     return (R.ok, ManifestPayload.new(true, digest, media_type, body))
+  }
+
+  def put(repository String, media_type String, body String) (R, String) {
+    const digest = "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+    const db = registry.db.connect(self.db_path)
+    db.begin()
+    const repository_id = db.ensure_repository(repository)
+    db.put_manifest(repository_id, digest, media_type, body.to_bytes().length(), body)
+    db.commit()
+    db.close()
+    return (R.ok, digest)
+  }
+
+  def tag(repository String, tag String, digest String) (R, Bool) {
+    const db = registry.db.connect(self.db_path)
+    const repository_id = db.repository_id(repository)
+    if repository_id == 0 {
+      db.close()
+      return (R.error, "registry: manifests: repository " + repository + " does not exist")
+    }
+    db.put_tag(repository_id, tag, digest)
+    db.close()
+    return (R.ok, true)
   }
 }
 
@@ -102,9 +136,41 @@ def split(path String) (String, String) {
   return (repository, reference)
 }
 
-def handle(req httpd.Request, store ManifestStore) httpd.Response {
+// The OCI tag grammar: `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}` — at most 128
+// characters, not starting with a separator.
+const tag_max_length = 128
+const tag_first_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+const tag_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+
+def valid_tag(tag String) Bool {
+  if tag == "" || tag.length() > tag_max_length {
+    return false
+  }
+  if tag_first_chars.index_of(tag.substring(0, 1)) < 0 {
+    return false
+  }
+  var i = 1
+  while i < tag.length() {
+    if tag_chars.index_of(tag.substring(i, 1)) < 0 {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+def handle(req httpd.Request, store ManifestStore, links registry.blobs.BlobLinks, writer ManifestWriter) httpd.Response {
+  if req.method == "PUT" {
+    const parts = split(req.path)
+    const repository = parts[0]
+    const reference = parts[1]
+    if repository == "" || reference == "" {
+      return registry.api.not_found(registry.api.code_manifest_unknown, "manifest unknown", req.path)
+    }
+    return put(req, repository, reference, store, links, writer)
+  }
   if req.method != "GET" && req.method != "HEAD" {
-    return registry.api.method_not_allowed("GET, HEAD")
+    return registry.api.method_not_allowed("GET, HEAD, PUT")
   }
   const parts = split(req.path)
   const repository = parts[0]
@@ -196,4 +262,113 @@ def trim_parameters(item String) String {
     }
   }
   return text.substring(start, end - start)
+}
+
+// ---------------------------------------------------------------------------
+// PUT (T2.12): store the manifest bytes verbatim and, for a tag reference,
+// point the tag at the digest. Validation runs before any write: the body
+// must parse as one of the four supported media types, a digest reference
+// must match the body's hash, a tag reference must satisfy the tag grammar,
+// and every blob (config, layers) or child manifest the document references
+// must already exist in the repository — a miss is
+// `404 MANIFEST_BLOB_UNKNOWN` naming the digest, and nothing is written.
+// The `subject` descriptor is deliberately not checked: the distribution
+// spec requires accepting a manifest whose subject is not present.
+def put(req httpd.Request, repository String, reference String, store ManifestStore, links registry.blobs.BlobLinks, writer ManifestWriter) httpd.Response {
+  if !registry.uploads.valid_name(repository) {
+    return registry.api.bad_request(registry.api.code_name_invalid, "invalid repository name", repository)
+  }
+  const by_digest = registry.digest.valid(reference)
+  if !by_digest && !valid_tag(reference) {
+    return registry.api.bad_request(registry.api.code_tag_invalid, "invalid tag", reference)
+  }
+  case registry.oci.parse_document(req.body, req.header("Content-Type")) {
+    (R.error, why) then {
+      return registry.api.bad_request(registry.api.code_manifest_invalid, "invalid manifest", why)
+    }
+    (R.ok, doc) then {
+      if by_digest {
+        const actual = "sha256:" + crypto.hex_encode(crypto.sha2.sha256(req.body.to_bytes()))
+        if actual != reference {
+          return registry.api.bad_request(registry.api.code_digest_invalid, "digest mismatch",
+            "the manifest hashes to " + actual + ", not " + reference)
+        }
+      }
+      case check_references(repository, doc, links, store) {
+        (R.error, why) then {
+          return registry.api.server_error("manifest reference check failed", why)
+        }
+        (R.ok, missing) then {
+          if missing != "" {
+            return registry.api.not_found(registry.api.code_manifest_blob_unknown,
+              "manifest references content unknown to the repository", missing)
+          }
+        }
+      }
+      case writer.put(repository, doc.media_type, req.body) {
+        (R.error, why) then { return registry.api.server_error("manifest store write failed", why) }
+        (R.ok, digest) then {
+          if !by_digest {
+            case writer.tag(repository, reference, digest) {
+              (R.error, why) then { return registry.api.server_error("tag update failed", why) }
+              (R.ok, _) then { }
+            }
+          }
+          return httpd.response(201, [
+            ("Location", route_prefix + repository + route_marker + digest),
+            ("Docker-Content-Digest", digest)
+          ], "")
+        }
+      }
+    }
+  }
+}
+
+// Every blob the document references must be linked into the repository
+// (config and layers of a manifest; the child manifests of an index). The
+// answer is "" when everything is present, the missing digest when a
+// reference is unknown (the caller answers 404), and an error when a lookup
+// itself failed (the caller answers 500). The subject descriptor never
+// reaches here because the parser drops it.
+def check_references(repository String, doc registry.oci.Document, links registry.blobs.BlobLinks, store ManifestStore) (R, String) {
+  if doc.is_index() {
+    const entries = doc.index.manifests
+    var i = 0
+    while i < entries.length() {
+      const digest = entries[i].descriptor.digest
+      case store.lookup(repository, digest) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, payload) then {
+          if !payload.found {
+            return (R.ok, digest)
+          }
+        }
+      }
+      i = i + 1
+    }
+    return (R.ok, "")
+  }
+  const config_digest = doc.manifest.config.digest
+  case links.linked(repository, config_digest) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, link) then {
+      if !link.found {
+        return (R.ok, config_digest)
+      }
+    }
+  }
+  const layers = doc.manifest.layers
+  var i = 0
+  while i < layers.length() {
+    case links.linked(repository, layers[i].digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, link) then {
+        if !link.found {
+          return (R.ok, layers[i].digest)
+        }
+      }
+    }
+    i = i + 1
+  }
+  return (R.ok, "")
 }

@@ -1,0 +1,550 @@
+// T2.12 tests for the manifest PUT route — run with `emo test`.
+//
+// The writer, the blob links, and the manifest store are fakes, so the
+// validation order (parse → digest → references → store → tag) and the
+// failure paths run in the interpreter; the compiled db_selftest covers the
+// SQLite writer (verbatim bytes, re-put no-op, tag updates).
+
+const manifests = registry.manifests
+const api = registry.api
+const oci = registry.oci
+
+require "httpd"
+require "json"
+require "crypto"
+
+const oci_manifest_type = "application/vnd.oci.image.manifest.v1+json"
+const oci_index_type = "application/vnd.oci.image.index.v1+json"
+
+// ---------------------------------------------------------------------------
+// Fakes.
+
+class FakeWriter {
+  def init() {
+    self.puts = Box.new(0)
+    self.tags = Box.new(0)
+    self.put_media_type = Box.new("")
+    self.put_body = Box.new("")
+    self.put_repository = Box.new("")
+    self.tag_name = Box.new("")
+    self.tag_digest = Box.new("")
+    self.fail_put = Box.new("")
+    self.fail_tag = Box.new("")
+  }
+
+  def put(repository String, media_type String, body String) (R, String) {
+    self.puts.replace(self.puts.read() + 1)
+    const why = self.fail_put.read()
+    if why != "" {
+      return (R.error, why)
+    }
+    self.put_repository.replace(repository)
+    self.put_media_type.replace(media_type)
+    self.put_body.replace(body)
+    return (R.ok, "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes())))
+  }
+
+  def tag(repository String, tag String, digest String) (R, Bool) {
+    self.tags.replace(self.tags.read() + 1)
+    const why = self.fail_tag.read()
+    if why != "" {
+      return (R.error, why)
+    }
+    self.tag_name.replace(tag)
+    self.tag_digest.replace(digest)
+    return (R.ok, true)
+  }
+
+  def put_count() Int64 {
+    return self.puts.read()
+  }
+
+  def tag_count() Int64 {
+    return self.tags.read()
+  }
+}
+
+class FakeLinks {
+  def init(present Array[String], failure String) {
+    self.present = Box.new(present)
+    self.failure = Box.new(failure)
+  }
+
+  def linked(repository String, digest String) (R, registry.blobs.BlobLink) {
+    const why = self.failure.read()
+    if why != "" {
+      return (R.error, why)
+    }
+    const digests = self.present.read()
+    var i = 0
+    while i < digests.length() {
+      if digests[i] == digest {
+        return (R.ok, registry.blobs.BlobLink.new(true, 10))
+      }
+      i = i + 1
+    }
+    return (R.ok, registry.blobs.absent_link())
+  }
+}
+
+class FakeStore {
+  def init(known Array[String]) {
+    self.known = Box.new(known)
+  }
+
+  def lookup(repository String, reference String) (R, registry.manifests.ManifestPayload) {
+    const digests = self.known.read()
+    var i = 0
+    while i < digests.length() {
+      if digests[i] == reference {
+        return (R.ok, registry.manifests.ManifestPayload.new(true, reference, oci_manifest_type, "{}"))
+      }
+      i = i + 1
+    }
+    return (R.ok, registry.manifests.absent_payload())
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers.
+
+def digest_of(body String) String {
+  return "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+def put_request(path String, content_type String, body String) httpd.Request {
+  var headers = []
+  if content_type != "" {
+    headers = headers.append(("Content-Type", content_type))
+  }
+  return httpd.Request.new(
+    method: "PUT",
+    target: path,
+    path: path,
+    query: Map.new(),
+    proto: "HTTP/1.1",
+    headers: headers,
+    body: body,
+    params: Map.new()
+  )
+}
+
+def header_value(headers Array[(String, String)], name String) String {
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == name.lower() {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+def error_field(body String, field String) String {
+  case json.decode(body) {
+    (R.error, _) then { return "" }
+    (R.ok, doc) then { return scan_errors(doc, field) }
+  }
+}
+
+def scan_errors(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == "errors" {
+        if value.is(json.JsonArray) {
+          const items = value.items()
+          if items.length() > 0 {
+            return scan_member(items[0], field)
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+def scan_member(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == field {
+        if value.is(json.JsonString) {
+          return value.as_string()
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+def config_digest() String {
+  return digest_of("config-bytes")
+}
+
+def layer_digest() String {
+  return digest_of("layer-bytes")
+}
+
+// A valid image manifest whose config and layer match the fakes' linked set.
+def manifest_body() String {
+  return "{\"schemaVersion\":2,\"mediaType\":\"" + oci_manifest_type
+    + "\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\""
+    + config_digest() + "\",\"size\":11},\"layers\":[{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\""
+    + layer_digest() + "\",\"size\":10}]}"
+}
+
+def index_body(child String) String {
+  return "{\"schemaVersion\":2,\"mediaType\":\"" + oci_index_type
+    + "\",\"manifests\":[{\"mediaType\":\"" + oci_manifest_type + "\",\"digest\":\"" + child + "\",\"size\":10,\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"}}]}"
+}
+
+// ---------------------------------------------------------------------------
+// PUT by tag.
+
+def linked_store() FakeLinks {
+  return FakeLinks.new([config_digest(), layer_digest()], "")
+}
+
+def test_put_by_tag_stores_and_points_the_tag() {
+  const writer = FakeWriter.new()
+  const body = manifest_body()
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, body), FakeStore.new([]), linked_store(), writer)
+  expect_equal(201, response.status)
+  expect_equal("", response.body)
+  expect_equal(digest_of(body), header_value(response.headers, "docker-content-digest"))
+  expect_equal("/v2/acme/app/manifests/" + digest_of(body), header_value(response.headers, "location"))
+  expect_equal(1, writer.put_count())
+  expect_equal("acme/app", writer.put_repository.read())
+  expect_equal(oci_manifest_type, writer.put_media_type.read())
+  expect_equal(body, writer.put_body.read())
+  expect_equal(1, writer.tag_count())
+  expect_equal("v1", writer.tag_name.read())
+  expect_equal(digest_of(body), writer.tag_digest.read())
+}
+
+def test_put_by_digest_does_not_write_a_tag() {
+  const writer = FakeWriter.new()
+  const body = manifest_body()
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/" + digest_of(body), oci_manifest_type, body), FakeStore.new([]), linked_store(), writer)
+  expect_equal(201, response.status)
+  expect_equal(digest_of(body), header_value(response.headers, "docker-content-digest"))
+  expect_equal(0, writer.tag_count())
+}
+
+// ---------------------------------------------------------------------------
+// Validation before any write.
+
+def test_put_by_digest_mismatch_writes_nothing() {
+  const writer = FakeWriter.new()
+  const other = digest_of("a different manifest")
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/" + other, oci_manifest_type, manifest_body()), FakeStore.new([]), linked_store(), writer)
+  expect_equal(400, response.status)
+  expect_equal(api.code_digest_invalid, error_field(response.body, "code"))
+  expect_true(error_field(response.body, "detail").index_of("hashes to") >= 0)
+  expect_equal(0, writer.put_count())
+  expect_equal(0, writer.tag_count())
+}
+
+def test_put_unparseable_body_is_a_400() {
+  const writer = FakeWriter.new()
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, "not json"), FakeStore.new([]), linked_store(), writer)
+  expect_equal(400, response.status)
+  expect_equal(api.code_manifest_invalid, error_field(response.body, "code"))
+  expect_equal(0, writer.put_count())
+}
+
+def test_put_content_type_disagreeing_with_body_is_a_400() {
+  const writer = FakeWriter.new()
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_index_type, manifest_body()), FakeStore.new([]), linked_store(), writer)
+  expect_equal(400, response.status)
+  expect_equal(api.code_manifest_invalid, error_field(response.body, "code"))
+  expect_equal(0, writer.put_count())
+}
+
+def test_put_without_any_media_type_is_a_400() {
+  const writer = FakeWriter.new()
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", "", "{\"schemaVersion\":2}"), FakeStore.new([]), linked_store(), writer)
+  expect_equal(400, response.status)
+  expect_equal(api.code_manifest_invalid, error_field(response.body, "code"))
+  expect_equal(0, writer.put_count())
+}
+
+def test_put_resolves_the_type_from_the_body_alone() {
+  const writer = FakeWriter.new()
+  const body = manifest_body()
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", "", body), FakeStore.new([]), linked_store(), writer)
+  expect_equal(201, response.status)
+  expect_equal(oci_manifest_type, writer.put_media_type.read())
+}
+
+def test_put_invalid_tag_is_a_400() {
+  const writer = FakeWriter.new()
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/-bad", oci_manifest_type, manifest_body()), FakeStore.new([]), linked_store(), writer)
+  expect_equal(400, response.status)
+  expect_equal(api.code_tag_invalid, error_field(response.body, "code"))
+  expect_equal(0, writer.put_count())
+}
+
+def test_put_invalid_repository_name_is_a_400() {
+  const writer = FakeWriter.new()
+  const response = manifests.handle(put_request("/v2/ACME/app/manifests/v1", oci_manifest_type, manifest_body()), FakeStore.new([]), linked_store(), writer)
+  expect_equal(400, response.status)
+  expect_equal(api.code_name_invalid, error_field(response.body, "code"))
+  expect_equal(0, writer.put_count())
+}
+
+// ---------------------------------------------------------------------------
+// Reference checks.
+
+def test_put_with_a_missing_layer_is_a_404() {
+  const writer = FakeWriter.new()
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, manifest_body()), FakeStore.new([]), FakeLinks.new([config_digest()], ""), writer)
+  expect_equal(404, response.status)
+  expect_equal(api.code_manifest_blob_unknown, error_field(response.body, "code"))
+  expect_equal(layer_digest(), error_field(response.body, "detail"))
+  expect_equal(0, writer.put_count())
+  expect_equal(0, writer.tag_count())
+}
+
+def test_put_with_a_missing_config_is_a_404() {
+  const writer = FakeWriter.new()
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, manifest_body()), FakeStore.new([]), FakeLinks.new([layer_digest()], ""), writer)
+  expect_equal(404, response.status)
+  expect_equal(api.code_manifest_blob_unknown, error_field(response.body, "code"))
+  expect_equal(config_digest(), error_field(response.body, "detail"))
+}
+
+def test_put_an_index_with_a_missing_child_is_a_404() {
+  const writer = FakeWriter.new()
+  const child = digest_of("child-manifest")
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_index_type, index_body(child)), FakeStore.new([]), FakeLinks.new([], ""), writer)
+  expect_equal(404, response.status)
+  expect_equal(api.code_manifest_blob_unknown, error_field(response.body, "code"))
+  expect_equal(child, error_field(response.body, "detail"))
+  expect_equal(0, writer.put_count())
+}
+
+def test_put_an_index_with_present_children_stores() {
+  const writer = FakeWriter.new()
+  const child = digest_of("child-manifest")
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_index_type, index_body(child)), FakeStore.new([child]), FakeLinks.new([], ""), writer)
+  expect_equal(201, response.status)
+  expect_equal(1, writer.put_count())
+  expect_equal(oci_index_type, writer.put_media_type.read())
+}
+
+def test_put_with_empty_layers_needs_no_blobs() {
+  const writer = FakeWriter.new()
+  const body = "{\"schemaVersion\":2,\"mediaType\":\"" + oci_manifest_type
+    + "\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\""
+    + config_digest() + "\",\"size\":11},\"layers\":[]}"
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, body), FakeStore.new([]), FakeLinks.new([config_digest()], ""), writer)
+  expect_equal(201, response.status)
+  expect_equal(1, writer.put_count())
+}
+
+def test_put_accepts_a_subject_that_is_not_present() {
+  const writer = FakeWriter.new()
+  const body = "{\"schemaVersion\":2,\"mediaType\":\"" + oci_manifest_type
+    + "\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\""
+    + config_digest() + "\",\"size\":11},\"layers\":[],\"subject\":{\"mediaType\":\""
+    + oci_manifest_type + "\",\"digest\":\"" + digest_of("absent-subject") + "\",\"size\":7}}"
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, body), FakeStore.new([]), FakeLinks.new([config_digest()], ""), writer)
+  expect_equal(201, response.status)
+  expect_equal(1, writer.put_count())
+}
+
+// ---------------------------------------------------------------------------
+// Tags.
+
+def test_tag_update_moves_the_tag() {
+  const writer = FakeWriter.new()
+  const first = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, manifest_body()), FakeStore.new([]), linked_store(), writer)
+  expect_equal(201, first.status)
+  const body2 = "{\"schemaVersion\":2,\"mediaType\":\"" + oci_manifest_type
+    + "\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\""
+    + config_digest() + "\",\"size\":11},\"layers\":[]}"
+  const second = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, body2), FakeStore.new([]), linked_store(), writer)
+  expect_equal(201, second.status)
+  expect_equal(2, writer.tag_count())
+  expect_equal(digest_of(body2), writer.tag_digest.read())
+}
+
+def test_tag_grammar() {
+  expect_true(manifests.valid_tag("v1"))
+  expect_true(manifests.valid_tag("latest"))
+  expect_true(manifests.valid_tag("1.2.3-alpha_build.1"))
+  expect_true(manifests.valid_tag("_ok"))
+  expect_true(!manifests.valid_tag(""))
+  expect_true(!manifests.valid_tag("-bad"))
+  expect_true(!manifests.valid_tag(".bad"))
+  expect_true(!manifests.valid_tag("a b"))
+  expect_true(!manifests.valid_tag("a/b"))
+  expect_true(!manifests.valid_tag(long_tag()))
+}
+
+def long_tag() String {
+  var out = "a"
+  var i = 0
+  while i < 128 {
+    out = out + "b"
+    i = i + 1
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Failures and routing.
+
+def test_put_store_failure_is_a_500() {
+  const writer = FakeWriter.new()
+  writer.fail_put.replace("database is down")
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, manifest_body()), FakeStore.new([]), linked_store(), writer)
+  expect_equal(500, response.status)
+  expect_equal(api.code_unknown, error_field(response.body, "code"))
+}
+
+def test_put_tag_failure_is_a_500() {
+  const writer = FakeWriter.new()
+  writer.fail_tag.replace("database is down")
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, manifest_body()), FakeStore.new([]), linked_store(), writer)
+  expect_equal(500, response.status)
+  expect_equal(api.code_unknown, error_field(response.body, "code"))
+}
+
+def test_put_link_check_failure_is_a_500() {
+  const writer = FakeWriter.new()
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, manifest_body()), FakeStore.new([]), FakeLinks.new([], "database is down"), writer)
+  expect_equal(500, response.status)
+  expect_equal(api.code_unknown, error_field(response.body, "code"))
+}
+
+def test_unrouted_methods_are_405s() {
+  const response = manifests.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, manifest_body()), FakeStore.new([]), linked_store(), FakeWriter.new())
+  expect_equal(201, response.status)
+  const post = manifests.handle(make_post("/v2/acme/app/manifests/latest"), FakeStore.new([]), linked_store(), FakeWriter.new())
+  expect_equal(405, post.status)
+  expect_equal("GET, HEAD, PUT", header_value(post.headers, "allow"))
+}
+
+def make_post(path String) httpd.Request {
+  return httpd.Request.new(
+    method: "POST",
+    target: path,
+    path: path,
+    query: Map.new(),
+    proto: "HTTP/1.1",
+    headers: [],
+    body: "",
+    params: Map.new()
+  )
+}
+
+def test_the_router_dispatches_manifest_put() {
+  case registry.blobstore.open(tmp_root("put-router")) {
+    (R.error, why) then { expect_true(false) }
+    (R.ok, store) then {
+      const config = registry.config.RegistryConfig.new(
+        registry.config.RegistryListen.new("127.0.0.1", 5000),
+        "/tmp/pf-put-router",
+        "/tmp/pf-put-router/registry.db",
+        registry.config.RegistryStore.new("fs", "/tmp/pf-put-router/blobs", registry.config.default_s3()),
+        registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
+        "/tmp/pf-put-router/shutdown",
+        "<test>"
+      )
+      const links = FakeLinks.new([config_digest(), layer_digest()], "")
+      const service = registry.router.Service.new(
+        config,
+        PutFakeDb.new(),
+        PutFakeHealth.new(),
+        store,
+        links,
+        FakeStore.new([]),
+        PutFakeUploads.new(),
+        FakeWriter.new()
+      )
+      const body = manifest_body()
+      const response = registry.router.handle(put_request("/v2/acme/app/manifests/v1", oci_manifest_type, body), service)
+      expect_equal(201, response.status)
+      expect_equal(digest_of(body), header_value(response.headers, "docker-content-digest"))
+      expect_equal("registry/2.0", header_value(response.headers, "docker-distribution-api-version"))
+      expect_true(header_value(response.headers, "x-request-id") != "")
+    }
+  }
+}
+
+class PutFakeDb {
+  def init() {
+  }
+
+  def ping() Bool {
+    return true
+  }
+
+  def path() String {
+    return "/tmp/fake.db"
+  }
+}
+
+class PutFakeHealth {
+  def init() {
+  }
+
+  def probe() (R, String) {
+    return (R.ok, "fs:/tmp/fake")
+  }
+}
+
+class PutFakeUploads {
+  def init() {
+  }
+
+  def start(repository String) (R, String) {
+    return (R.ok, "sess-1")
+  }
+
+  def lookup(id String) (R, registry.uploads.UploadSession) {
+    return (R.ok, registry.uploads.absent_session())
+  }
+
+  def append(id String, body String, start Int64, ranged Bool) (R, Int64) {
+    return (R.error, "fake: append")
+  }
+
+  def complete(id String, digest String, size Int64) (R, Bool) {
+    return (R.ok, true)
+  }
+
+  def cancel(id String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def part_path(id String) (R, String) {
+    return (R.ok, "/tmp/fake-part")
+  }
+}
+
+def tmp_root(name String) String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base + "pokerface-registry-manifest-put-" + os.getpid().to_string() + "-" + name
+}

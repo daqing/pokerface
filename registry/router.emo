@@ -9,7 +9,7 @@
 require "httpd"
 
 class Service {
-  def init(config registry.config.RegistryConfig, db registry.health.DbHealth, blob registry.blobstore.BlobHealth, blob_store registry.blobstore.BlobStore, blob_links registry.blobs.BlobLinks, manifests registry.manifests.ManifestStore, uploads registry.uploads.UploadSessions) {
+  def init(config registry.config.RegistryConfig, db registry.health.DbHealth, blob registry.blobstore.BlobHealth, blob_store registry.blobstore.BlobStore, blob_links registry.blobs.BlobLinks, manifests registry.manifests.ManifestStore, uploads registry.uploads.UploadSessions, manifest_writer registry.manifests.ManifestWriter) {
     self.config = config
     self.db = db
     self.blob = blob
@@ -17,6 +17,7 @@ class Service {
     self.blob_links = blob_links
     self.manifests = manifests
     self.uploads = uploads
+    self.manifest_writer = manifest_writer
   }
 }
 
@@ -34,7 +35,7 @@ def route(req httpd.Request, service Service) httpd.Response {
     return registry.blobs.handle(req, service.blob_links, service.blob_store)
   }
   if registry.manifests.is_route(req.path) {
-    return registry.manifests.handle(req, service.manifests)
+    return registry.manifests.handle(req, service.manifests, service.blob_links, service.manifest_writer)
   }
   if req.path == "/v2" || req.path == "/v2/" {
     if req.method != "GET" {

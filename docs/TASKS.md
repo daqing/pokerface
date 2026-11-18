@@ -357,7 +357,7 @@ Exit criteria:
 | [x] | T2.9 | Blob GET and 307 presigned redirect | T2.4, T2.6, T2.8 | 2-3h |
 | [x] | T2.10 | Blob upload: POST / PUT | T2.4, T2.7 | 3h |
 | [x] | T2.11 | Chunked upload and resumable transfers: PATCH / GET / DELETE | T2.10 | 3h |
-| [ ] | T2.12 | Manifest PUT and tag updates | T2.3, T2.10, T2.11 | 2-3h |
+| [x] | T2.12 | Manifest PUT and tag updates | T2.3, T2.10, T2.11 | 2-3h |
 | [ ] | T2.13 | Resolve / metadata API | T2.8, T2.12 | 2h |
 | [ ] | T2.14 | Authentication and token service | T2.7 | 3-4h |
 | [ ] | T2.15 | Cache headers, ETag, and CDN behavior | T2.8, T2.9 | 2h |
@@ -517,6 +517,8 @@ Suggested tables:
 **Acceptance**: `oras push` / `skopeo copy` succeeds; missing references return `MANIFEST_BLOB_UNKNOWN`; tag updates are atomic; the response includes `Docker-Content-Digest`; a failure does not overwrite the old tag.
 
 **Depends on**: T2.3, T2.10, T2.11 · **Estimate**: 2-3h
+
+> **Notes** (2026-11-19, ~2.5h): Done. `registry/manifests.emo` gained the write half: `PUT /v2/<name>/manifests/<tag|digest>` stores the bytes **verbatim** under their digest (`ManifestWriter` interface; `DbManifests.put` hashes and `INSERT OR IGNORE`s — re-push is a one-row no-op) and, for a tag reference, points the tag with a single `INSERT OR REPLACE` (atomic; a failure never disturbs the old tag). Validation runs before any write: parse via the T2.3 `parse_document` (Content-Type ↔ body `mediaType` must agree; either may stand alone → 400 `MANIFEST_INVALID`), a digest reference must match the body's hash (400 `DIGEST_INVALID` naming both), a tag must satisfy the OCI grammar `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}` (400 `TAG_INVALID`; `/` is not a tag so the digest check runs first), and the repository name is checked because PUT creates the row (400 `NAME_INVALID`). Every reference must exist: a manifest's config + layers are checked against the repository's blob links, an index's children against stored manifests — the first miss is `404 MANIFEST_BLOB_UNKNOWN` naming the digest with nothing written. Lookup failures inside the check answer 500, distinct from misses. The `subject` descriptor is deliberately unchecked (the spec requires accepting an absent subject; the T2.3 parser drops it). Success: `201` + `Location` + `Docker-Content-Digest`. Service carries `manifest_writer` (the same `DbManifests` instance serves both interfaces), so the three T2.x test files' ctors and the GET tests' `handle` calls gained the new arguments. Tests: 22 in `test/registry_manifest_put.emo` (tag/digest puts, mismatch, parse/type/disagreement 400s, tag grammar, name grammar, missing config/layer/child → 404 with the digest, empty layers, subject accepted, tag-move sequence, store/tag/link-check 500s, 405 with `Allow: GET, HEAD, PUT`, router dispatch) + 10 db_selftest checks (verbatim round-trip, digest answer, re-put no-op, tag point/update, unknown-repository tag rejected); `emo test` 425/425, db selftest 114/114. **Manually verified: a full `skopeo copy oci:… docker://127.0.0.1:…` push now succeeds end to end** (blob uploads were T2.11; the manifest step that failed before lands here), manifest GET/HEAD by tag return the exact bytes with `Docker-Content-Digest`, and a curl PUT with an empty-layers manifest moved a tag (201, new digest served). Gotchas: the reference-check helper needed a three-way answer (present/missing/failure) — a two-tuple conflated a link-store failure with a missing blob and answered 404 where 500 belonged; caught by the tests.
 
 #### T2.13 Resolve / Metadata API
 
