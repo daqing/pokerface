@@ -64,27 +64,46 @@ def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) 
 }
 
 // The chain without any output: ref -> commit -> lock -> image -> digests.
-// Offline accepts only a full commit SHA and reads the lock from the mirror
-// cache with a plain `git show` (never a fetch).
+// Offline resolves the ref through the cache's ref -> commit map (written by
+// every online resolution) and reads the lock from the mirror cache with a
+// plain `git show` (never a fetch).
 def resolution_with_settings(flags src.common.Flags, parsed src.ref.Reference, settings src.settings.AppSettings, offline Bool) (R, ResolveResult) {
   const wanted = parsed.ref
+  const cache_root = src.cache.root_of(settings)
+  var commit = ""
   if offline {
-    if wanted.length() != 40 || !src.git.all_hex(wanted) {
-      return (R.error, "offline: the reference must be a full 40-character commit SHA when offline")
+    if wanted.length() == 40 && src.git.all_hex(wanted) {
+      commit = wanted
+    } else {
+      if cache_root == "" {
+        return (R.error, "offline: no cache directory is available (set POKERFACE_CACHE_DIR or HOME)")
+      }
+      case src.cache.read_ref(cache_root, parsed.git_url, wanted) {
+        (R.error, why) then { return (R.error, "offline: " + why) }
+        (R.ok, cached) then { commit = cached }
+      }
+    }
+  } else {
+    const runner = src.git.RealRunner.new()
+    case src.git.resolve(runner, parsed.git_url, wanted, resolve_timeout(flags)) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, resolved) then {
+        commit = resolved
+        if cache_root != "" {
+          // The ref map lives in the cache layout, which may not exist yet on
+          // the first pull; adopt/create it before the atomic write.
+          const (_, _) = src.cache.ensure_root(cache_root)
+          const (_, _) = src.cache.write_ref(cache_root, parsed.git_url, wanted, commit)
+        }
+      }
     }
   }
-  const runner = src.git.RealRunner.new()
-  case src.git.resolve(runner, parsed.git_url, wanted, resolve_timeout(flags)) {
+  case load_doc_with_settings(flags, parsed, commit, settings, offline) {
     (R.error, why) then { return (R.error, why) }
-    (R.ok, commit) then {
-      case load_doc_with_settings(flags, parsed, commit, settings, offline) {
+    (R.ok, doc) then {
+      case pick_image(doc, flags) {
         (R.error, why) then { return (R.error, why) }
-        (R.ok, doc) then {
-          case pick_image(doc, flags) {
-            (R.error, why) then { return (R.error, why) }
-            (R.ok, entry) then { return (R.ok, result_of(parsed, commit, entry)) }
-          }
-        }
+        (R.ok, entry) then { return (R.ok, result_of(parsed, commit, entry)) }
       }
     }
   }
@@ -98,20 +117,11 @@ def resolve_timeout(flags src.common.Flags) Float64 {
 // root comes from settings (POKERFACE_CACHE_DIR or the XDG default); the ref
 // hint is the user's ref, so the fetch touches only what the request needs.
 def load_doc_with_settings(flags src.common.Flags, parsed src.ref.Reference, commit String, settings src.settings.AppSettings, offline Bool) (R, src.lockfile.LockDoc) {
-  const cache_root = cache_root_of(settings)
+  const cache_root = src.cache.root_of(settings)
   if offline {
     return load_lock_offline(src.git.RealRunner.new(), parsed.git_url, commit, cache_root, resolve_timeout(flags))
   }
   return src.git_cache.load_lock(src.git.RealRunner.new(), parsed.git_url, commit, parsed.ref, cache_root, resolve_timeout(flags))
-}
-
-// The cache root shared by the Git mirror, manifests, and blobs (T1.15 owns
-// its lifecycle). "" means no HOME/XDG value was available.
-def cache_root_of(settings src.settings.AppSettings) String {
-  if settings.cache_dir != "" {
-    return settings.cache_dir
-  }
-  return src.git_cache.default_cache_root()
 }
 
 def load_lock_offline(runner src.git.CommandRunner, git_url String, commit String, cache_root String, timeout Float64) (R, src.lockfile.LockDoc) {

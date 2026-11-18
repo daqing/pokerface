@@ -84,7 +84,7 @@
 | [x] | T1.12 | OCI 镜像布局组装 | T1.10、T1.11 | 2-3h |
 | [x] | T1.13 | 运行时导入适配 | T1.12 | 3h |
 | [x] | T1.14 | `pull` 命令串联与失败回退 | T1.9-T1.13 | 3h |
-| [ ] | T1.15 | 本地缓存与离线模式 | T1.7、T1.14 | 2-3h |
+| [x] | T1.15 | 本地缓存与离线模式 | T1.7、T1.14 | 2-3h |
 | [ ] | T1.16 | 错误模型、退出码与日志 | T1.1 | 2h |
 | [ ] | T1.17 | M1 测试基线、E2E 脚本与规范文档 | T1.1-T1.16 | 2-3h |
 
@@ -300,6 +300,8 @@ images:
 **验收**：第二次 pull 在断网时可用；损坏缓存能被识别并淘汰；容量上限生效；`cache rm` 不误删非 pokerface 目录；并发读写安全。
 
 **依赖**：T1.7、T1.14 · **预估**：2-3h
+
+> **备注**（2026-11-18，约 3h）：完成。`src/cache.emo` 统一管理整个缓存：Git 镜像、Manifest envelope、内容寻址 Blob，以及 ref → commit 映射；`src/commands/cache.emo` 实现 `cache ls` / `rm` / `verify`。**安全**：根目录由 `.pokerface-cache` 标记文件标识；`ensure_root` 只接管空目录或仅含已知子目录的目录（T1.14 布局）并写入标记，其他目录一律拒绝，因此 `cache rm` 不会误删无关目录。破坏性操作通过 `<root>/.lock` 目录串行化，删除时按 stat 报告的类型判断、绝不跟随符号链接。**Manifest** 改为单文件 JSON envelope（body + 元数据），用带 pid 的 `.part` 名原子写入，并发写同一个 key 不会出现 body/元数据错配；旧的两文件格式可被接管，遗留文件由 verify 清理。**Refs** 为 `<sha256(git_url\nref)> -> commit`，每次在线解析都会写入（写入前先 ensure_root），`--offline` 读取它，因此分支/标签名无需完整 SHA 也能离线拉取。**容量**：`POKERFACE_CACHE_TTL`（秒或 `<n>s/m/h/d`）与 `POKERFACE_CACHE_MAX_SIZE`（字节或 `<n>K/M/G/T`，1024 进制）在 settings 中解析，每次成功 pull 后尽力执行；先按 TTL 过期，再按最旧优先淘汰到上限内。**命令**：`cache ls`（人类/JSON）、`cache verify [--check]`（默认修复：Blob 哈希、Manifest envelope、ref 映射、Git 镜像 `git fsck`；仍有问题则退出 1）、`cache rm [--all|--git|--manifests|--blobs|--refs]`（清空选中分区，保留根目录和标记，根目录不存在时为空操作）。测试：`test/cache_cmd.emo` 20 个、`test/settings.emo` 3 个容量解析用例、`test/cli.emo` 2 个 cache 路由用例，且 T1.14 的完整命令测试新增同 ref 的离线二次拉取；`emo test` 199/199。**已手工验证**真实缓存（由真实 pull 经 Docker/skopeo 路径填充）：`cache ls` 正确显示 git/manifests/blobs/refs，`verify` 干净；破坏一个 Blob 后 `verify --check` 退出 1、`verify` 将其淘汰；`cache rm --manifests` 与 `cache rm` 只清对应分区且标记保留；外部目录被拒绝且哨兵文件完好；停掉注册表后按分支名离线拉取成功。测试镜像已删除。文档：`docs/spec/cache.md`、`docs/spec/pull.md`、`docs/spec/config.md`、`docs/cli.md`、`docs/notes/git-cache-layout.md`。踩坑：Emo 没有 `else if`（要嵌套 `else`）；`os` 没有 stat，缓存通过 runner 调用 BSD `stat -f "%z %m %HT"` / GNU `stat -c "%s %Y %F"`；`write_atomic` 必须用带 pid 的临时文件名，否则同一 key 的两个写者会共用 `.part`；首次在线 pull 必须先 `ensure_root` 再 `write_ref`，因为 refs 目录尚不存在（手工冒烟时发现）。
 
 #### T1.16 错误模型、退出码与日志
 

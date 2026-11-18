@@ -27,6 +27,14 @@ config: /path/to/config.yaml: not found (--config): os: open_read ...
 | Registry URL | `POKERFACE_REGISTRY_URL` | `registry.url` | *(unset)* |
 | Registry token | `POKERFACE_REGISTRY_TOKEN` | `registry.token` | *(unset)* |
 | Cache directory | `POKERFACE_CACHE_DIR` | `cache_dir` | `git_cache.default_cache_root()` |
+| Cache TTL | `POKERFACE_CACHE_TTL` | — | *(disabled)* |
+| Cache size limit | `POKERFACE_CACHE_MAX_SIZE` | — | *(disabled)* |
+
+The cache limits are environment-only for now. `POKERFACE_CACHE_TTL` accepts
+seconds or `<n>s/m/h/d`; `POKERFACE_CACHE_MAX_SIZE` accepts bytes or
+`<n>K/M/G/T` (1024-based). `0` disables either limit. Invalid values are
+errors naming the variable (`config: POKERFACE_CACHE_TTL: expected seconds or
+<n>s/m/h/d, got 'soon'`). See `docs/spec/cache.md` for enforcement.
 
 Environment variables override file values when set to a non-empty string;
 an unset variable leaves the file value in place. Invalid environment values

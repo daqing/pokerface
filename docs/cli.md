@@ -1,7 +1,7 @@
 # CLI Reference
 
-> Status: `resolve`, `pull`, and `version` are implemented; `build`, `config`,
-> and `cache` report "not implemented yet" on stderr and exit 1 until their
+> Status: `resolve`, `pull`, `cache`, and `version` are implemented; `build`
+> and `config` report "not implemented yet" on stderr and exit 1 until their
 > tasks land. The plan lives in `docs/TASKS.md`.
 
 ## Usage
@@ -18,7 +18,7 @@ pokerface [global flags] <command> [args]
 | pull     | implemented     | Fetch an image, verify it, and import it into the runtime (T1.14) |
 | build    | not implemented | Build and push the image described by `pokerface.yaml` (T4.1)  |
 | config   | not implemented | Show the effective configuration (T1.8)                        |
-| cache    | not implemented | Inspect and manage the local cache (T1.15)                     |
+| cache    | implemented     | Inspect and manage the local cache (T1.15)                     |
 | version  | implemented     | Print the version; `--json` prints `{"name": ..., "version": ...}` |
 
 ## Global flags
@@ -30,7 +30,7 @@ Flags are parsed before the first positional argument; the value form
 | ---------------- | ---------------------------------------------------------- |
 | `--config <path>` | Configuration file path (see docs/spec/config.md)          |
 | `--verbose`       | Verbose logging (wired up in T1.16)                       |
-| `--json`          | Machine-readable output (`version`, `resolve`, `pull`)     |
+| `--json`          | Machine-readable output (`version`, `resolve`, `pull`, `cache ls`/`rm`/`verify`) |
 | `-h`, `--help`    | Show the help text and exit 0                             |
 
 ## Exit codes
@@ -156,3 +156,42 @@ runtime import`. Behavior:
 Exit codes: 0 success; 2 for a missing/malformed reference or an invalid
 option value (unknown tag/platform); 1 for Git, manifest, blob, layout, or
 import failures. Full behavior: `docs/spec/pull.md`.
+
+### The `cache` command (T1.15)
+
+```console
+$ pokerface cache ls
+cache: /Users/me/.cache/pokerface
+  git        1 entries  27.4 KiB
+  manifests  1 entries  719 B
+  blobs      2 entries  29.3 MiB
+  refs       1 entries  41 B
+  total      5 entries  29.3 MiB
+  limits     ttl=(unset) max_size=(unset)
+```
+
+```text
+pokerface cache ls
+pokerface cache verify [--check]
+pokerface cache rm [--all | --git | --manifests | --blobs | --refs]
+```
+
+- `ls` reports per-section entry counts and sizes; `--json` gives the same
+  data plus the configured limits.
+- `verify` checks blobs, manifest envelopes, ref maps, and Git mirrors
+  (`git fsck`). It **repairs by default** — corrupt entries and temp debris
+  are evicted; `--check` only reports and exits 1 if anything is wrong.
+- `rm` clears the selected sections (default: all) and recreates them empty.
+  It never removes the cache root, the marker, or anything outside the known
+  section directories, and refuses a directory that is not a pokerface cache.
+  A missing cache is a no-op.
+
+Limits come from the environment:
+
+| Variable | Example | Effect |
+| --- | --- | --- |
+| `POKERFACE_CACHE_TTL` | `7d` | Evict entries older than this. |
+| `POKERFACE_CACHE_MAX_SIZE` | `2G` | Evict oldest entries until the total fits (1024-based). |
+
+Limits are enforced after each successful pull. Full behavior:
+`docs/spec/cache.md`.

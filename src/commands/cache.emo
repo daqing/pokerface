@@ -1,0 +1,321 @@
+// T1.15: the `cache` command — ls, rm, and verify over the shared cache
+// primitives in src/cache.emo. `verify` repairs by default (evicts corrupt
+// or orphaned entries); --check reports without touching anything.
+
+require "os"
+require "file"
+
+const cache_all_sections = ["git", "manifests", "blobs", "refs"]
+
+def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) Int64 {
+  if rest.length() == 0 {
+    src.common.eprint("pokerface: cache expects ls, rm, or verify\n")
+    return src.common.exit_usage
+  }
+  const sub = rest[0]
+  const args = tail(rest)
+  case sub {
+    "ls" then { return run_ls(flags, args, env) }
+    "rm" then { return run_rm(flags, args, env) }
+    "verify" then { return run_verify(flags, args, env) }
+    _ then {
+      src.common.eprint("pokerface: cache: unknown subcommand '" + sub + "' (expected ls, rm, or verify)\n")
+      return src.common.exit_usage
+    }
+  }
+}
+
+def tail(items Array[String]) Array[String] {
+  var out = []
+  var i = 1
+  while i < items.length() {
+    out = out.append(items[i])
+    i = i + 1
+  }
+  return out
+}
+
+def load_root(flags src.common.Flags, env src.settings.EnvSource) (R, (String, src.settings.AppSettings)) {
+  case src.settings.load(src.git.RealRunner.new(), env, flags.config) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, settings) then {
+      const root = src.cache.root_of(settings)
+      if root == "" {
+        return (R.error, "no cache directory is available (set POKERFACE_CACHE_DIR or HOME)")
+      }
+      return (R.ok, (root, settings))
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// cache ls
+
+def run_ls(flags src.common.Flags, args Array[String], env src.settings.EnvSource) Int64 {
+  if args.length() > 0 {
+    src.common.eprint("pokerface: cache ls takes no arguments\n")
+    return src.common.exit_usage
+  }
+  case load_root(flags, env) {
+    (R.error, why) then {
+      src.common.eprint("pokerface: cache ls: " + why + "\n")
+      return src.common.exit_failure
+    }
+    (R.ok, pair) then {
+      const (root, settings) = pair
+      case src.cache.ls(src.git.RealRunner.new(), root) {
+        (R.error, why) then {
+          src.common.eprint("pokerface: cache ls: " + why + "\n")
+          return src.common.exit_failure
+        }
+        (R.ok, stats) then {
+          if flags.json {
+            println(stats_json(stats, settings))
+          } else {
+            print_stats(stats, settings)
+          }
+          return src.common.exit_ok
+        }
+      }
+    }
+  }
+}
+
+def print_stats(stats src.cache.CacheStats, settings src.settings.AppSettings) {
+  println("cache: " + stats.root)
+  var i = 0
+  while i < stats.sections.length() {
+    const s = stats.sections[i]
+    println("  " + pad(s.name, 10) + " " + s.entries.to_string() + " entries  " + src.cache.format_bytes(s.bytes))
+    i = i + 1
+  }
+  println("  " + pad("total", 10) + " " + stats.total_entries().to_string() + " entries  " + src.cache.format_bytes(stats.total_bytes()))
+  var ttl = "(unset)"
+  if settings.cache_ttl_seconds > 0 {
+    ttl = settings.cache_ttl_seconds.to_string() + "s"
+  }
+  var max_size = "(unset)"
+  if settings.cache_max_bytes > 0 {
+    max_size = src.cache.format_bytes(settings.cache_max_bytes)
+  }
+  println("  " + pad("limits", 10) + " ttl=" + ttl + " max_size=" + max_size)
+}
+
+def stats_json(stats src.cache.CacheStats, settings src.settings.AppSettings) String {
+  var out = "{"
+  out = out + "\"root\": \"" + stats.root + "\", \"sections\": ["
+  var i = 0
+  while i < stats.sections.length() {
+    if i > 0 {
+      out = out + ", "
+    }
+    const s = stats.sections[i]
+    out = out + "{\"name\": \"" + s.name + "\", \"entries\": " + s.entries.to_string()
+    out = out + ", \"bytes\": " + s.bytes.to_string()
+    out = out + ", \"oldest\": " + s.oldest.to_string() + ", \"newest\": " + s.newest.to_string() + "}"
+    i = i + 1
+  }
+  out = out + "], \"total_entries\": " + stats.total_entries().to_string()
+  out = out + ", \"total_bytes\": " + stats.total_bytes().to_string()
+  out = out + ", \"ttl\": " + settings.cache_ttl_seconds.to_string()
+  out = out + ", \"max_bytes\": " + settings.cache_max_bytes.to_string()
+  out = out + "}"
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// cache rm
+
+def run_rm(flags src.common.Flags, args Array[String], env src.settings.EnvSource) Int64 {
+  case parse_rm_sections(args) {
+    (R.error, why) then {
+      src.common.eprint("pokerface: cache rm: " + why + "\n")
+      return src.common.exit_usage
+    }
+    (R.ok, sections) then {
+      case load_root(flags, env) {
+        (R.error, why) then {
+          src.common.eprint("pokerface: cache rm: " + why + "\n")
+          return src.common.exit_failure
+        }
+        (R.ok, pair) then {
+          const (root, _) = pair
+          case src.cache.remove(src.git.RealRunner.new(), root, sections) {
+            (R.error, why) then {
+              src.common.eprint("pokerface: cache rm: " + why + "\n")
+              return src.common.exit_failure
+            }
+            (R.ok, report) then {
+              if flags.json {
+                println(remove_json(root, report))
+              } else {
+                println("cache:   " + root)
+                println("removed: " + report.entries.to_string() + " entries, " + src.cache.format_bytes(report.bytes))
+                println("sections: " + join_list(report.sections))
+              }
+              return src.common.exit_ok
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+def parse_rm_sections(args Array[String]) (R, Array[String]) {
+  var selected = []
+  var all = false
+  var i = 0
+  while i < args.length() {
+    const arg = args[i]
+    case arg {
+      "--all" then { all = true }
+      "--git" then { selected = selected.append("git") }
+      "--manifests" then { selected = selected.append("manifests") }
+      "--blobs" then { selected = selected.append("blobs") }
+      "--refs" then { selected = selected.append("refs") }
+      _ then { return (R.error, "unknown option " + arg + " (expected --all, --git, --manifests, --blobs, --refs)") }
+    }
+    i = i + 1
+  }
+  if all || selected.length() == 0 {
+    return (R.ok, cache_all_sections)
+  }
+  return (R.ok, selected)
+}
+
+def remove_json(root String, report src.cache.RemoveReport) String {
+  var out = "{"
+  out = out + "\"root\": \"" + root + "\""
+  out = out + ", \"entries\": " + report.entries.to_string()
+  out = out + ", \"bytes\": " + report.bytes.to_string()
+  out = out + ", \"sections\": [" + json_string_list(report.sections) + "]"
+  out = out + "}"
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// cache verify
+
+def run_verify(flags src.common.Flags, args Array[String], env src.settings.EnvSource) Int64 {
+  case parse_verify_mode(args) {
+    (R.error, why) then {
+      src.common.eprint("pokerface: cache verify: " + why + "\n")
+      return src.common.exit_usage
+    }
+    (R.ok, fix) then {
+      case load_root(flags, env) {
+        (R.error, why) then {
+          src.common.eprint("pokerface: cache verify: " + why + "\n")
+          return src.common.exit_failure
+        }
+        (R.ok, pair) then {
+          const (root, _) = pair
+          case src.cache.verify(src.git.RealRunner.new(), root, fix) {
+            (R.error, why) then {
+              src.common.eprint("pokerface: cache verify: " + why + "\n")
+              return src.common.exit_failure
+            }
+            (R.ok, report) then {
+              if flags.json {
+                println(verify_json(root, report, fix))
+              } else {
+                print_verify_report(root, report, fix)
+              }
+              if report.issues > report.evicted {
+                return src.common.exit_failure
+              }
+              return src.common.exit_ok
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+def parse_verify_mode(args Array[String]) (R, Bool) {
+  var fix = true
+  var i = 0
+  while i < args.length() {
+    const arg = args[i]
+    case arg {
+      "--fix" then { fix = true }
+      "--check" then { fix = false }
+      _ then { return (R.error, "unknown option " + arg + " (expected --fix or --check)") }
+    }
+    i = i + 1
+  }
+  return (R.ok, fix)
+}
+
+def print_verify_report(root String, report src.cache.VerifyReport, fix Bool) {
+  println("cache:   " + root)
+  println("checked: " + report.checked.to_string() + " entries")
+  println("issues:  " + report.issues.to_string())
+  println("evicted: " + report.evicted.to_string())
+  if report.issues > 0 && !fix {
+    println("run `pokerface cache verify --fix` to evict the corrupt entries")
+  }
+  var i = 0
+  while i < report.notes.length() {
+    println("  " + report.notes[i])
+    i = i + 1
+  }
+}
+
+def verify_json(root String, report src.cache.VerifyReport, fix Bool) String {
+  var out = "{"
+  out = out + "\"root\": \"" + root + "\""
+  out = out + ", \"fix\": " + bool_text(fix)
+  out = out + ", \"checked\": " + report.checked.to_string()
+  out = out + ", \"issues\": " + report.issues.to_string()
+  out = out + ", \"evicted\": " + report.evicted.to_string()
+  out = out + ", \"notes\": [" + json_string_list(report.notes) + "]"
+  out = out + "}"
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Shared output helpers.
+
+def pad(text String, width Int64) String {
+  var out = text
+  while out.length() < width {
+    out = out + " "
+  }
+  return out
+}
+
+def join_list(items Array[String]) String {
+  var out = ""
+  var i = 0
+  while i < items.length() {
+    if i > 0 {
+      out = out + ", "
+    }
+    out = out + items[i]
+    i = i + 1
+  }
+  return out
+}
+
+def json_string_list(items Array[String]) String {
+  var out = ""
+  var i = 0
+  while i < items.length() {
+    if i > 0 {
+      out = out + ", "
+    }
+    out = out + "\"" + items[i] + "\""
+    i = i + 1
+  }
+  return out
+}
+
+def bool_text(value Bool) String {
+  if value {
+    return "true"
+  }
+  return "false"
+}

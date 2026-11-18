@@ -18,7 +18,7 @@ out. Docker Hub is never contacted.
 | `--platform <os>/<arch>` | Select the platform; must be in the lock's `platforms` list. Default: the lock's first platform. |
 | `--tag <tag>` | Image tag to import; must be one of the lock's `tags`. Default: the reference's ref name when it is a listed tag, else the only tag, else `latest`. |
 | `--keep-temp` | Keep the assembled OCI layout (and a containerd archive) after success or failure and print its path. |
-| `--offline` | Use only the local cache: no registry, no blob downloads, no Git fetches. Requires the reference to be a full 40-character commit SHA and a warm cache. |
+| `--offline` | Use only the local cache: no registry, no blob downloads, no Git fetches. A ref name resolves from the cache's ref → commit map (written by an earlier online run); a cache miss is an error. |
 
 Global flags (`--config`, `--verbose`, `--json`) apply as elsewhere.
 `--verbose` prints the settings summary (token redacted), the resolved chain,
@@ -53,31 +53,34 @@ child by platform, and fetches that child by digest. Every fetch is verified:
 - the selected child must hash to the digest the index named;
 - when the lock pins `manifest_digest`, the final manifest must match it.
 
-## Cache layout (T1.14 subset)
+## Cache
+
+The cache is owned by T1.15 (`docs/spec/cache.md`). Pull uses:
 
 ```text
 <cache_root>/
-  manifests/<sha256(image@reference#platform)>.json   manifest body
-  manifests/<same>.meta                               digest, media type, platform,
-                                                      reference, reference kind
-  blobs/sha256/<hex>                                  content-addressed blobs
+  .pokerface-cache                         marker
+  manifests/<sha256(image@reference#platform)>.json   one JSON envelope: body + metadata
+  blobs/sha256/<hex>                       content-addressed blobs
+  refs/<sha256(git_url\nref)>              ref -> commit map for offline pulls
 ```
 
 `<cache_root>` is `POKERFACE_CACHE_DIR`, else `cache_dir` from the config,
-else `$XDG_CACHE_HOME/pokerface` / `~/.cache/pokerface` (T1.7's default). A
-pull errors clearly when no cache directory can be determined.
+else `$XDG_CACHE_HOME/pokerface` / `~/.cache/pokerface`. A pull errors clearly
+when no cache directory can be determined.
 
-Manifest cache writes are atomic (`.part` + rename) and the meta file is the
-commit point; writes are best effort and never fail a pull. Blob cache files
-are verified by digest and size on every use; an online pull re-downloads a
-corrupted entry, while an offline pull reports it.
-
-T1.15 adds TTL, size limits, eviction, `cache` subcommands, and ref-level
-offline resolution on top of this layout.
+Manifest envelopes and ref maps are written atomically (per-process `.part` +
+rename), and writes are best effort — a read-only cache never fails a pull.
+Blob cache files are verified by digest and size on every use; an online pull
+re-downloads a corrupted entry, while an offline pull reports it. The cache
+limit environment variables (`POKERFACE_CACHE_TTL`,
+`POKERFACE_CACHE_MAX_SIZE`) are enforced after each successful pull, best
+effort.
 
 ## Offline mode
 
-- Git: the reference must be a full commit SHA; the lock is read with
+- Git: a ref name is resolved through the cached ref → commit map; a full
+  40-character commit SHA works without it. The lock is read with
   `git show <sha>:pokerface.lock.yaml` from the mirror cache, never fetched.
 - Manifest: read only from the manifest cache; the cached digest must match
   the lock.

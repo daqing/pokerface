@@ -34,7 +34,7 @@ def help_text() String {
     + "  --json            Machine-readable output where supported\n"
     + "  -h, --help        Show this help\n"
     + "\n"
-    + "build, config, and cache are not implemented yet; see docs/TASKS.md for the plan.\n"
+    + "config is not implemented yet; see docs/TASKS.md for the plan.\n"
   )
 }
 
@@ -92,7 +92,7 @@ def route(argv Array[String]) Int64 {
         // Global flags are handled above. After `pull`, an unrecognized
         // option belongs to the command and is parsed (and rejected) there;
         // other commands have no command-specific options yet.
-        if command == "pull" {
+        if command == "pull" || command == "cache" {
           rest = rest.append(arg)
         } else {
           eprint("pokerface: unknown option " + arg + "; run `pokerface --help` for usage\n")
@@ -122,7 +122,7 @@ def route(argv Array[String]) Int64 {
     "pull" then { return src.commands.pull.run(flags, rest, src.settings.RealEnv.new()) }
     "build" then { return not_implemented(command, flags) }
     "config" then { return not_implemented(command, flags) }
-    "cache" then { return not_implemented(command, flags) }
+    "cache" then { return src.commands.cache.run(flags, rest, src.settings.RealEnv.new()) }
     _ then {
       eprint("pokerface: unknown command \"" + command + "\"; run `pokerface --help` for the command list\n")
       return exit_usage

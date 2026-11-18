@@ -1,0 +1,1306 @@
+// T1.15: one home for the local cache — the Git mirrors (T1.7), the manifest
+// cache, the content-addressed blob cache, and the ref -> commit map that
+// makes a ref pull work offline. Also owns expiry (TTL), the size cap,
+// verification/eviction, and the `cache` commands' primitives.
+//
+// Safety: a marker file names the directory as a pokerface cache, so no
+// destructive operation runs on an unrelated directory; removals never
+// follow symlinks; the manifest cache is one JSON envelope written with an
+// atomic rename, so concurrent readers never see a torn body/meta pair. Spec:
+// docs/spec/cache.md.
+
+require "os"
+require "file"
+require "json"
+require "crypto"
+require "time"
+
+const cache_marker_name = ".pokerface-cache"
+const cache_marker_text = "pokerface-cache-v1\n"
+const cache_lock_name = ".lock"
+const cache_git_dir = "git"
+const cache_manifest_dir = "manifests"
+const cache_blob_dir = "blobs/sha256"
+const cache_ref_dir = "refs"
+const cache_hex_charset = "0123456789abcdef"
+const cache_fsck_timeout = 60.0
+const cache_stat_timeout = 10.0
+
+class CachedManifest {
+  def init(body String, media_type String, digest String, platform String, reference String, kind String) {
+    self.body = body
+    self.media_type = media_type
+    self.digest = digest
+    self.platform = platform
+    self.reference = reference
+    self.kind = kind
+  }
+}
+
+class CacheSection {
+  def init(name String, entries Int64, bytes Int64, oldest Int64, newest Int64) {
+    self.name = name
+    self.entries = entries
+    self.bytes = bytes
+    self.oldest = oldest
+    self.newest = newest
+  }
+}
+
+class CacheStats {
+  def init(root String, sections Array[CacheSection]) {
+    self.root = root
+    self.sections = sections
+  }
+
+  def total_entries() Int64 {
+    var n = 0
+    var i = 0
+    while i < self.sections.length() {
+      n = n + self.sections[i].entries
+      i = i + 1
+    }
+    return n
+  }
+
+  def total_bytes() Int64 {
+    var n = 0
+    var i = 0
+    while i < self.sections.length() {
+      n = n + self.sections[i].bytes
+      i = i + 1
+    }
+    return n
+  }
+}
+
+class VerifyReport {
+  def init(checked Int64, issues Int64, evicted Int64, notes Array[String]) {
+    self.checked = checked
+    self.issues = issues
+    self.evicted = evicted
+    self.notes = notes
+  }
+}
+
+class RemoveReport {
+  def init(entries Int64, bytes Int64, sections Array[String]) {
+    self.entries = entries
+    self.bytes = bytes
+    self.sections = sections
+  }
+}
+
+class EvictReport {
+  def init(evicted Int64, bytes Int64) {
+    self.evicted = evicted
+    self.bytes = bytes
+  }
+}
+
+class CacheEntry {
+  def init(kind String, key String, path String, size Int64, mtime Int64) {
+    self.kind = kind
+    self.key = key
+    self.path = path
+    self.size = size
+    self.mtime = mtime
+  }
+}
+
+class StatInfo {
+  def init(size Int64, mtime Int64, kind String) {
+    self.size = size
+    self.mtime = mtime
+    self.kind = kind
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Root, marker, and directory layout.
+
+def root_of(settings src.settings.AppSettings) String {
+  if settings.cache_dir != "" {
+    return settings.cache_dir
+  }
+  return src.git_cache.default_cache_root()
+}
+
+def marker_path(root String) String {
+  return root + "/" + cache_marker_name
+}
+
+def has_marker(root String) Bool {
+  case file.read(marker_path(root)) {
+    (R.ok, _) then { return true }
+    (R.error, _) then { return false }
+  }
+}
+
+// Creates the cache root, marker, and section directories. An existing
+// directory is adopted only when it is empty or contains nothing but the
+// known section names (the T1.14 layout), so pointing the cache at an
+// unrelated non-empty directory fails instead of writing into it.
+def ensure_root(root String) (R, Bool) {
+  case os.mkdir(root) {
+    (R.ok, _) then { return finish_root_init(root) }
+    (R.error, _) then {
+      case os.list_dir(root) {
+        (R.error, why) then {
+          return (R.error, "cache: cannot use " + root + " as the cache directory: " + why)
+        }
+        (R.ok, entries) then {
+          if has_marker(root) {
+            return finish_root_init(root)
+          }
+          if adoptable(entries) {
+            return finish_root_init(root)
+          }
+          return (R.error, "cache: refusing to use " + root + ": missing " + cache_marker_name + " and the directory is not empty")
+        }
+      }
+    }
+  }
+}
+
+def adoptable(entries Array[String]) Bool {
+  var i = 0
+  while i < entries.length() {
+    if !known_entry(entries[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+def known_entry(name String) Bool {
+  return (
+    name == cache_git_dir
+    || name == cache_manifest_dir
+    || name == "blobs"
+    || name == cache_ref_dir
+    || name == cache_marker_name
+    || name == cache_lock_name
+  )
+}
+
+def finish_root_init(root String) (R, Bool) {
+  if !has_marker(root) {
+    case file.write(marker_path(root), cache_marker_text) {
+      (R.error, why) then { return (R.error, "cache: cannot write " + marker_path(root) + ": " + why) }
+      (R.ok, _) then { }
+    }
+  }
+  case ensure_dir(root + "/" + cache_git_dir) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case ensure_dir(root + "/" + cache_manifest_dir) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case ensure_dir(root + "/blobs") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case ensure_dir(root + "/" + cache_blob_dir) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case ensure_dir(root + "/" + cache_ref_dir) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { return (R.ok, true) }
+  }
+}
+
+def ensure_dir(path String) (R, Bool) {
+  case os.mkdir(path) {
+    (R.ok, _) then { return (R.ok, true) }
+    (R.error, _) then {
+      case os.list_dir(path) {
+        (R.ok, _) then { return (R.ok, true) }
+        (R.error, why) then { return (R.error, "cache: cannot create directory " + path + ": " + why) }
+      }
+    }
+  }
+}
+
+// Read-only commands accept a missing or empty root as "empty", but refuse a
+// populated directory that is not marked as a pokerface cache.
+def check_root_for_read(root String) (R, Bool) {
+  case os.list_dir(root) {
+    (R.error, _) then { return (R.ok, true) }
+    (R.ok, entries) then {
+      if has_marker(root) {
+        return (R.ok, true)
+      }
+      if entries.length() == 0 {
+        return (R.ok, true)
+      }
+      return (R.error, "cache: " + root + " is not a pokerface cache (missing " + cache_marker_name + ")")
+    }
+  }
+}
+
+def acquire_lock(root String) (R, Bool) {
+  const lock = root + "/" + cache_lock_name
+  case os.mkdir(lock) {
+    (R.ok, _) then { return (R.ok, true) }
+    (R.error, _) then {
+      return (R.error, "cache: another cache operation is running (remove " + lock + " if it is stale)")
+    }
+  }
+}
+
+def try_lock(root String) (R, Bool) {
+  case os.mkdir(root + "/" + cache_lock_name) {
+    (R.ok, _) then { return (R.ok, true) }
+    (R.error, _) then { return (R.ok, false) }
+  }
+}
+
+def release_lock(root String) {
+  os.rmdir(root + "/" + cache_lock_name)
+}
+
+// ---------------------------------------------------------------------------
+// Manifest envelope: one file per key, written atomically, so a reader never
+// pairs one writer's body with another writer's metadata.
+
+def manifest_key(image String, reference String, platform String) String {
+  return sha_hex(image + "@" + reference + "#" + platform)
+}
+
+def manifest_path(root String, key String) String {
+  return root + "/" + cache_manifest_dir + "/" + key + ".json"
+}
+
+def write_manifest(root String, key String, body String, media_type String, digest String, platform String, reference String, kind String) (R, Bool) {
+  const doc = json.object([
+    ("body", json.string(body)),
+    ("media_type", json.string(media_type)),
+    ("digest", json.string(digest)),
+    ("platform", json.string(platform)),
+    ("reference", json.string(reference)),
+    ("kind", json.string(kind))
+  ])
+  return write_atomic(manifest_path(root, key), json.encode(doc) + "\n")
+}
+
+// Parses and self-verifies an envelope (body hash, media type, reference
+// kind) without knowing the request that produced it.
+def parse_cached_manifest(text String) (R, CachedManifest) {
+  case json.decode(text) {
+    (R.error, why) then { return (R.error, "cached manifest is invalid JSON: " + why) }
+    (R.ok, doc) then {
+      case string_member(doc, "body") {
+        (R.error, why) then { return (R.error, "cached manifest: body: " + why) }
+        (R.ok, body) then {
+          case string_member(doc, "media_type") {
+            (R.error, why) then { return (R.error, "cached manifest: media_type: " + why) }
+            (R.ok, media_type) then {
+              case string_member(doc, "digest") {
+                (R.error, why) then { return (R.error, "cached manifest: digest: " + why) }
+                (R.ok, digest) then {
+                  case string_member(doc, "platform") {
+                    (R.error, why) then { return (R.error, "cached manifest: platform: " + why) }
+                    (R.ok, platform) then {
+                      case string_member(doc, "reference") {
+                        (R.error, why) then { return (R.error, "cached manifest: reference: " + why) }
+                        (R.ok, reference) then {
+                          case string_member(doc, "kind") {
+                            (R.error, why) then { return (R.error, "cached manifest: kind: " + why) }
+                            (R.ok, kind) then {
+                              case check_envelope(body, media_type, digest, reference, kind) {
+                                (R.error, why) then { return (R.error, why) }
+                                (R.ok, _) then {
+                                  return (R.ok, CachedManifest.new(body, media_type, digest, platform, reference, kind))
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+def check_envelope(body String, media_type String, digest String, reference String, kind String) (R, Bool) {
+  const actual = "sha256:" + sha_hex(body)
+  if actual != digest {
+    return (R.error, "cached manifest is corrupted (metadata says " + digest + ", body hashes to " + actual + ")")
+  }
+  if !src.oci.is_manifest_type(media_type) {
+    return (R.error, "cached media type '" + media_type + "' is not an image manifest")
+  }
+  if kind == "manifest" {
+    if digest != reference {
+      return (R.error, "cached manifest digest " + digest + " does not match its reference " + reference)
+    }
+    return (R.ok, true)
+  }
+  if kind == "index" {
+    return (R.ok, true)
+  }
+  return (R.error, "cached manifest has unknown reference kind '" + kind + "'")
+}
+
+// Reads the entry for a request, enforcing the reference, the requested
+// platform, and the lock's expected digest.
+def read_manifest(root String, key String, reference String, expected String, platform String) (R, CachedManifest) {
+  case file.read(manifest_path(root, key)) {
+    (R.error, why) then { return (R.error, "no cached manifest (" + why + ")") }
+    (R.ok, text) then {
+      case parse_cached_manifest(text) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, cached) then {
+          if cached.reference != reference {
+            return (R.error, "cached manifest is for reference " + cached.reference + ", not " + reference)
+          }
+          if cached.platform != platform {
+            return (R.error, "cached manifest is for platform " + cached.platform + ", not " + platform)
+          }
+          if expected != "" && cached.digest != expected {
+            return (R.error, "cached manifest digest " + cached.digest + " does not match the lock's " + expected)
+          }
+          return (R.ok, cached)
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Blob and ref entries.
+
+def blob_path(root String, digest String) String {
+  return root + "/" + cache_blob_dir + "/" + src.blob.digest_hex(digest)
+}
+
+def blob_ok(path String, digest String, size Int64) Bool {
+  case src.oci.hash_file(path) {
+    (R.ok, info) then {
+      const (actual, actual_size) = info
+      return actual == digest && actual_size == size
+    }
+    (R.error, _) then { return false }
+  }
+}
+
+def ref_key(git_url String, ref String) String {
+  return sha_hex(git_url + "\n" + ref)
+}
+
+def ref_path(root String, git_url String, ref String) String {
+  return root + "/" + cache_ref_dir + "/" + ref_key(git_url, ref)
+}
+
+// The ref -> commit map that lets an offline pull resolve a branch or tag
+// name; written after every successful online resolution.
+def write_ref(root String, git_url String, ref String, commit String) (R, Bool) {
+  return write_atomic(ref_path(root, git_url, ref), commit + "\n")
+}
+
+def read_ref(root String, git_url String, ref String) (R, String) {
+  case file.read(ref_path(root, git_url, ref)) {
+    (R.error, _) then {
+      return (R.error, "no cached resolution for " + git_url + ":" + ref + " (run an online pull first)")
+    }
+    (R.ok, text) then {
+      const commit = text.trim()
+      if commit.length() != 40 || !all_hex(commit) {
+        return (R.error, "cached resolution for " + git_url + ":" + ref + " is corrupted")
+      }
+      return (R.ok, commit)
+    }
+  }
+}
+
+def write_atomic(path String, body String) (R, Bool) {
+  // A per-process temp name: two writers of the same key must not share a
+  // .part file. The final rename is atomic, so a reader sees one complete
+  // envelope, never a body/meta mismatch.
+  const part = path + "." + os.getpid().to_string() + ".part"
+  case file.write(part, body) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then {
+      case os.rename(part, path) {
+        (R.error, why) then {
+          os.unlink(part)
+          return (R.error, why)
+        }
+        (R.ok, _) then { return (R.ok, true) }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Listing and sizing.
+
+def ls(runner src.git.CommandRunner, root String) (R, CacheStats) {
+  case check_root_for_read(root) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case stat_flavor(runner) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, bsd) then {
+      var sections = []
+      case section_stats(runner, bsd, "git", root + "/" + cache_git_dir, true) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, s) then { sections = sections.append(s) }
+      }
+      case section_stats(runner, bsd, "manifests", root + "/" + cache_manifest_dir, false) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, s) then { sections = sections.append(s) }
+      }
+      case section_stats(runner, bsd, "blobs", root + "/" + cache_blob_dir, false) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, s) then { sections = sections.append(s) }
+      }
+      case section_stats(runner, bsd, "refs", root + "/" + cache_ref_dir, false) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, s) then { sections = sections.append(s) }
+      }
+      return (R.ok, CacheStats.new(root, sections))
+    }
+  }
+}
+
+// is_dirs: git's entries are per-url directories; everything else is files.
+def section_stats(runner src.git.CommandRunner, bsd Bool, name String, dir String, is_dirs Bool) (R, CacheSection) {
+  case os.list_dir(dir) {
+    (R.error, _) then { return (R.ok, CacheSection.new(name, 0, 0, 0, 0)) }
+    (R.ok, entries) then {
+      var count = 0
+      var bytes = 0
+      var oldest = 0
+      var newest = 0
+      var i = 0
+      while i < entries.length() {
+        const child = dir + "/" + entries[i]
+        if !is_temp_name(entries[i]) {
+          var size = 0
+          var mtime = 0
+          if is_dirs {
+            case tree_size(runner, bsd, child) {
+              (R.ok, s) then { size = s }
+              (R.error, _) then { size = 0 }
+            }
+            case stat_one(runner, bsd, child) {
+              (R.ok, info) then { mtime = info.mtime }
+              (R.error, _) then { mtime = 0 }
+            }
+          } else {
+            case stat_one(runner, bsd, child) {
+              (R.ok, info) then {
+                size = info.size
+                mtime = info.mtime
+              }
+              (R.error, _) then { }
+            }
+          }
+          count = count + 1
+          bytes = bytes + size
+          if oldest == 0 || (mtime > 0 && mtime < oldest) {
+            oldest = mtime
+          }
+          if mtime > newest {
+            newest = mtime
+          }
+        }
+        i = i + 1
+      }
+      return (R.ok, CacheSection.new(name, count, bytes, oldest, newest))
+    }
+  }
+}
+
+def is_temp_name(name String) Bool {
+  const n = name.length()
+  if n >= 5 && name.substring(n - 5, 5) == ".part" {
+    return true
+  }
+  if n >= 5 && name.substring(n - 5, 5) == ".meta" {
+    return true
+  }
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Verification and eviction.
+
+// Default mode repairs (evicts) every problem it finds; --check reports only.
+def verify(runner src.git.CommandRunner, root String, fix Bool) (R, VerifyReport) {
+  case check_root_for_read(root) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  if !has_marker(root) {
+    return (R.ok, VerifyReport.new(0, 0, 0, []))
+  }
+  if fix {
+    case acquire_lock(root) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, _) then { }
+    }
+  }
+  case stat_flavor(runner) {
+    (R.error, why) then {
+      if fix {
+        release_lock(root)
+      }
+      return (R.error, why)
+    }
+    (R.ok, bsd) then {
+      var checked = 0
+      var issues = 0
+      var evicted = 0
+      var notes = []
+      const (c1, i1, e1, n1) = verify_blobs(runner, bsd, root, fix)
+      checked = checked + c1
+      issues = issues + i1
+      evicted = evicted + e1
+      notes = append_all(notes, n1)
+      const (c2, i2, e2, n2) = verify_manifests(runner, bsd, root, fix)
+      checked = checked + c2
+      issues = issues + i2
+      evicted = evicted + e2
+      notes = append_all(notes, n2)
+      const (c3, i3, e3, n3) = verify_refs(runner, bsd, root, fix)
+      checked = checked + c3
+      issues = issues + i3
+      evicted = evicted + e3
+      notes = append_all(notes, n3)
+      const (c4, i4, e4, n4) = verify_git(runner, bsd, root, fix)
+      checked = checked + c4
+      issues = issues + i4
+      evicted = evicted + e4
+      notes = append_all(notes, n4)
+      if fix {
+        release_lock(root)
+      }
+      return (R.ok, VerifyReport.new(checked, issues, evicted, notes))
+    }
+  }
+}
+
+def verify_blobs(runner src.git.CommandRunner, bsd Bool, root String, fix Bool) (Int64, Int64, Int64, Array[String]) {
+  var checked = 0
+  var issues = 0
+  var evicted = 0
+  var notes = []
+  const dir = root + "/" + cache_blob_dir
+  case os.list_dir(dir) {
+    (R.error, _) then { }
+    (R.ok, entries) then {
+      var i = 0
+      while i < entries.length() {
+        const name = entries[i]
+        const path = dir + "/" + name
+        if is_temp_name(name) {
+          issues = issues + 1
+          notes = notes.append("blobs/sha256/" + name + ": orphan temporary file")
+          if fix {
+            evicted = evicted + 1
+            remove_path(runner, bsd, path)
+          }
+        } else {
+          if !is_hex64(name) {
+            issues = issues + 1
+            notes = notes.append("blobs/sha256/" + name + ": unexpected file name")
+            if fix {
+              evicted = evicted + 1
+              remove_path(runner, bsd, path)
+            }
+          } else {
+            checked = checked + 1
+            const expected = "sha256:" + name
+            case src.oci.hash_file(path) {
+              (R.error, why) then {
+                issues = issues + 1
+                notes = notes.append("blobs/sha256/" + name + ": cannot hash: " + why)
+                if fix {
+                  evicted = evicted + 1
+                  remove_path(runner, bsd, path)
+                }
+              }
+              (R.ok, info) then {
+                const (actual, _) = info
+                if actual != expected {
+                  issues = issues + 1
+                  notes = notes.append("blobs/sha256/" + name + ": digest mismatch (expected " + expected + ", got " + actual + ")")
+                  if fix {
+                    evicted = evicted + 1
+                    remove_path(runner, bsd, path)
+                  }
+                }
+              }
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  return (checked, issues, evicted, notes)
+}
+
+def verify_manifests(runner src.git.CommandRunner, bsd Bool, root String, fix Bool) (Int64, Int64, Int64, Array[String]) {
+  var checked = 0
+  var issues = 0
+  var evicted = 0
+  var notes = []
+  const dir = root + "/" + cache_manifest_dir
+  case os.list_dir(dir) {
+    (R.error, _) then { }
+    (R.ok, entries) then {
+      var i = 0
+      while i < entries.length() {
+        const name = entries[i]
+        const path = dir + "/" + name
+        const key = key_from_json_name(name)
+        if key == "" {
+          issues = issues + 1
+          notes = notes.append("manifests/" + name + ": unexpected file name")
+          if fix {
+            evicted = evicted + 1
+            remove_path(runner, bsd, path)
+          }
+        } else {
+          checked = checked + 1
+          case file.read(path) {
+            (R.error, why) then {
+              issues = issues + 1
+              notes = notes.append("manifests/" + name + ": cannot read: " + why)
+              if fix {
+                evicted = evicted + 1
+                remove_path(runner, bsd, path)
+              }
+            }
+            (R.ok, text) then {
+              case parse_cached_manifest(text) {
+                (R.error, why) then {
+                  issues = issues + 1
+                  notes = notes.append("manifests/" + name + ": " + why)
+                  if fix {
+                    evicted = evicted + 1
+                    remove_path(runner, bsd, path)
+                  }
+                }
+                (R.ok, _) then { }
+              }
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  return (checked, issues, evicted, notes)
+}
+
+def verify_refs(runner src.git.CommandRunner, bsd Bool, root String, fix Bool) (Int64, Int64, Int64, Array[String]) {
+  var checked = 0
+  var issues = 0
+  var evicted = 0
+  var notes = []
+  const dir = root + "/" + cache_ref_dir
+  case os.list_dir(dir) {
+    (R.error, _) then { }
+    (R.ok, entries) then {
+      var i = 0
+      while i < entries.length() {
+        const name = entries[i]
+        const path = dir + "/" + name
+        if is_temp_name(name) {
+          issues = issues + 1
+          notes = notes.append("refs/" + name + ": orphan temporary file")
+          if fix {
+            evicted = evicted + 1
+            remove_path(runner, bsd, path)
+          }
+        } else {
+          checked = checked + 1
+          case file.read(path) {
+            (R.error, why) then {
+              issues = issues + 1
+              notes = notes.append("refs/" + name + ": cannot read: " + why)
+              if fix {
+                evicted = evicted + 1
+                remove_path(runner, bsd, path)
+              }
+            }
+            (R.ok, text) then {
+              const commit = text.trim()
+              if commit.length() != 40 || !all_hex(commit) {
+                issues = issues + 1
+                notes = notes.append("refs/" + name + ": not a 40-character commit SHA")
+                if fix {
+                  evicted = evicted + 1
+                  remove_path(runner, bsd, path)
+                }
+              }
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  return (checked, issues, evicted, notes)
+}
+
+def verify_git(runner src.git.CommandRunner, bsd Bool, root String, fix Bool) (Int64, Int64, Int64, Array[String]) {
+  var checked = 0
+  var issues = 0
+  var evicted = 0
+  var notes = []
+  const dir = root + "/" + cache_git_dir
+  case os.list_dir(dir) {
+    (R.error, _) then { }
+    (R.ok, entries) then {
+      var i = 0
+      while i < entries.length() {
+        const name = entries[i]
+        const path = dir + "/" + name
+        if name == cache_lock_name || is_temp_name(name) {
+          // Nothing to verify.
+        } else {
+          checked = checked + 1
+          const mirror = path + "/mirror.git"
+          case file.read(mirror + "/HEAD") {
+            (R.error, why) then {
+              issues = issues + 1
+              notes = notes.append("git/" + name + ": mirror is missing or unreadable (" + why + ")")
+              if fix {
+                evicted = evicted + 1
+                remove_path(runner, bsd, path)
+              }
+            }
+            (R.ok, _) then {
+              case runner.run(["git", "-C", mirror, "fsck", "--no-progress", "--no-dangling"], cache_fsck_timeout) {
+                (R.ok, _) then { }
+                (R.error, why) then {
+                  issues = issues + 1
+                  notes = notes.append("git/" + name + ": fsck failed: " + why)
+                  if fix {
+                    evicted = evicted + 1
+                    remove_path(runner, bsd, path)
+                  }
+                }
+              }
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  return (checked, issues, evicted, notes)
+}
+
+def key_from_json_name(name String) String {
+  if name.length() != 69 || name.substring(64, 5) != ".json" {
+    return ""
+  }
+  const key = name.substring(0, 64)
+  if !is_hex64(key) {
+    return ""
+  }
+  return key
+}
+
+// ---------------------------------------------------------------------------
+// Removal (`cache rm`).
+
+// Removes the selected sections (git/manifests/blobs/refs) but never the
+// root, the marker, or anything outside the known section directories.
+def remove(runner src.git.CommandRunner, root String, sections Array[String]) (R, RemoveReport) {
+  case os.list_dir(root) {
+    (R.error, _) then { return (R.ok, RemoveReport.new(0, 0, [])) }
+    (R.ok, _) then { }
+  }
+  if !has_marker(root) {
+    return (R.error, "cache: refusing to remove " + root + ": not a pokerface cache (missing " + cache_marker_name + ")")
+  }
+  case acquire_lock(root) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case stat_flavor(runner) {
+    (R.error, why) then {
+      release_lock(root)
+      return (R.error, why)
+    }
+    (R.ok, bsd) then {
+      var entries = 0
+      var bytes = 0
+      var done = []
+      var i = 0
+      while i < sections.length() {
+        const section = sections[i]
+        var dir = ""
+        if section == "git" {
+          dir = root + "/" + cache_git_dir
+        }
+        if section == "manifests" {
+          dir = root + "/" + cache_manifest_dir
+        }
+        if section == "blobs" {
+          dir = root + "/blobs"
+        }
+        if section == "refs" {
+          dir = root + "/" + cache_ref_dir
+        }
+        if dir != "" {
+          const (e, b) = clear_dir(runner, bsd, dir)
+          entries = entries + e
+          bytes = bytes + b
+          done = done.append(section)
+        }
+        i = i + 1
+      }
+      const (_, _) = ensure_root(root)
+      release_lock(root)
+      return (R.ok, RemoveReport.new(entries, bytes, done))
+    }
+  }
+}
+
+def clear_dir(runner src.git.CommandRunner, bsd Bool, dir String) (Int64, Int64) {
+  var entries = 0
+  var bytes = 0
+  case os.list_dir(dir) {
+    (R.error, _) then { }
+    (R.ok, names) then {
+      var i = 0
+      while i < names.length() {
+        const path = dir + "/" + names[i]
+        case tree_size(runner, bsd, path) {
+          (R.ok, s) then { bytes = bytes + s }
+          (R.error, _) then { }
+        }
+        entries = entries + 1
+        remove_path(runner, bsd, path)
+        i = i + 1
+      }
+    }
+  }
+  return (entries, bytes)
+}
+
+// ---------------------------------------------------------------------------
+// TTL and size enforcement.
+
+// Best-effort: a missing cache or a concurrent operation is a no-op. Pulls
+// call this after a successful import; the configured limits are otherwise
+// only enforced by cache management commands.
+def enforce_limits(runner src.git.CommandRunner, root String, ttl_seconds Int64, max_bytes Int64, verbose Bool) (R, EvictReport) {
+  if ttl_seconds <= 0 && max_bytes <= 0 {
+    return (R.ok, EvictReport.new(0, 0))
+  }
+  if !has_marker(root) {
+    return (R.ok, EvictReport.new(0, 0))
+  }
+  case try_lock(root) {
+    (R.ok, locked) then {
+      if !locked {
+        return (R.ok, EvictReport.new(0, 0))
+      }
+      case stat_flavor(runner) {
+        (R.error, why) then {
+          release_lock(root)
+          return (R.error, why)
+        }
+        (R.ok, bsd) then {
+          case collect_entries(runner, bsd, root) {
+            (R.error, why) then {
+              release_lock(root)
+              return (R.error, why)
+            }
+            (R.ok, entries) then {
+              const now = time.now().unix_ms() / 1000
+              var remaining = []
+              var evicted = 0
+              var evicted_bytes = 0
+              var i = 0
+              while i < entries.length() {
+                const entry = entries[i]
+                const too_old = ttl_seconds > 0 && entry.mtime > 0 && entry.mtime < now - ttl_seconds
+                if too_old {
+                  remove_path(runner, bsd, entry.path)
+                  evicted = evicted + 1
+                  evicted_bytes = evicted_bytes + entry.size
+                  if verbose {
+                    src.common.eprint("cache: expired " + entry.kind + " " + entry.key + "\n")
+                  }
+                } else {
+                  remaining = remaining.append(entry)
+                }
+                i = i + 1
+              }
+              if max_bytes > 0 {
+                var total = 0
+                var j = 0
+                while j < remaining.length() {
+                  total = total + remaining[j].size
+                  j = j + 1
+                }
+                const sorted = sort_by_mtime(remaining)
+                var k = 0
+                while total > max_bytes && k < sorted.length() {
+                  const entry = sorted[k]
+                  remove_path(runner, bsd, entry.path)
+                  total = total - entry.size
+                  evicted = evicted + 1
+                  evicted_bytes = evicted_bytes + entry.size
+                  if verbose {
+                    src.common.eprint("cache: evicted " + entry.kind + " " + entry.key + " (" + entry.size.to_string() + " bytes, size limit)\n")
+                  }
+                  k = k + 1
+                }
+              }
+              release_lock(root)
+              return (R.ok, EvictReport.new(evicted, evicted_bytes))
+            }
+          }
+        }
+      }
+    }
+    (R.error, why) then { return (R.error, why) }
+  }
+}
+
+def collect_entries(runner src.git.CommandRunner, bsd Bool, root String) (R, Array[CacheEntry]) {
+  var out = []
+  case collect_blob_entries(runner, bsd, root) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, list) then { out = append_entries(out, list) }
+  }
+  case collect_manifest_entries(runner, bsd, root) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, list) then { out = append_entries(out, list) }
+  }
+  case collect_ref_entries(runner, bsd, root) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, list) then { out = append_entries(out, list) }
+  }
+  case collect_git_entries(runner, bsd, root) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, list) then { out = append_entries(out, list) }
+  }
+  return (R.ok, out)
+}
+
+def collect_blob_entries(runner src.git.CommandRunner, bsd Bool, root String) (R, Array[CacheEntry]) {
+  return collect_file_entries(runner, bsd, root + "/" + cache_blob_dir, "blob")
+}
+
+def collect_manifest_entries(runner src.git.CommandRunner, bsd Bool, root String) (R, Array[CacheEntry]) {
+  return collect_file_entries(runner, bsd, root + "/" + cache_manifest_dir, "manifest")
+}
+
+def collect_ref_entries(runner src.git.CommandRunner, bsd Bool, root String) (R, Array[CacheEntry]) {
+  return collect_file_entries(runner, bsd, root + "/" + cache_ref_dir, "ref")
+}
+
+def collect_file_entries(runner src.git.CommandRunner, bsd Bool, dir String, kind String) (R, Array[CacheEntry]) {
+  var out = []
+  case os.list_dir(dir) {
+    (R.error, _) then { return (R.ok, out) }
+    (R.ok, names) then {
+      var i = 0
+      while i < names.length() {
+        const name = names[i]
+        if !is_temp_name(name) {
+          const path = dir + "/" + name
+          case stat_one(runner, bsd, path) {
+            (R.ok, info) then {
+              if info.kind == "file" {
+                out = out.append(CacheEntry.new(kind, name, path, info.size, info.mtime))
+              }
+            }
+            (R.error, why) then { return (R.error, why) }
+          }
+        }
+        i = i + 1
+      }
+      return (R.ok, out)
+    }
+  }
+}
+
+def collect_git_entries(runner src.git.CommandRunner, bsd Bool, root String) (R, Array[CacheEntry]) {
+  var out = []
+  const dir = root + "/" + cache_git_dir
+  case os.list_dir(dir) {
+    (R.error, _) then { return (R.ok, out) }
+    (R.ok, names) then {
+      var i = 0
+      while i < names.length() {
+        const name = names[i]
+        if name != cache_lock_name && !is_temp_name(name) {
+          const path = dir + "/" + name
+          case stat_one(runner, bsd, path) {
+            (R.ok, info) then {
+              if info.kind == "dir" {
+                var size = 0
+                case tree_size(runner, bsd, path) {
+                  (R.ok, s) then { size = s }
+                  (R.error, why) then { return (R.error, why) }
+                }
+                out = out.append(CacheEntry.new("git", name, path, size, info.mtime))
+              }
+            }
+            (R.error, why) then { return (R.error, why) }
+          }
+        }
+        i = i + 1
+      }
+      return (R.ok, out)
+    }
+  }
+}
+
+def sort_by_mtime(entries Array[CacheEntry]) Array[CacheEntry] {
+  var out = []
+  var remaining = entries
+  while remaining.length() > 0 {
+    var min = 0
+    var i = 1
+    while i < remaining.length() {
+      if remaining[i].mtime < remaining[min].mtime {
+        min = i
+      }
+      i = i + 1
+    }
+    out = out.append(remaining[min])
+    var next = []
+    var j = 0
+    while j < remaining.length() {
+      if j != min {
+        next = next.append(remaining[j])
+      }
+      j = j + 1
+    }
+    remaining = next
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem primitives: no stat in the stdlib, so the runner asks the host
+// stat (BSD or GNU); removals use the reported kind and never follow symlinks.
+
+def stat_flavor(runner src.git.CommandRunner) (R, Bool) {
+  case runner.run(["uname", "-s"], cache_stat_timeout) {
+    (R.error, why) then { return (R.error, "cache: cannot determine the stat flavor: " + why) }
+    (R.ok, platform) then { return (R.ok, platform.trim().starts_with("Darwin")) }
+  }
+}
+
+def stat_one(runner src.git.CommandRunner, bsd Bool, path String) (R, StatInfo) {
+  var argv = ["stat", "-c", "%s %Y %F", path]
+  if bsd {
+    argv = ["stat", "-f", "%z %m %HT", path]
+  }
+  case runner.run(argv, cache_stat_timeout) {
+    (R.error, why) then { return (R.error, "cache: stat " + path + ": " + why) }
+    (R.ok, out) then {
+      const tokens = split_tokens(out.trim())
+      if tokens.length() < 2 {
+        return (R.error, "cache: unexpected stat output for " + path)
+      }
+      var kind_text = ""
+      var i = 2
+      while i < tokens.length() {
+        if i > 2 {
+          kind_text = kind_text + " "
+        }
+        kind_text = kind_text + tokens[i]
+        i = i + 1
+      }
+      return (R.ok, StatInfo.new(tokens[0].to_int64(), tokens[1].to_int64(), normalize_kind(kind_text)))
+    }
+  }
+}
+
+def split_tokens(text String) Array[String] {
+  var out = []
+  var current = ""
+  var i = 0
+  while i < text.length() {
+    const c = text.substring(i, 1)
+    if c == " " || c == "\t" {
+      if current != "" {
+        out = out.append(current)
+        current = ""
+      }
+    } else {
+      current = current + c
+    }
+    i = i + 1
+  }
+  if current != "" {
+    out = out.append(current)
+  }
+  return out
+}
+
+def normalize_kind(text String) String {
+  const t = text.trim().lower()
+  if t == "directory" || t == "dir" {
+    return "dir"
+  }
+  if t == "regular file" || t == "regular empty file" || t == "file" {
+    return "file"
+  }
+  if t.index_of("symbolic link") >= 0 || t.index_of("symlink") >= 0 {
+    return "link"
+  }
+  return "other"
+}
+
+def tree_size(runner src.git.CommandRunner, bsd Bool, path String) (R, Int64) {
+  case stat_one(runner, bsd, path) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, info) then {
+      if info.kind == "dir" {
+        var total = 0
+        case os.list_dir(path) {
+          (R.error, _) then { return (R.ok, 0) }
+          (R.ok, names) then {
+            var i = 0
+            while i < names.length() {
+              case tree_size(runner, bsd, path + "/" + names[i]) {
+                (R.ok, s) then { total = total + s }
+                (R.error, why) then { return (R.error, why) }
+              }
+              i = i + 1
+            }
+            return (R.ok, total)
+          }
+        }
+      }
+      if info.kind == "file" {
+        return (R.ok, info.size)
+      }
+      return (R.ok, 0)
+    }
+  }
+}
+
+// Never follows a symlink: the reported kind decides between unlink and
+// recursive removal.
+def remove_path(runner src.git.CommandRunner, bsd Bool, path String) (R, Bool) {
+  case stat_one(runner, bsd, path) {
+    (R.error, _) then { return (R.ok, true) }
+    (R.ok, info) then {
+      if info.kind == "dir" {
+        case os.list_dir(path) {
+          (R.error, why) then { return (R.error, "cache: cannot list " + path + ": " + why) }
+          (R.ok, names) then {
+            var i = 0
+            while i < names.length() {
+              case remove_path(runner, bsd, path + "/" + names[i]) {
+                (R.error, why) then { return (R.error, why) }
+                (R.ok, _) then { }
+              }
+              i = i + 1
+            }
+          }
+        }
+        case os.rmdir(path) {
+          (R.ok, _) then { return (R.ok, true) }
+          (R.error, why) then { return (R.error, "cache: cannot remove " + path + ": " + why) }
+        }
+      }
+      os.unlink(path)
+      return (R.ok, true)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Small shared helpers.
+
+def sha_hex(text String) String {
+  return crypto.hex_encode(crypto.sha2.sha256(text.to_bytes()))
+}
+
+def all_hex(text String) Bool {
+  var i = 0
+  while i < text.length() {
+    if cache_hex_charset.index_of(text.substring(i, 1)) < 0 {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+def is_hex64(text String) Bool {
+  return text.length() == 64 && all_hex(text)
+}
+
+def string_member(doc json.Json, key String) (R, String) {
+  case src.oci.member(doc, key) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, value) then {
+      if value.is(json.JsonString) {
+        return (R.ok, value.as_string())
+      }
+      return (R.error, "expected a string")
+    }
+  }
+}
+
+def append_all(base Array[String], extra Array[String]) Array[String] {
+  var out = base
+  var i = 0
+  while i < extra.length() {
+    out = out.append(extra[i])
+    i = i + 1
+  }
+  return out
+}
+
+def append_entries(base Array[CacheEntry], extra Array[CacheEntry]) Array[CacheEntry] {
+  var out = base
+  var i = 0
+  while i < extra.length() {
+    out = out.append(extra[i])
+    i = i + 1
+  }
+  return out
+}
+
+// Human-readable byte count for the cache commands.
+def format_bytes(bytes Int64) String {
+  if bytes < 1024 {
+    return bytes.to_string() + " B"
+  }
+  if bytes < 1024 * 1024 {
+    return fixed1(bytes, 1024) + " KiB"
+  }
+  if bytes < 1024 * 1024 * 1024 {
+    return fixed1(bytes, 1024 * 1024) + " MiB"
+  }
+  return fixed1(bytes, 1024 * 1024 * 1024) + " GiB"
+}
+
+def fixed1(value Int64, unit Int64) String {
+  const tenths = (value * 10) / unit
+  return (tenths / 10).to_string() + "." + (tenths % 10).to_string()
+}

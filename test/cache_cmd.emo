@@ -1,0 +1,570 @@
+// T1.15 tests for the shared cache and the `cache` command — run with
+// `emo test`. Files live under TMPDIR with unique per-run names; stat and
+// git fsck use the real runner.
+
+const cache_mod = src.cache
+const cache_cmd = src.commands.cache
+const cache_runner = src.git.RealRunner.new()
+const cache_manifest_mt = "application/vnd.oci.image.manifest.v1+json"
+
+def cache_temp_base() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def cache_root_for(name String) String {
+  return cache_temp_base() + "pokerface-cache-test-" + os.getpid().to_string() + "-" + name
+}
+
+def cache_sha(body String) String {
+  return crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+def cache_digest(body String) String {
+  return "sha256:" + cache_sha(body)
+}
+
+def cache_write(path String, body String) {
+  case file.write(path, body) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("write " + path + " failed: " + why) }
+  }
+}
+
+def cache_mkdir(path String) {
+  case os.mkdir(path) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("mkdir " + path + " failed: " + why) }
+  }
+}
+
+def cache_read(path String) String {
+  case file.read(path) {
+    (R.ok, text) then { return text }
+    (R.error, why) then {
+      expect_fail("read " + path + " failed: " + why)
+      return ""
+    }
+  }
+}
+
+def cache_exists(path String) Bool {
+  case file.read(path) {
+    (R.ok, _) then { return true }
+    (R.error, _) then { return false }
+  }
+}
+
+def cache_dir_exists(path String) Bool {
+  case os.list_dir(path) {
+    (R.ok, _) then { return true }
+    (R.error, _) then { return false }
+  }
+}
+
+def cache_ensure(root String) {
+  case cache_mod.ensure_root(root) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("ensure_root failed: " + why) }
+  }
+}
+
+def touch_old(path String, stamp String) {
+  case cache_runner.run(["touch", "-t", stamp, path], 5.0) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("touch failed: " + why) }
+  }
+}
+
+def repeat_char(c String, n Int64) String {
+  var out = ""
+  var i = 0
+  while i < n {
+    out = out + c
+    i = i + 1
+  }
+  return out
+}
+
+def section_named(stats src.cache.CacheStats, name String) src.cache.CacheSection {
+  var i = 0
+  while i < stats.sections.length() {
+    if stats.sections[i].name == name {
+      return stats.sections[i]
+    }
+    i = i + 1
+  }
+  expect_fail("no section " + name)
+  return stats.sections[0]
+}
+
+// ---------------------------------------------------------------------------
+// Root, marker, and layout.
+
+def test_ensure_root_creates_marker_and_dirs() {
+  const root = cache_root_for("fresh")
+  cache_ensure(root)
+  expect_true(cache_exists(root + "/" + src.cache.cache_marker_name))
+  expect_true(cache_dir_exists(root + "/git"))
+  expect_true(cache_dir_exists(root + "/manifests"))
+  expect_true(cache_dir_exists(root + "/blobs/sha256"))
+  expect_true(cache_dir_exists(root + "/refs"))
+  cache_ensure(root)
+}
+
+def test_ensure_root_refuses_foreign_directory() {
+  const root = cache_root_for("foreign")
+  cache_mkdir(root)
+  cache_write(root + "/notes.txt", "do not touch")
+  case cache_mod.ensure_root(root) {
+    (R.ok, _) then { expect_fail("expected a refusal") }
+    (R.error, why) then { expect_true(why.index_of("refusing") >= 0) }
+  }
+  expect_equal("do not touch", cache_read(root + "/notes.txt"))
+}
+
+def test_ensure_root_adopts_legacy_layout() {
+  const root = cache_root_for("legacy")
+  cache_mkdir(root)
+  cache_mkdir(root + "/git")
+  cache_mkdir(root + "/manifests")
+  cache_mkdir(root + "/blobs")
+  cache_mkdir(root + "/blobs/sha256")
+  cache_ensure(root)
+  expect_true(cache_exists(root + "/" + src.cache.cache_marker_name))
+}
+
+// ---------------------------------------------------------------------------
+// Manifest envelope.
+
+def test_manifest_round_trip_and_request_checks() {
+  const root = cache_root_for("manifest")
+  cache_ensure(root)
+  const body = "{\"schemaVersion\":2}"
+  const digest = cache_digest(body)
+  const key = cache_mod.manifest_key("registry.example.com/acme/app", digest, "linux/amd64")
+  case cache_mod.write_manifest(root, key, body, cache_manifest_mt, digest, "linux/amd64", digest, "manifest") {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("write_manifest failed: " + why) }
+  }
+  case cache_mod.read_manifest(root, key, digest, digest, "linux/amd64") {
+    (R.ok, cached) then {
+      expect_equal(body, cached.body)
+      expect_equal(digest, cached.digest)
+      expect_equal("manifest", cached.kind)
+      expect_equal("linux/amd64", cached.platform)
+    }
+    (R.error, why) then { expect_fail("read_manifest failed: " + why) }
+  }
+  case cache_mod.read_manifest(root, key, digest, digest, "linux/arm64") {
+    (R.ok, _) then { expect_fail("expected a platform mismatch") }
+    (R.error, why) then { expect_true(why.index_of("platform") >= 0) }
+  }
+  case cache_mod.read_manifest(root, key, cache_digest("other"), "", "linux/amd64") {
+    (R.ok, _) then { expect_fail("expected a reference mismatch") }
+    (R.error, why) then { expect_true(why.index_of("reference") >= 0) }
+  }
+  case cache_mod.read_manifest(root, key, digest, cache_digest("other"), "linux/amd64") {
+    (R.ok, _) then { expect_fail("expected an expected-digest mismatch") }
+    (R.error, why) then { expect_true(why.index_of("does not match the lock") >= 0) }
+  }
+}
+
+def test_corrupted_manifest_is_detected_and_evicted() {
+  const root = cache_root_for("manifest-corrupt")
+  cache_ensure(root)
+  const key = cache_mod.manifest_key("image", "sha256:00", "linux/amd64")
+  const path = cache_mod.manifest_path(root, key)
+  cache_write(path, "not an envelope")
+  case cache_mod.read_manifest(root, key, "sha256:00", "", "linux/amd64") {
+    (R.ok, _) then { expect_fail("expected a corrupt-manifest error") }
+    (R.error, why) then { expect_true(why.index_of("invalid JSON") >= 0) }
+  }
+  case cache_mod.verify(cache_runner, root, true) {
+    (R.ok, report) then {
+      expect_true(report.issues >= 1)
+      expect_true(report.evicted >= 1)
+    }
+    (R.error, why) then { expect_fail("verify failed: " + why) }
+  }
+  expect_true(!cache_exists(path))
+}
+
+// ---------------------------------------------------------------------------
+// Refs and blobs.
+
+def test_ref_map_round_trip() {
+  const root = cache_root_for("refs")
+  cache_ensure(root)
+  const commit = "0123456789abcdef0123456789abcdef01234567"
+  case cache_mod.write_ref(root, "https://example.com/a.git", "main", commit) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("write_ref failed: " + why) }
+  }
+  case cache_mod.read_ref(root, "https://example.com/a.git", "main") {
+    (R.ok, cached) then { expect_equal(commit, cached) }
+    (R.error, why) then { expect_fail("read_ref failed: " + why) }
+  }
+  case cache_mod.read_ref(root, "https://example.com/a.git", "dev") {
+    (R.ok, _) then { expect_fail("expected a missing-ref error") }
+    (R.error, why) then { expect_true(why.index_of("no cached resolution") >= 0) }
+  }
+  const path = cache_mod.ref_path(root, "https://example.com/a.git", "main")
+  cache_write(path, "nope")
+  case cache_mod.read_ref(root, "https://example.com/a.git", "main") {
+    (R.ok, _) then { expect_fail("expected a corrupt-ref error") }
+    (R.error, why) then { expect_true(why.index_of("corrupted") >= 0) }
+  }
+  case cache_mod.verify(cache_runner, root, true) {
+    (R.ok, report) then { expect_true(report.evicted >= 1) }
+    (R.error, why) then { expect_fail("verify failed: " + why) }
+  }
+  expect_true(!cache_exists(path))
+}
+
+def test_blob_helpers() {
+  const root = cache_root_for("blobs")
+  cache_ensure(root)
+  const body = "blob bytes for the cache test"
+  const digest = cache_digest(body)
+  const path = cache_mod.blob_path(root, digest)
+  cache_write(path, body)
+  expect_true(cache_mod.blob_ok(path, digest, body.length()))
+  expect_true(!cache_mod.blob_ok(path, digest, body.length() + 1))
+  expect_true(!cache_mod.blob_ok(path, cache_digest("other"), body.length()))
+}
+
+// ---------------------------------------------------------------------------
+// ls
+
+def test_ls_reports_each_section() {
+  const root = cache_root_for("ls")
+  cache_ensure(root)
+  const blob = "ls blob"
+  cache_write(cache_mod.blob_path(root, cache_digest(blob)), blob)
+  const manifest = "{\"schemaVersion\":2}"
+  cache_mod.write_manifest(root, cache_mod.manifest_key("img", "ref", "linux/amd64"), manifest, cache_manifest_mt, cache_digest(manifest), "linux/amd64", "ref", "manifest")
+  cache_mod.write_ref(root, "https://example.com/a.git", "main", "0123456789abcdef0123456789abcdef01234567")
+  cache_mkdir(root + "/git/abc")
+  cache_mkdir(root + "/git/abc/mirror.git")
+  cache_write(root + "/git/abc/mirror.git/HEAD", "ref: refs/heads/main\n")
+  cache_write(root + "/git/abc/source-url", "https://example.com/a.git\n")
+  case cache_mod.ls(cache_runner, root) {
+    (R.error, why) then { expect_fail("ls failed: " + why) }
+    (R.ok, stats) then {
+      expect_equal(1, section_named(stats, "git").entries)
+      expect_equal(1, section_named(stats, "manifests").entries)
+      expect_equal(1, section_named(stats, "blobs").entries)
+      expect_equal(1, section_named(stats, "refs").entries)
+      expect_equal(4, stats.total_entries())
+      expect_true(stats.total_bytes() > 0)
+    }
+  }
+}
+
+def test_ls_on_missing_root_is_empty() {
+  const root = cache_root_for("ls-missing")
+  case cache_mod.ls(cache_runner, root) {
+    (R.error, why) then { expect_fail("ls failed: " + why) }
+    (R.ok, stats) then {
+      expect_equal(0, stats.total_entries())
+      expect_equal(0, stats.total_bytes())
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// verify
+
+def test_verify_detects_and_evicts_corrupt_blob() {
+  const root = cache_root_for("verify-blob")
+  cache_ensure(root)
+  const name = repeat_char("a", 64)
+  const path = root + "/blobs/sha256/" + name
+  cache_write(path, "not the named digest")
+  case cache_mod.verify(cache_runner, root, false) {
+    (R.ok, report) then {
+      expect_equal(1, report.checked)
+      expect_equal(1, report.issues)
+      expect_equal(0, report.evicted)
+      expect_true(report.notes[0].index_of("digest mismatch") >= 0)
+    }
+    (R.error, why) then { expect_fail("verify failed: " + why) }
+  }
+  expect_true(cache_exists(path))
+  case cache_mod.verify(cache_runner, root, true) {
+    (R.ok, report) then {
+      expect_equal(1, report.evicted)
+    }
+    (R.error, why) then { expect_fail("verify --fix failed: " + why) }
+  }
+  expect_true(!cache_exists(path))
+  expect_true(!cache_exists(root + "/" + src.cache.cache_lock_name))
+}
+
+def test_verify_evicts_orphans() {
+  const root = cache_root_for("verify-orphans")
+  cache_ensure(root)
+  cache_write(root + "/blobs/sha256/deadbeef.part", "partial")
+  cache_write(root + "/manifests/not-a-key.json", "junk")
+  cache_write(root + "/refs/bad", "not a commit")
+  case cache_mod.verify(cache_runner, root, true) {
+    (R.ok, report) then {
+      expect_equal(3, report.issues)
+      expect_true(report.evicted >= 3)
+    }
+    (R.error, why) then { expect_fail("verify failed: " + why) }
+  }
+  expect_true(!cache_exists(root + "/blobs/sha256/deadbeef.part"))
+  expect_true(!cache_exists(root + "/manifests/not-a-key.json"))
+  expect_true(!cache_exists(root + "/refs/bad"))
+}
+
+def test_verify_git_mirrors() {
+  const root = cache_root_for("verify-git")
+  cache_ensure(root)
+  cache_mkdir(root + "/git/good")
+  case cache_runner.run(["git", "init", "--bare", root + "/git/good/mirror.git"], 30.0) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("git init failed: " + why) }
+  }
+  cache_write(root + "/git/good/source-url", "https://example.com/a.git\n")
+  cache_mkdir(root + "/git/broken")
+  case cache_mod.verify(cache_runner, root, false) {
+    (R.ok, report) then {
+      expect_equal(2, report.checked)
+      expect_equal(1, report.issues)
+      expect_true(report.notes[0].index_of("git/broken") >= 0)
+    }
+    (R.error, why) then { expect_fail("verify failed: " + why) }
+  }
+  case cache_mod.verify(cache_runner, root, true) {
+    (R.ok, report) then { expect_true(report.evicted >= 1) }
+    (R.error, why) then { expect_fail("verify --fix failed: " + why) }
+  }
+  expect_true(!cache_exists(root + "/git/broken"))
+  expect_true(cache_exists(root + "/git/good/mirror.git/HEAD"))
+}
+
+// ---------------------------------------------------------------------------
+// rm
+
+def test_rm_refuses_a_foreign_directory() {
+  const root = cache_root_for("rm-foreign")
+  cache_mkdir(root)
+  cache_mkdir(root + "/src")
+  cache_write(root + "/src/keep.txt", "keep")
+  case cache_mod.remove(cache_runner, root, ["git", "manifests", "blobs", "refs"]) {
+    (R.ok, _) then { expect_fail("expected a refusal") }
+    (R.error, why) then { expect_true(why.index_of("refusing") >= 0) }
+  }
+  expect_equal("keep", cache_read(root + "/src/keep.txt"))
+}
+
+def test_rm_clears_only_selected_sections() {
+  const root = cache_root_for("rm-sections")
+  cache_ensure(root)
+  cache_write(root + "/blobs/sha256/" + repeat_char("b", 64), "blob")
+  cache_write(root + "/refs/ref", "0123456789abcdef0123456789abcdef01234567\n")
+  cache_mkdir(root + "/git/key")
+  cache_write(root + "/git/key/source-url", "https://example.com/a.git\n")
+  cache_write(root + "/sentinel.txt", "keep me")
+  case cache_mod.remove(cache_runner, root, ["blobs"]) {
+    (R.ok, report) then { expect_equal(1, report.entries) }
+    (R.error, why) then { expect_fail("rm failed: " + why) }
+  }
+  case os.list_dir(root + "/blobs/sha256") {
+    (R.ok, entries) then { expect_equal(0, entries.length()) }
+    (R.error, why) then { expect_fail("blobs dir missing: " + why) }
+  }
+  expect_true(cache_exists(root + "/refs/ref"))
+  expect_true(cache_exists(root + "/git/key/source-url"))
+  expect_equal("keep me", cache_read(root + "/sentinel.txt"))
+  expect_true(cache_exists(root + "/" + src.cache.cache_marker_name))
+  case cache_mod.remove(cache_runner, root, ["git", "manifests", "blobs", "refs"]) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("second rm failed: " + why) }
+  }
+  expect_true(!cache_exists(root + "/refs/ref"))
+  expect_true(!cache_exists(root + "/git/key/source-url"))
+  expect_equal("keep me", cache_read(root + "/sentinel.txt"))
+}
+
+def test_rm_honors_the_lock() {
+  const root = cache_root_for("rm-lock")
+  cache_ensure(root)
+  cache_write(root + "/blobs/sha256/" + repeat_char("c", 64), "blob")
+  cache_mkdir(root + "/" + src.cache.cache_lock_name)
+  case cache_mod.remove(cache_runner, root, ["blobs"]) {
+    (R.ok, _) then { expect_fail("expected a locked-cache error") }
+    (R.error, why) then { expect_true(why.index_of("another cache operation") >= 0) }
+  }
+  case os.rmdir(root + "/" + src.cache.cache_lock_name) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("cannot remove the lock: " + why) }
+  }
+  case cache_mod.remove(cache_runner, root, ["blobs"]) {
+    (R.ok, report) then { expect_equal(1, report.entries) }
+    (R.error, why) then { expect_fail("rm after unlock failed: " + why) }
+  }
+}
+
+def test_rm_on_a_missing_root_is_a_noop() {
+  const root = cache_root_for("rm-missing")
+  case cache_mod.remove(cache_runner, root, ["blobs"]) {
+    (R.ok, report) then { expect_equal(0, report.entries) }
+    (R.error, why) then { expect_fail("rm failed: " + why) }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TTL and size limit
+
+def test_ttl_eviction() {
+  const root = cache_root_for("ttl")
+  cache_ensure(root)
+  const old_body = "old blob"
+  const new_body = "new blob"
+  const old_path = cache_mod.blob_path(root, cache_digest(old_body))
+  const new_path = cache_mod.blob_path(root, cache_digest(new_body))
+  cache_write(old_path, old_body)
+  cache_write(new_path, new_body)
+  touch_old(old_path, "200001010000")
+  case cache_mod.enforce_limits(cache_runner, root, 1, 0, false) {
+    (R.ok, report) then { expect_equal(1, report.evicted) }
+    (R.error, why) then { expect_fail("enforce_limits failed: " + why) }
+  }
+  expect_true(!cache_exists(old_path))
+  expect_true(cache_exists(new_path))
+}
+
+def test_size_limit_evicts_oldest_first() {
+  const root = cache_root_for("size")
+  cache_ensure(root)
+  const one = repeat_char("a", 100)
+  const two = repeat_char("b", 100)
+  const three = repeat_char("c", 100)
+  const p1 = cache_mod.blob_path(root, cache_digest(one))
+  const p2 = cache_mod.blob_path(root, cache_digest(two))
+  const p3 = cache_mod.blob_path(root, cache_digest(three))
+  cache_write(p1, one)
+  cache_write(p2, two)
+  cache_write(p3, three)
+  touch_old(p1, "200001010000")
+  touch_old(p2, "200101010000")
+  touch_old(p3, "200201010000")
+  case cache_mod.enforce_limits(cache_runner, root, 0, 150, false) {
+    (R.ok, report) then { expect_equal(2, report.evicted) }
+    (R.error, why) then { expect_fail("enforce_limits failed: " + why) }
+  }
+  expect_true(!cache_exists(p1))
+  expect_true(!cache_exists(p2))
+  expect_true(cache_exists(p3))
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency: two processes writing one key never leave a torn envelope.
+
+def test_concurrent_manifest_writers_leave_a_consistent_entry() {
+  const root = cache_root_for("concurrent")
+  cache_ensure(root)
+  const key = cache_mod.manifest_key("img", "reference", "linux/amd64")
+  const (R.ok, pid1) = os.fork()
+  if pid1 == 0 {
+    var i = 0
+    while i < 20 {
+      const body = "A" + i.to_string()
+      const (_, _) = cache_mod.write_manifest(root, key, body, cache_manifest_mt, cache_digest(body), "linux/amd64", cache_digest(body), "manifest")
+      i = i + 1
+    }
+    os._exit(0)
+  }
+  const (R.ok, pid2) = os.fork()
+  if pid2 == 0 {
+    var i = 0
+    while i < 20 {
+      const body = "B" + i.to_string()
+      const (_, _) = cache_mod.write_manifest(root, key, body, cache_manifest_mt, cache_digest(body), "linux/amd64", cache_digest(body), "manifest")
+      i = i + 1
+    }
+    os._exit(0)
+  }
+  const w1 = os.waitpid(pid1)
+  const w2 = os.waitpid(pid2)
+  expect_true(os.wait_exited(w1[1]))
+  expect_true(os.wait_exited(w2[1]))
+  expect_equal(0, os.wait_exit_code(w1[1]))
+  expect_equal(0, os.wait_exit_code(w2[1]))
+  case file.read(cache_mod.manifest_path(root, key)) {
+    (R.error, why) then { expect_fail("final envelope missing: " + why) }
+    (R.ok, text) then {
+      case cache_mod.parse_cached_manifest(text) {
+        (R.error, why) then { expect_fail("final envelope is torn: " + why) }
+        (R.ok, cached) then {
+          case cache_mod.read_manifest(root, key, cached.reference, cached.digest, cached.platform) {
+            (R.ok, _) then { expect_true(true) }
+            (R.error, why) then { expect_fail("final envelope is inconsistent: " + why) }
+          }
+        }
+      }
+    }
+  }
+  case cache_mod.verify(cache_runner, root, false) {
+    (R.ok, report) then { expect_equal(0, report.issues) }
+    (R.error, why) then { expect_fail("verify failed: " + why) }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Command layer: exit codes.
+
+class CacheTestEnv {
+  def init(values Map[String, String]) {
+    self.values = values
+  }
+
+  def getenv(name String) (R, String) {
+    if self.values.has(name) {
+      return (R.ok, self.values.get(name))
+    }
+    return (R.error, "os: getenv " + name + ": is not set")
+  }
+}
+
+def cache_flags() src.common.Flags {
+  return src.common.Flags.new("", false, false)
+}
+
+def cache_env(root String) CacheTestEnv {
+  return CacheTestEnv.new(Map.new(("POKERFACE_CACHE_DIR", root)))
+}
+
+def test_cache_command_routing_and_exit_codes() {
+  const root = cache_root_for("command")
+  const env = cache_env(root)
+  expect_equal(src.common.exit_usage, cache_cmd.run(cache_flags(), [], env))
+  expect_equal(src.common.exit_usage, cache_cmd.run(cache_flags(), ["bogus"], env))
+  expect_equal(src.common.exit_usage, cache_cmd.run(cache_flags(), ["rm", "--wat"], env))
+  expect_equal(src.common.exit_ok, cache_cmd.run(cache_flags(), ["ls"], env))
+  expect_equal(src.common.exit_ok, cache_cmd.run(cache_flags(), ["verify"], env))
+  expect_equal(src.common.exit_ok, cache_cmd.run(cache_flags(), ["rm"], env))
+  cache_ensure(root)
+  const foreign = cache_root_for("command-foreign")
+  cache_mkdir(foreign)
+  cache_write(foreign + "/keep.txt", "keep")
+  const foreign_env = cache_env(foreign)
+  expect_equal(src.common.exit_failure, cache_cmd.run(cache_flags(), ["ls"], foreign_env))
+  expect_equal(src.common.exit_failure, cache_cmd.run(cache_flags(), ["rm"], foreign_env))
+  expect_equal("keep", cache_read(foreign + "/keep.txt"))
+}

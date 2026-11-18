@@ -88,16 +88,6 @@ class BlobOutcome {
   }
 }
 
-class CachedMeta {
-  def init(digest String, media_type String, platform String, reference String, kind String) {
-    self.digest = digest
-    self.media_type = media_type
-    self.platform = platform
-    self.reference = reference
-    self.kind = kind
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Command entry point and options.
 
@@ -148,7 +138,7 @@ def run_with(flags src.common.Flags, opts PullOptions, env src.settings.EnvSourc
                       return src.common.exit_usage
                     }
                     (R.ok, platform) then {
-                      const cache_root = src.commands.resolve.cache_root_of(settings)
+                      const cache_root = src.cache.root_of(settings)
                       if cache_root == "" {
                         src.common.eprint("pokerface: pull: no cache directory is available (set POKERFACE_CACHE_DIR or HOME)\n")
                         return src.common.exit_failure
@@ -166,6 +156,7 @@ def run_with(flags src.common.Flags, opts PullOptions, env src.settings.EnvSourc
                           return src.common.exit_failure
                         }
                         (R.ok, outcome) then {
+                          enforce_cache_limits(cache_root, settings, flags.verbose)
                           print_outcome(outcome, resolved.commit, flags)
                           return src.common.exit_ok
                         }
@@ -388,7 +379,7 @@ def pull_image(deps PullDeps, req PullRequest) (R, PullOutcome) {
     (R.error, why) then { return (R.error, why) }
     (R.ok, _) then { }
   }
-  case ensure_cache_dirs(req.cache_root) {
+  case src.cache.ensure_root(req.cache_root) {
     (R.error, why) then { return (R.error, why) }
     (R.ok, _) then { }
   }
@@ -434,7 +425,7 @@ def pull_into(deps PullDeps, req PullRequest, layout_dir String) (R, PullOutcome
     (R.ok, target) then {
       const (base, repo) = target
       const client = src.registry.Client.new(base, deps.registry_token, src.registry.HttpTransport.new(), pull_manifest_timeout)
-      const key = manifest_cache_key(req.image, req.reference_digest, req.platform)
+      const key = src.cache.manifest_key(req.image, req.reference_digest, req.platform)
       case fetch_manifest_with_cache(client, repo, req, key, deps.verbose) {
         (R.error, why) then { return (R.error, why) }
         (R.ok, manifest) then {
@@ -498,8 +489,8 @@ def pull_into(deps PullDeps, req PullRequest, layout_dir String) (R, PullOutcome
 
 def fetch_manifest_with_cache(client src.registry.Client, repo String, req PullRequest, key String, verbose Bool) (R, ManifestResult) {
   if req.offline {
-    case read_manifest_cache(req.cache_root, key, req.reference_digest, req.expected_manifest_digest, req.platform) {
-      (R.ok, cached) then { return (R.ok, cached) }
+    case src.cache.read_manifest(req.cache_root, key, req.reference_digest, req.expected_manifest_digest, req.platform) {
+      (R.ok, cached) then { return (R.ok, from_cached(cached)) }
       (R.error, why) then {
         return (R.error, "offline: no usable cached manifest for " + req.image + " (" + why + ")")
       }
@@ -507,14 +498,14 @@ def fetch_manifest_with_cache(client src.registry.Client, repo String, req PullR
   }
   case fetch_final_manifest(client, repo, req.reference_digest, req.expected_manifest_digest, req.platform) {
     (R.ok, fresh) then {
-      write_manifest_cache(req.cache_root, key, fresh, req.reference_digest, req.platform)
+      const (_, _) = src.cache.write_manifest(req.cache_root, key, fresh.body, fresh.media_type, fresh.digest, req.platform, req.reference_digest, fresh.reference_kind)
       return (R.ok, fresh)
     }
     (R.error, why) then {
-      case read_manifest_cache(req.cache_root, key, req.reference_digest, req.expected_manifest_digest, req.platform) {
+      case src.cache.read_manifest(req.cache_root, key, req.reference_digest, req.expected_manifest_digest, req.platform) {
         (R.ok, cached) then {
           src.common.eprint("pokerface: warning: manifest fetch failed (" + why + "); using cached manifest " + cached.digest + "\n")
-          return (R.ok, cached)
+          return (R.ok, from_cached(cached))
         }
         (R.error, cache_why) then {
           return (R.error, why + "; no usable cached manifest: " + cache_why)
@@ -522,6 +513,10 @@ def fetch_manifest_with_cache(client src.registry.Client, repo String, req PullR
       }
     }
   }
+}
+
+def from_cached(cached src.cache.CachedManifest) ManifestResult {
+  return ManifestResult.new(cached.body, cached.media_type, cached.digest, true, cached.kind)
 }
 
 // Fetches reference_digest, verifying it; an index is resolved by platform
@@ -592,125 +587,6 @@ def split_platform(platform String) (R, (String, String)) {
   return (R.ok, (parts[0], parts[1]))
 }
 
-def manifest_cache_key(image String, reference String, platform String) String {
-  return crypto.hex_encode(crypto.sha2.sha256((image + "@" + reference + "#" + platform).to_bytes()))
-}
-
-// Cache writes are best effort: a read-only cache never fails a pull.
-def write_manifest_cache(cache_root String, key String, result ManifestResult, reference String, platform String) {
-  const dir = cache_root + "/manifests"
-  const body_path = dir + "/" + key + ".json"
-  const meta_path = dir + "/" + key + ".meta"
-  case write_atomic(body_path, result.body) {
-    (R.error, _) then { }
-    (R.ok, _) then {
-      const meta = json.object([
-        ("digest", json.string(result.digest)),
-        ("media_type", json.string(result.media_type)),
-        ("platform", json.string(platform)),
-        ("reference", json.string(reference)),
-        ("reference_kind", json.string(result.reference_kind))
-      ])
-      const meta_text = json.encode(meta) + "\n"
-      case write_atomic(meta_path, meta_text) {
-        (R.error, _) then { }
-        (R.ok, _) then { }
-      }
-    }
-  }
-}
-
-def write_atomic(path String, body String) (R, Bool) {
-  const part = path + ".part"
-  case file.write(part, body) {
-    (R.error, why) then { return (R.error, why) }
-    (R.ok, _) then {
-      case os.rename(part, path) {
-        (R.error, why) then {
-          os.unlink(part)
-          return (R.error, why)
-        }
-        (R.ok, _) then { return (R.ok, true) }
-      }
-    }
-  }
-}
-
-def read_manifest_cache(cache_root String, key String, reference String, expected String, platform String) (R, ManifestResult) {
-  const dir = cache_root + "/manifests"
-  const meta_path = dir + "/" + key + ".meta"
-  case file.read(meta_path) {
-    (R.error, why) then { return (R.error, "no cached manifest metadata (" + why + ")") }
-    (R.ok, meta_text) then {
-      case parse_cached_meta(meta_text) {
-        (R.error, why) then { return (R.error, "cached manifest metadata is invalid: " + why) }
-        (R.ok, meta) then {
-          if meta.reference != reference {
-            return (R.error, "cached manifest is for reference " + meta.reference + ", not " + reference)
-          }
-          if meta.platform != platform {
-            return (R.error, "cached manifest is for platform " + meta.platform + ", not " + platform)
-          }
-          if expected != "" && meta.digest != expected {
-            return (R.error, "cached manifest digest " + meta.digest + " does not match the lock's " + expected)
-          }
-          if meta.kind == "manifest" && meta.digest != reference {
-            return (R.error, "cached manifest digest " + meta.digest + " does not match its reference " + reference)
-          }
-          if !src.oci.is_manifest_type(meta.media_type) {
-            return (R.error, "cached media type '" + meta.media_type + "' is not an image manifest")
-          }
-          const body_path = dir + "/" + key + ".json"
-          case file.read(body_path) {
-            (R.error, why) then { return (R.error, "cached manifest body is missing (" + why + ")") }
-            (R.ok, body) then {
-              const actual = "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
-              if actual != meta.digest {
-                return (R.error, "cached manifest is corrupted (metadata says " + meta.digest + ", body hashes to " + actual + ")")
-              }
-              return (R.ok, ManifestResult.new(body, meta.media_type, meta.digest, true, meta.kind))
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-def parse_cached_meta(text String) (R, CachedMeta) {
-  case json.decode(text) {
-    (R.error, why) then { return (R.error, "invalid JSON — " + why) }
-    (R.ok, doc) then {
-      case src.oci.member_string(doc, "digest") {
-        (R.error, why) then { return (R.error, "digest: " + why) }
-        (R.ok, digest) then {
-          case src.oci.member_string(doc, "media_type") {
-            (R.error, why) then { return (R.error, "media_type: " + why) }
-            (R.ok, media_type) then {
-              case src.oci.member_string(doc, "platform") {
-                (R.error, why) then { return (R.error, "platform: " + why) }
-                (R.ok, cached_platform) then {
-                  case src.oci.member_string(doc, "reference") {
-                    (R.error, why) then { return (R.error, "reference: " + why) }
-                    (R.ok, reference) then {
-                      case src.oci.member_string(doc, "reference_kind") {
-                        (R.error, why) then { return (R.error, "reference_kind: " + why) }
-                        (R.ok, kind) then {
-                          return (R.ok, CachedMeta.new(digest, media_type, cached_platform, reference, kind))
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Blob stage and its content-addressed cache.
 
@@ -731,13 +607,12 @@ def ensure_blobs(client src.registry.Client, base String, repo String, manifest_
         const (_, _) = client.probe()
       }
       const transport = src.blob.RegistryBlobTransport.new(client.token())
-      const dir = cache_root + "/blobs/sha256"
       var sources = []
       var downloaded = 0
       var cached = 0
       var index = 0
       while index < all.length() {
-        case ensure_one_blob(transport, base, repo, all[index], dir, offline, verbose) {
+        case ensure_one_blob(transport, base, repo, all[index], cache_root, offline, verbose) {
           (R.error, why) then { return (R.error, why) }
           (R.ok, one) then {
             const (source, was_downloaded) = one
@@ -756,13 +631,12 @@ def ensure_blobs(client src.registry.Client, base String, repo String, manifest_
   }
 }
 
-def ensure_one_blob(transport src.blob.BlobTransport, base String, repo String, descriptor src.oci.Descriptor, dir String, offline Bool, verbose Bool) (R, (src.oci.BlobSource, Bool)) {
-  const hex = src.blob.digest_hex(descriptor.digest)
-  if hex == "" {
+def ensure_one_blob(transport src.blob.BlobTransport, base String, repo String, descriptor src.oci.Descriptor, cache_root String, offline Bool, verbose Bool) (R, (src.oci.BlobSource, Bool)) {
+  if src.blob.digest_hex(descriptor.digest) == "" {
     return (R.error, "pull: manifest references a non-sha256 blob digest '" + descriptor.digest + "'")
   }
-  const path = dir + "/" + hex
-  if blob_ok(path, descriptor.digest, descriptor.size) {
+  const path = src.cache.blob_path(cache_root, descriptor.digest)
+  if src.cache.blob_ok(path, descriptor.digest, descriptor.size) {
     return (R.ok, (src.oci.BlobSource.new(descriptor.digest, descriptor.size, path), false))
   }
   if offline {
@@ -780,49 +654,28 @@ def ensure_one_blob(transport src.blob.BlobTransport, base String, repo String, 
   }
 }
 
-def blob_ok(path String, digest String, size Int64) Bool {
-  case src.oci.hash_file(path) {
-    (R.ok, info) then {
-      const (actual, actual_size) = info
-      return actual == digest && actual_size == size
-    }
-    (R.error, _) then { return false }
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Cache directories and output.
+// Cache limits: enforced after a successful pull, best effort.
 
-def ensure_cache_dirs(root String) (R, Bool) {
-  case ensure_dir(root) {
-    (R.error, why) then { return (R.error, why) }
-    (R.ok, _) then { }
-  }
-  case ensure_dir(root + "/manifests") {
-    (R.error, why) then { return (R.error, why) }
-    (R.ok, _) then { }
-  }
-  case ensure_dir(root + "/blobs") {
-    (R.error, why) then { return (R.error, why) }
-    (R.ok, _) then { }
-  }
-  case ensure_dir(root + "/blobs/sha256") {
-    (R.error, why) then { return (R.error, why) }
-    (R.ok, _) then { return (R.ok, true) }
-  }
-}
-
-def ensure_dir(path String) (R, Bool) {
-  case os.mkdir(path) {
-    (R.ok, _) then { return (R.ok, true) }
-    (R.error, _) then {
-      case os.list_dir(path) {
-        (R.ok, _) then { return (R.ok, true) }
-        (R.error, why) then { return (R.error, "pull: cannot create directory " + path + ": " + why) }
+def enforce_cache_limits(cache_root String, settings src.settings.AppSettings, verbose Bool) {
+  if settings.cache_ttl_seconds > 0 || settings.cache_max_bytes > 0 {
+    case src.cache.enforce_limits(src.git.RealRunner.new(), cache_root, settings.cache_ttl_seconds, settings.cache_max_bytes, verbose) {
+      (R.ok, report) then {
+        if verbose && report.evicted > 0 {
+          src.common.eprint("cache: limits evicted " + report.evicted.to_string() + " entries (" + src.cache.format_bytes(report.bytes) + ")\n")
+        }
+      }
+      (R.error, why) then {
+        if verbose {
+          src.common.eprint("warning: cache limit enforcement failed: " + why + "\n")
+        }
       }
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Output.
 
 def print_outcome(outcome PullOutcome, commit String, flags src.common.Flags) {
   if flags.json {

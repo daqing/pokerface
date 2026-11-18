@@ -798,4 +798,10 @@ def test_pull_command_end_to_end_with_git_metadata() {
   expect_true(runner.layout() != "")
   expect_contains(runner.calls_text(), "skopeo copy oci:" + runner.layout() + ":latest docker-daemon:" + fixture.image() + ":latest")
   fixture.stop()
+  // The same ref, offline: the ref -> commit map written by the online run
+  // resolves "main" without Git, and the manifest/blob caches serve the rest.
+  const offline_opts = src.commands.pull.PullOptions.new(repo + ":main", "", "", false, true)
+  const offline_runner = PullRuntimeRunner.new(true)
+  expect_equal(0, pull_mod.run_with(flags, offline_opts, env, offline_runner))
+  expect_true(offline_runner.layout() != "")
 }

@@ -298,3 +298,74 @@ def full_file_text() String {
     + "cache_dir: /tmp/file-cache\n"
   )
 }
+
+def test_cache_limits_from_env() {
+  const env = FakeEnv.new(Map.new(("POKERFACE_CACHE_TTL", "7d"), ("POKERFACE_CACHE_MAX_SIZE", "2G")))
+  case settings.load(settings_runner, env, "") {
+    (R.ok, s) then {
+      expect_equal(604800, s.cache_ttl_seconds)
+      expect_equal(2147483648, s.cache_max_bytes)
+    }
+    (R.error, why) then { expect_fail("load failed: " + why) }
+  }
+}
+
+def test_invalid_cache_limits_are_errors() {
+  const env = FakeEnv.new(Map.new(("POKERFACE_CACHE_TTL", "soon")))
+  case settings.load(settings_runner, env, "") {
+    (R.ok, _) then { expect_fail("expected a TTL error") }
+    (R.error, why) then { expect_true(why.index_of("POKERFACE_CACHE_TTL") >= 0) }
+  }
+  const env2 = FakeEnv.new(Map.new(("POKERFACE_CACHE_MAX_SIZE", "lots")))
+  case settings.load(settings_runner, env2, "") {
+    (R.ok, _) then { expect_fail("expected a size error") }
+    (R.error, why) then { expect_true(why.index_of("POKERFACE_CACHE_MAX_SIZE") >= 0) }
+  }
+}
+
+def test_parse_duration_and_size() {
+  case settings.parse_duration("3600") {
+    (R.ok, v) then { expect_equal(3600, v) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case settings.parse_duration("10s") {
+    (R.ok, v) then { expect_equal(10, v) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case settings.parse_duration("2h") {
+    (R.ok, v) then { expect_equal(7200, v) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case settings.parse_duration("7d") {
+    (R.ok, v) then { expect_equal(604800, v) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case settings.parse_duration("soon") {
+    (R.ok, _) then { expect_fail("expected a duration error") }
+    (R.error, _) then { expect_true(true) }
+  }
+  case settings.parse_size("1024") {
+    (R.ok, v) then { expect_equal(1024, v) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case settings.parse_size("1k") {
+    (R.ok, v) then { expect_equal(1024, v) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case settings.parse_size("2m") {
+    (R.ok, v) then { expect_equal(2097152, v) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case settings.parse_size("3g") {
+    (R.ok, v) then { expect_equal(3221225472, v) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case settings.parse_size("10b") {
+    (R.ok, v) then { expect_equal(10, v) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case settings.parse_size("lots") {
+    (R.ok, _) then { expect_fail("expected a size error") }
+    (R.error, _) then { expect_true(true) }
+  }
+}

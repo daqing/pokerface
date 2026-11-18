@@ -54,7 +54,8 @@ document is its own error (`… is not valid lock YAML: …`).
   fetches; racing `git init --bare` and lock-file contention are retried with
   short sleeps (`test_concurrent_fetches_do_not_corrupt_cache` races a real
   forked process against the parent on one fresh cache).
-- **The mirror only ever grows.** Nothing prunes objects in v0.1; size
-  limits and eviction are T1.15's job.
+- **The mirror only ever grows during reads.** T1.15's `src/cache.emo` evicts
+  whole mirror directories for TTL/size reasons and `cache rm --git`, using
+  the `<cache_root>/.lock` guard; reads themselves never prune.
 - **All git traffic is argv-array, never shell**, through the same
   `CommandRunner` abstraction as T1.6, with the double-fork watchdog timeout.
