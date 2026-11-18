@@ -1,0 +1,502 @@
+// T1.10: OCI registry client — /v2/ probe, WWW-Authenticate Bearer dance,
+// manifest fetch by tag or digest with digest verification, and index
+// platform selection. The transport is injectable (HttpTransport real,
+// MockTransport for offline tests); redirects are never followed — a 3xx is
+// an error naming the location. Spec: docs/spec/registry-client.md.
+
+require "http"
+require "json"
+require "crypto"
+
+// Media types this client speaks (full table in docs/spec/registry-client.md).
+const mt_oci_manifest = "application/vnd.oci.image.manifest.v1+json"
+const mt_oci_index = "application/vnd.oci.image.index.v1+json"
+const mt_docker_manifest = "application/vnd.docker.distribution.manifest.v2+json"
+const mt_docker_list = "application/vnd.docker.distribution.manifest.list.v2+json"
+const accept_manifest_types = mt_oci_manifest + ", " + mt_oci_index + ", " + mt_docker_manifest + ", " + mt_docker_list
+
+const default_timeout = 30.0
+
+class Response {
+  def init(status Int64, headers Array[(String, String)], body String) {
+    self.status = status
+    self.headers = headers
+    self.body = body
+  }
+
+  def header(name String) String {
+    const wanted = name.lower()
+    var i = 0
+    while i < self.headers.length() {
+      const (key, value) = self.headers[i]
+      if key.lower() == wanted {
+        return value
+      }
+      i = i + 1
+    }
+    return ""
+  }
+}
+
+interface Transport {
+  def request(method String, url String, headers Array[(String, String)], body String, timeout Float64) (R, Response)
+}
+
+class HttpTransport {
+  def init() {
+  }
+
+  def request(method String, url String, headers Array[(String, String)], body String, timeout Float64) (R, Response) {
+    case http.request(method, url, headers, body, timeout) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, resp) then { return (R.ok, Response.new(resp.status, resp.headers, resp.body)) }
+    }
+  }
+}
+
+class MockRoute {
+  // mode: "any" matches every request to the URL; "none" requires the request
+  // to carry no Authorization header; "contains" requires it to carry one
+  // whose value includes auth_contains.
+  def init(mode String, auth_contains String, url_contains String, status Int64, body String, headers Array[(String, String)]) {
+    self.mode = mode
+    self.auth_contains = auth_contains
+    self.url_contains = url_contains
+    self.status = status
+    self.body = body
+    self.headers = headers
+  }
+}
+
+class MockTransport {
+  def init(routes Array[MockRoute]) {
+    self.routes = routes
+    self.calls = Box.new(ArrayBuilder.new())
+  }
+
+  def authorization_in(headers Array[(String, String)]) String {
+    var i = 0
+    while i < headers.length() {
+      const (key, value) = headers[i]
+      if key.lower() == "authorization" {
+        return value
+      }
+      i = i + 1
+    }
+    return ""
+  }
+
+  def route_matches(route MockRoute, url String, auth String) Bool {
+    if url.index_of(route.url_contains) < 0 {
+      return false
+    }
+    case route.mode {
+      "any" then { return true }
+      "none" then { return auth == "" }
+      "contains" then { return auth.index_of(route.auth_contains) >= 0 }
+    }
+  }
+
+  def request(method String, url String, headers Array[(String, String)], body String, timeout Float64) (R, Response) {
+    const auth = self.authorization_in(headers)
+    var record = method + " " + url
+    if auth != "" {
+      record = record + " [" + auth + "]"
+    }
+    self.calls.read().push(record)
+    var i = 0
+    while i < self.routes.length() {
+      const route = self.routes[i]
+      if self.route_matches(route, url, auth) {
+        return (R.ok, Response.new(route.status, route.headers, route.body))
+      }
+      i = i + 1
+    }
+    return (R.ok, Response.new(404, [], "mock: no route matches " + record))
+  }
+
+  def calls_text() String {
+    var out = ""
+    const arr = self.calls.read().to_array()
+    var i = 0
+    while i < arr.length() {
+      out = out + arr[i] + "\n"
+      i = i + 1
+    }
+    return out
+  }
+}
+
+class ManifestFetch {
+  def init(media_type String, body String, digest String) {
+    self.media_type = media_type
+    self.body = body
+    self.digest = digest
+  }
+}
+
+class Client {
+  def init(base String, token String, transport Transport, timeout Float64) {
+    self.base = base
+    self.token_box = Box.new(token)
+    self.transport = transport
+    self.timeout = timeout
+  }
+
+  def token() String {
+    return self.token_box.read()
+  }
+
+  def get_transport() Transport {
+    return self.transport
+  }
+
+  def auth_headers() Array[(String, String)] {
+    if self.token() == "" {
+      return []
+    }
+    return [("Authorization", "Bearer " + self.token())]
+  }
+
+  // GET /v2/ — 200 means done; 401 runs the WWW-Authenticate Bearer dance
+  // (token fetch + verify probe); anything else is an error.
+  def probe() (R, Bool) {
+    case self.transport.request("GET", self.base + "/v2/", self.auth_headers(), "", self.timeout) {
+      (R.error, why) then { return (R.error, "registry: probe failed: " + why) }
+      (R.ok, resp) then {
+        if resp.status == 200 {
+          return (R.ok, true)
+        }
+        if resp.status == 401 {
+          return self.authenticate()
+        }
+        return (R.error, "registry: probe returned status " + resp.status.to_string())
+      }
+    }
+  }
+
+  // The Bearer dance: re-challenge, parse WWW-Authenticate, fetch the token
+  // from the realm, store it, and verify with a second probe. Answers a Bool
+  // via (R, Bool); the token stays in the client for later calls.
+  def authenticate() (R, Bool) {
+    case self.transport.request("GET", self.base + "/v2/", [], "", self.timeout) {
+      (R.error, why) then { return (R.error, "registry: challenge failed: " + why) }
+      (R.ok, resp) then {
+        if resp.status != 401 {
+          return (R.error, "registry: expected a 401 challenge, got status " + resp.status.to_string())
+        }
+        case parse_challenge(resp.header("WWW-Authenticate")) {
+          (R.error, why) then { return (R.error, "registry: " + why) }
+          (R.ok, challenge) then {
+            const (realm, service, scope) = challenge
+            var token_url = realm + "?service=" + percent_encode(service)
+            if scope != "" {
+              token_url = token_url + "&scope=" + percent_encode(scope)
+            }
+            case self.transport.request("GET", token_url, [], "", self.timeout) {
+              (R.error, why) then { return (R.error, "registry: token request failed: " + why) }
+              (R.ok, token_resp) then {
+                if token_resp.status != 200 {
+                  return (R.error, "registry: token endpoint returned status " + token_resp.status.to_string())
+                }
+                case extract_token(token_resp.body) {
+                  (R.error, why) then { return (R.error, "registry: " + why) }
+                  (R.ok, token) then {
+                    self.token_box.replace(token)
+                    case self.transport.request("GET", self.base + "/v2/", self.auth_headers(), "", self.timeout) {
+                      (R.error, why) then { return (R.error, "registry: probe after token failed: " + why) }
+                      (R.ok, check) then {
+                        if check.status == 200 {
+                          return (R.ok, true)
+                        }
+                        return (R.error, "registry: probe after token returned status " + check.status.to_string() + " — the token was not accepted")
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Fetch a manifest (or index) by tag or digest. A 401 runs the dance and
+  // retries once; a 3xx is an error (redirects are never followed); the
+  // Docker-Content-Digest header must match the body's sha256 when present.
+  def fetch_manifest(repo String, reference String) (R, ManifestFetch) {
+    const url = self.base + "/v2/" + repo + "/manifests/" + reference
+    case self.transport.request("GET", url, self.manifest_headers(), "", self.timeout) {
+      (R.error, why) then { return (R.error, "registry: manifest request failed: " + why) }
+      (R.ok, resp) then {
+        if resp.status == 401 {
+          case self.authenticate() {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, _) then {
+              // Rebuild the headers: the dance may have stored a token after
+              // the first attempt went out without one.
+              case self.transport.request("GET", url, self.manifest_headers(), "", self.timeout) {
+                (R.error, why) then { return (R.error, "registry: manifest request failed: " + why) }
+                (R.ok, retry) then { return manifest_from(retry.status, retry.headers, retry.body) }
+              }
+            }
+          }
+        }
+        return manifest_from(resp.status, resp.headers, resp.body)
+      }
+    }
+  }
+
+  def manifest_headers() Array[(String, String)] {
+    return merge_headers([("Accept", accept_manifest_types)], self.auth_headers())
+  }
+
+  // Select a child manifest from an OCI index (or Docker manifest list) by
+  // platform; answers the child's digest for the next fetch_manifest.
+  def select_platform(index_body String, os String, arch String) (R, String) {
+    case json.decode(index_body) {
+      (R.error, why) then { return (R.error, "registry: index is not valid JSON: " + why) }
+      (R.ok, doc) then {
+        case json_member(doc, "manifests") {
+          (R.error, why) then { return (R.error, "registry: index has no manifests array: " + why) }
+          (R.ok, manifests) then {
+            if manifests.is(json.JsonArray) {
+              return index_scan(manifests, os, arch)
+            }
+            return (R.error, "registry: index manifests is not an array")
+          }
+        }
+      }
+    }
+  }
+}
+
+def index_scan(manifests json.JsonArray, os String, arch String) (R, String) {
+  const items = manifests.items()
+  var available = ""
+  var i = 0
+  while i < items.length() {
+    const item = items[i]
+    case json_member(item, "digest") {
+      (R.error, why) then { return (R.error, "registry: index entry " + i.to_string() + " has no digest: " + why) }
+      (R.ok, digest_value) then {
+        const digest = digest_value.as_string()
+        case json_member(item, "platform") {
+          (R.error, why) then {
+            available = available + " " + digest + " (no platform)"
+          }
+          (R.ok, platform) then {
+            const item_os = member_string_or(platform, "os", "?")
+            const item_arch = member_string_or(platform, "architecture", "?")
+            available = available + " " + item_os + "/" + item_arch
+            if item_os == os && item_arch == arch {
+              return (R.ok, digest)
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  return (R.error, "registry: index lists no " + os + "/" + arch + " manifest (available:" + available + ")")
+}
+
+// Shared manifest finishing: status handling, digest verification, media
+// type. Takes the plain fields so both the first attempt and the retry path
+// reuse it.
+def manifest_from(status Int64, headers Array[(String, String)], body String) (R, ManifestFetch) {
+  if status == 401 {
+    return (R.error, "registry: manifest request is unauthorized (401) after authentication")
+  }
+  if status == 404 {
+    return (R.error, "registry: manifest not found (404 MANIFEST_UNKNOWN)")
+  }
+  if status >= 500 {
+    return (R.error, "registry: registry error (status " + status.to_string() + ")")
+  }
+  if status >= 300 {
+    const location = header_value(headers, "Location")
+    return (R.error, "registry: unexpected redirect (status " + status.to_string() + " to " + location + ") — redirects are never followed")
+  }
+  if status != 200 {
+    return (R.error, "registry: manifest request returned status " + status.to_string())
+  }
+  case verify_digest(body, header_value(headers, "Docker-Content-Digest")) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, digest) then {
+      var media_type = header_value(headers, "Content-Type")
+      case body_media_type(body) {
+        (R.ok, declared) then { media_type = declared }
+        (R.error, _) then { }
+      }
+      return (R.ok, ManifestFetch.new(media_type, body, digest))
+    }
+  }
+}
+
+def header_value(headers Array[(String, String)], name String) String {
+  const wanted = name.lower()
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == wanted {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+// The body's sha256 must equal the Docker-Content-Digest header when the
+// header is present; the computed digest is the answer either way.
+def verify_digest(body String, expected String) (R, String) {
+  const hex = crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+  if expected != "" {
+    if !expected.starts_with("sha256:") {
+      return (R.error, "registry: Docker-Content-Digest '" + expected + "' is not a sha256 digest")
+    }
+    const want = expected.substring(7, expected.length() - 7)
+    if !crypto.constant_time_compare(hex.to_bytes(), want.to_bytes()) {
+      return (R.error, "registry: digest mismatch — header says " + expected + ", body hashes to sha256:" + hex)
+    }
+  }
+  return (R.ok, "sha256:" + hex)
+}
+
+// The manifest's own mediaType field is authoritative when present.
+def body_media_type(body String) (R, String) {
+  case json.decode(body) {
+    (R.error, why) then { return (R.error, "registry: manifest is not valid JSON: " + why) }
+    (R.ok, doc) then {
+      case json_member(doc, "mediaType") {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, value) then { return (R.ok, value.as_string()) }
+      }
+    }
+  }
+}
+
+// WWW-Authenticate: Bearer realm="...",service="...",scope="..." — quoted
+// values, no escaped quotes in practice; realm is required.
+def parse_challenge(value String) (R, (String, String, String)) {
+  if !value.starts_with("Bearer ") {
+    return (R.error, "unsupported WWW-Authenticate challenge '" + value + "' (only Bearer is supported)")
+  }
+  case quoted_value(value, "realm") {
+    (R.error, why) then { return (R.error, "challenge has no realm: " + why) }
+    (R.ok, realm) then {
+      var service = ""
+      var scope = ""
+      case quoted_value(value, "service") {
+        (R.ok, v) then { service = v }
+        (R.error, _) then { service = "" }
+      }
+      case quoted_value(value, "scope") {
+        (R.ok, v) then { scope = v }
+        (R.error, _) then { scope = "" }
+      }
+      return (R.ok, (realm, service, scope))
+    }
+  }
+}
+
+def quoted_value(s String, key String) (R, String) {
+  const needle = key + "=\""
+  const at = s.index_of(needle)
+  if at < 0 {
+    return (R.error, "no " + key + " in '" + s + "'")
+  }
+  const rest = s.substring(at + needle.length(), s.length() - at - needle.length())
+  const close = rest.index_of("\"")
+  if close < 0 {
+    return (R.error, "unterminated " + key + " value in '" + s + "'")
+  }
+  return (R.ok, rest.substring(0, close))
+}
+
+// Token responses carry "token" or "access_token".
+def extract_token(body String) (R, String) {
+  case json.decode(body) {
+    (R.error, why) then { return (R.error, "token response is not valid JSON: " + why) }
+    (R.ok, doc) then {
+      case json_member(doc, "token") {
+        (R.ok, value) then { return (R.ok, value.as_string()) }
+        (R.error, _) then {
+          case json_member(doc, "access_token") {
+            (R.ok, value) then { return (R.ok, value.as_string()) }
+            (R.error, _) then { return (R.error, "token response carries neither token nor access_token") }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Safe member lookup — Json.get raises on a missing key, which Emo cannot
+// catch, so every optional field goes through this scan.
+def json_member(doc json.Json, key String) (R, json.Json) {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (k, v) = entries[i]
+      if k == key {
+        return (R.ok, v)
+      }
+      i = i + 1
+    }
+    return (R.error, "no member '" + key + "'")
+  }
+  return (R.error, "value is not an object")
+}
+
+def member_string_or(doc json.Json, key String, fallback String) String {
+  case json_member(doc, key) {
+    (R.ok, value) then { return value.as_string() }
+    (R.error, _) then { return fallback }
+  }
+}
+
+def merge_headers(a Array[(String, String)], b Array[(String, String)]) Array[(String, String)] {
+  var out = []
+  var i = 0
+  while i < a.length() {
+    out = out.append(a[i])
+    i = i + 1
+  }
+  var j = 0
+  while j < b.length() {
+    out = out.append(b[j])
+    j = j + 1
+  }
+  return out
+}
+
+// RFC 3986 unreserved characters pass; everything else percent-encodes with
+// uppercase hex.
+def percent_encode(s String) String {
+  const unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+  const lower_hex = "0123456789abcdef"
+  const upper_hex = "0123456789ABCDEF"
+  var out = ""
+  var i = 0
+  while i < s.length() {
+    const c = s.substring(i, 1)
+    if unreserved.index_of(c) >= 0 {
+      out = out + c
+    } else {
+      const hex = crypto.hex_encode(c.to_bytes())
+      var hx = ""
+      var j = 0
+      while j < hex.length() {
+        const at = lower_hex.index_of(hex.substring(j, 1))
+        hx = hx + upper_hex.substring(at, 1)
+        j = j + 1
+      }
+      out = out + "%" + hx
+    }
+    i = i + 1
+  }
+  return out
+}

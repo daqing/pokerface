@@ -79,7 +79,7 @@ Exit criteria:
 | [x] | T1.7 | Read Git metadata and cache repository mirrors | T1.6, T1.5 | 3h |
 | [x] | T1.8 | Configuration, credentials, and XDG paths | T1.1 | 2h |
 | [x] | T1.9 | Wire up the `resolve` command | T1.4-T1.8 | 2h |
-| [ ] | T1.10 | Registry authentication and manifest client | T1.5, T1.8 | 3h |
+| [x] | T1.10 | Registry authentication and manifest client | T1.5, T1.8 | 3h |
 | [ ] | T1.11 | Blob downloader: retries, verification, resume | T1.10 | 3-4h |
 | [ ] | T1.12 | Assemble an OCI image layout | T1.10, T1.11 | 2-3h |
 | [ ] | T1.13 | Runtime import adapter | T1.12 | 3h |
@@ -240,6 +240,8 @@ images:
 **Acceptance**: 401 -> fetch token -> retry succeeds; 404 / 5xx / timeouts produce clear errors; a multi-arch index can select the target platform; manifest bytes match the digest; all requests go only to the configured registry host; redirects are not followed automatically.
 
 **Depends on**: T1.5, T1.8 · **Estimate**: 3h
+
+> **Notes** (2026-11-18, ~2.5h): Done. `src/registry.emo` implements the full acceptance set against an injectable `Transport` (HttpTransport real, MockTransport offline): probe → 401 → `WWW-Authenticate` Bearer parse (realm/service/scope, percent-encoded) → token fetch → verify probe; manifest fetch by tag/digest with constant-time `Docker-Content-Digest` verification (mismatch names both digests); 401-dance-and-retry-once whose retry **rebuilds headers** (first version reused the pre-dance header array and silently re-sent no token — mock caught it); index platform selection listing available platforms on a miss; 3xx is a hard error naming the Location; every mock call asserted to stay on the registry or auth host. Media-type table lives in docs/spec/registry-client.md. Gotchas: client token mutability needs a `Box` (class fields freeze after init); Json.get raises on missing keys and Emo has no catch, so all optional members go through a scanning `json_member` helper; reverse `if !x.is(...)` guards do not narrow — positive-branch structure only; type paths in test signatures cannot use const aliases (`reg.Client` fails, `src.registry.Client` works).
 
 #### T1.11 Blob Downloader: Retries, Verification, Resume
 

@@ -1,0 +1,336 @@
+// T1.10 tests for the registry client — run with `emo test`.
+//
+// Loader-pitfall discipline (see the note at the top of test/resolve_cmd.emo):
+// the file is NOT named test/registry.emo (a path mirroring src/registry.emo
+// trips E5003), and top level holds only literal consts and defs — every
+// cross-module constructor call lives inside a def.
+
+const reg = src.registry
+
+// 64-hex-char digest bodies for fixtures.
+const hex_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const hex_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+const hex_c = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+const base = "https://reg.example.com"
+const auth_realm = "https://auth.example.com/token"
+
+const manifest_json = (
+  "{\"schemaVersion\":2,"
+  + "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+  + "\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\","
+  + "\"digest\":\"sha256:" + hex_c + "\",\"size\":1},"
+  + "\"layers\":[]}"
+)
+
+def sha_hex(body String) String {
+  return crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+def manifest_digest() String {
+  return "sha256:" + sha_hex(manifest_json)
+}
+
+def challenge_header() String {
+  return (
+    "Bearer realm=\"" + auth_realm + "\""
+    + ",service=\"reg.example.com\""
+    + ",scope=\"repository:acme/app:pull\""
+  )
+}
+
+def token_json() String {
+  return "{\"token\":\"tok-123\"}"
+}
+
+def route(url_contains String, status Int64, body String, headers Array[(String, String)]) src.registry.MockRoute {
+  return src.registry.MockRoute.new("any", "", url_contains, status, body, headers)
+}
+
+// Matches only requests that carry no Authorization header.
+def route_no_auth(url_contains String, status Int64, body String, headers Array[(String, String)]) src.registry.MockRoute {
+  return src.registry.MockRoute.new("none", "", url_contains, status, body, headers)
+}
+
+// Matches only requests whose Authorization header includes the value.
+def route_auth(url_contains String, auth_contains String, status Int64, body String, headers Array[(String, String)]) src.registry.MockRoute {
+  return src.registry.MockRoute.new("contains", auth_contains, url_contains, status, body, headers)
+}
+
+// The bearer-dance route set: unauthenticated requests get the 401
+// challenge, the token endpoint issues tok-123, and token-bearing requests
+// succeed.
+def dance_routes() Array[src.registry.MockRoute] {
+  return [
+    route_no_auth("/v2/acme/app/manifests/", 401, "unauthorized", [("WWW-Authenticate", challenge_header())]),
+    route_no_auth("/v2/", 401, "unauthorized", [("WWW-Authenticate", challenge_header())]),
+    route_no_auth("/token", 200, token_json(), [("Content-Type", "application/json")]),
+    route_auth("/v2/acme/app/manifests/", "tok-123", 200, manifest_json, [
+      ("Content-Type", "application/vnd.oci.image.manifest.v1+json"),
+      ("Docker-Content-Digest", manifest_digest())
+    ]),
+    route_auth("/v2/", "tok-123", 200, "ok", [])
+  ]
+}
+
+def manifest_route() src.registry.MockRoute {
+  return route("/v2/acme/app/manifests/", 200, manifest_json, [
+    ("Content-Type", "application/vnd.oci.image.manifest.v1+json"),
+    ("Docker-Content-Digest", manifest_digest())
+  ])
+}
+
+def token_route() src.registry.MockRoute {
+  return route("/token", 200, token_json(), [("Content-Type", "application/json")])
+}
+
+def challenge_route() src.registry.MockRoute {
+  return route("/v2/", 401, "unauthorized", [("WWW-Authenticate", challenge_header())])
+}
+
+def make_client(routes Array[src.registry.MockRoute]) src.registry.Client {
+  return src.registry.Client.new(base, "", src.registry.MockTransport.new(routes), 5.0)
+}
+
+def mock_of(client src.registry.Client) src.registry.MockTransport {
+  const t = client.get_transport()
+  if t.is(src.registry.MockTransport) {
+    return t
+  }
+  expect_fail("client does not use a MockTransport")
+  return src.registry.MockTransport.new([])
+}
+
+def expect_ok(result (R, String)) String {
+  case result {
+    (R.ok, v) then { return v }
+    (R.error, why) then {
+      expect_fail("expected ok, got: " + why)
+      return ""
+    }
+  }
+}
+
+def expect_ok_bool(result (R, Bool)) {
+  case result {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("expected ok, got: " + why) }
+  }
+}
+
+def test_probe_anonymous_ok() {
+  const client = make_client([route("/v2/", 200, "ok", [])])
+  expect_ok_bool(client.probe())
+}
+
+def test_probe_auth_dance() {
+  const client = make_client(dance_routes())
+  expect_ok_bool(client.probe())
+  expect_equal("tok-123", client.token())
+}
+
+def test_probe_401_without_challenge_header_errors() {
+  const client = make_client([route_no_auth("/v2/", 401, "unauthorized", [])])
+  case client.probe() {
+    (R.ok, _) then { expect_fail("expected an error") }
+    (R.error, why) then { expect_true(why.index_of("challenge") >= 0) }
+  }
+}
+
+def test_probe_5xx_errors() {
+  const client = make_client([route("/v2/", 503, "unavailable", [])])
+  case client.probe() {
+    (R.ok, _) then { expect_fail("expected an error") }
+    (R.error, why) then { expect_true(why.index_of("503") >= 0) }
+  }
+}
+
+def test_token_rejected_still_401_errors() {
+  const client = make_client([
+    route_no_auth("/v2/", 401, "unauthorized", [("WWW-Authenticate", challenge_header())]),
+    route_no_auth("/token", 200, token_json(), [("Content-Type", "application/json")]),
+    route_no_auth("/v2/", 401, "unauthorized", [("WWW-Authenticate", challenge_header())])
+  ])
+  case client.probe() {
+    (R.ok, _) then { expect_fail("expected an error") }
+    (R.error, why) then { expect_true(why.index_of("was not accepted") >= 0) }
+  }
+}
+
+def test_preset_token_sent_on_first_probe() {
+  const client = src.registry.Client.new(base, "preset-tok", src.registry.MockTransport.new([
+    route_auth("/v2/", "preset-tok", 200, "ok", [])
+  ]), 5.0)
+  expect_ok_bool(client.probe())
+  const calls = mock_of(client).calls_text()
+  expect_true(calls.index_of("Bearer preset-tok") >= 0)
+}
+
+def test_fetch_manifest_verifies_digest() {
+  const client = make_client([manifest_route()])
+  case client.fetch_manifest("acme/app", "latest") {
+    (R.ok, m) then {
+      expect_equal(manifest_digest(), m.digest)
+      expect_equal("application/vnd.oci.image.manifest.v1+json", m.media_type)
+      expect_equal(manifest_json, m.body)
+    }
+    (R.error, why) then { expect_fail("fetch failed: " + why) }
+  }
+}
+
+def test_fetch_manifest_digest_mismatch_errors() {
+  const client = make_client([route("/v2/acme/app/manifests/", 200, manifest_json, [
+    ("Docker-Content-Digest", "sha256:" + hex_b)
+  ])])
+  case client.fetch_manifest("acme/app", "latest") {
+    (R.ok, _) then { expect_fail("expected a digest mismatch") }
+    (R.error, why) then {
+      expect_true(why.index_of("digest mismatch") >= 0)
+      expect_true(why.index_of("sha256:" + hex_b) >= 0)
+    }
+  }
+}
+
+def test_fetch_manifest_404() {
+  const client = make_client([route("/v2/acme/app/manifests/", 404, "nope", [])])
+  case client.fetch_manifest("acme/app", "nope") {
+    (R.ok, _) then { expect_fail("expected 404") }
+    (R.error, why) then { expect_true(why.index_of("MANIFEST_UNKNOWN") >= 0) }
+  }
+}
+
+def test_fetch_manifest_5xx() {
+  const client = make_client([route("/v2/acme/app/manifests/", 500, "boom", [])])
+  case client.fetch_manifest("acme/app", "latest") {
+    (R.ok, _) then { expect_fail("expected 500") }
+    (R.error, why) then { expect_true(why.index_of("500") >= 0) }
+  }
+}
+
+def test_fetch_manifest_redirect_errors() {
+  const client = make_client([route("/v2/acme/app/manifests/", 307, "", [("Location", "https://cdn.example.com/blob")])])
+  case client.fetch_manifest("acme/app", "latest") {
+    (R.ok, _) then { expect_fail("expected a redirect error") }
+    (R.error, why) then {
+      expect_true(why.index_of("never followed") >= 0)
+      expect_true(why.index_of("cdn.example.com") >= 0)
+    }
+  }
+}
+
+def test_fetch_manifest_401_dances_then_retries() {
+  const client = make_client(dance_routes())
+  case client.fetch_manifest("acme/app", "latest") {
+    (R.ok, m) then { expect_equal(manifest_digest(), m.digest) }
+    (R.error, why) then { expect_fail("fetch after dance failed: " + why) }
+  }
+  const calls = mock_of(client).calls_text()
+  expect_true(calls.index_of("/token") >= 0)
+  expect_true(calls.index_of("[Bearer tok-123]") >= 0)
+}
+
+def test_fetch_by_digest_reference() {
+  const client = make_client([manifest_route()])
+  case client.fetch_manifest("acme/app", manifest_digest()) {
+    (R.ok, m) then { expect_equal(manifest_digest(), m.digest) }
+    (R.error, why) then { expect_fail("fetch by digest failed: " + why) }
+  }
+}
+
+def test_select_platform_matches_exact() {
+  const client = make_client([])
+  const index = index_json()
+  case client.select_platform(index, "linux", "arm64") {
+    (R.ok, digest) then { expect_equal("sha256:" + hex_b, digest) }
+    (R.error, why) then { expect_fail("select failed: " + why) }
+  }
+  case client.select_platform(index, "linux", "amd64") {
+    (R.ok, digest) then { expect_equal("sha256:" + hex_a, digest) }
+    (R.error, why) then { expect_fail("select failed: " + why) }
+  }
+}
+
+def test_select_platform_no_match_lists_available() {
+  const client = make_client([])
+  case client.select_platform(index_json(), "windows", "386") {
+    (R.ok, _) then { expect_fail("expected no match") }
+    (R.error, why) then {
+      expect_true(why.index_of("linux/amd64") >= 0)
+      expect_true(why.index_of("linux/arm64") >= 0)
+    }
+  }
+}
+
+def test_index_json_is_accepted_as_manifest_media_type() {
+  const index_body = index_json()
+  const digest = "sha256:" + sha_hex(index_body)
+  const client = make_client([route("/v2/acme/app/manifests/", 200, index_body, [
+    ("Content-Type", "application/vnd.oci.image.index.v1+json"),
+    ("Docker-Content-Digest", digest)
+  ])])
+  case client.fetch_manifest("acme/app", "latest") {
+    (R.ok, m) then {
+      expect_equal("application/vnd.oci.image.index.v1+json", m.media_type)
+      expect_equal(digest, m.digest)
+    }
+    (R.error, why) then { expect_fail("index fetch failed: " + why) }
+  }
+}
+
+def test_all_calls_stay_on_configured_host() {
+  const client = make_client(dance_routes())
+  expect_ok_bool(client.probe())
+  case client.fetch_manifest("acme/app", "latest") {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("fetch failed: " + why) }
+  }
+  const calls = mock_of(client).calls_text()
+  expect_true(calls.index_of(auth_realm) >= 0)
+  expect_true(calls.index_of("https://evil.example.com") < 0)
+  const lines = calls.split("\n")
+  var i = 0
+  while i < lines.length() {
+    const line = lines[i]
+    if line != "" {
+      expect_true(line.starts_with("GET https://reg.example.com") || line.starts_with("GET https://auth.example.com"))
+    }
+    i = i + 1
+  }
+}
+
+def test_percent_encode() {
+  expect_equal("repository%3Aacme%2Fapp%3Apull", reg.percent_encode("repository:acme/app:pull"))
+  expect_equal("reg.example.com", reg.percent_encode("reg.example.com"))
+  expect_equal("a_b.c-d~e", reg.percent_encode("a_b.c-d~e"))
+}
+
+def test_parse_challenge_fields() {
+  case reg.parse_challenge(challenge_header()) {
+    (R.ok, challenge) then {
+      const (realm, service, scope) = challenge
+      expect_equal(auth_realm, realm)
+      expect_equal("reg.example.com", service)
+      expect_equal("repository:acme/app:pull", scope)
+    }
+    (R.error, why) then { expect_fail("parse failed: " + why) }
+  }
+  case reg.parse_challenge("Basic realm=\"x\"") {
+    (R.ok, _) then { expect_fail("Basic should be unsupported") }
+    (R.error, why) then { expect_true(why.index_of("only Bearer") >= 0) }
+  }
+}
+
+def index_json() String {
+  return (
+    "{\"schemaVersion\":2,"
+    + "\"mediaType\":\"application/vnd.oci.image.index.v1+json\","
+    + "\"manifests\":["
+    + "{\"digest\":\"sha256:" + hex_a + "\","
+    + "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"size\":1,"
+    + "\"platform\":{\"os\":\"linux\",\"architecture\":\"amd64\"}},"
+    + "{\"digest\":\"sha256:" + hex_b + "\","
+    + "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"size\":1,"
+    + "\"platform\":{\"os\":\"linux\",\"architecture\":\"arm64\"}}"
+    + "]}"
+  )
+}

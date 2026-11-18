@@ -79,7 +79,7 @@
 | [x] | T1.7 | Git 元数据读取与镜像缓存 | T1.6、T1.5 | 3h |
 | [x] | T1.8 | 配置、凭据与 XDG 路径 | T1.1 | 2h |
 | [x] | T1.9 | `resolve` 命令串联 | T1.4-T1.8 | 2h |
-| [ ] | T1.10 | Registry 认证与 Manifest 客户端 | T1.5、T1.8 | 3h |
+| [x] | T1.10 | Registry 认证与 Manifest 客户端 | T1.5、T1.8 | 3h |
 | [ ] | T1.11 | Blob 下载器：重试、校验、续传 | T1.10 | 3-4h |
 | [ ] | T1.12 | OCI 镜像布局组装 | T1.10、T1.11 | 2-3h |
 | [ ] | T1.13 | 运行时导入适配 | T1.12 | 3h |
@@ -240,6 +240,8 @@ images:
 **验收**：401 -> 取 token -> 重试成功；404 / 5xx / 超时有明确错误；多架构 Index 能选中目标平台；Manifest 字节与 digest 一致；所有请求只发往配置的 Registry 域名；不自动跟随重定向。
 
 **依赖**：T1.5、T1.8 · **预估**：3h
+
+> **笔记**（2026-11-18，约 2.5h）：完成。`src/registry.emo` 以可注入 `Transport`（真实 HttpTransport + 离线 MockTransport）实现了全部验收点：探测 → 401 → `WWW-Authenticate` Bearer 解析（realm/service/scope，百分号编码）→ 取 token → 验证探测；按 tag/digest 拉 manifest 并常数时间比对 `Docker-Content-Digest`（不匹配时报出两个 digest）；401 舞步后重试一次，且重试**重建 headers**（第一版复用了 dance 前的 header 数组，静默重发了空 token——被 mock 抓住）；index 平台选择，未命中时列出可用平台；3xx 是硬错误并带 Location；mock 断言所有请求只发往 registry 或 auth 域名。媒体类型表在 docs/spec/registry-client.md。踩坑：client 的 token 可变性需要 `Box`（类字段 init 后冻结）；`Json.get` 对缺失键直接抛异常而 Emo 无 catch，所有可选成员走扫描式 `json_member`；反向 `if !x.is(...)` 守卫不触发窄化——只能正向分支包裹；测试签名里的类型路径不能用 const 别名（`reg.Client` 不行，`src.registry.Client` 才行）。
 
 #### T1.11 Blob 下载器：重试、校验、续传
 
