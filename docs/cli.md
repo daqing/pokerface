@@ -28,7 +28,7 @@ Flags are parsed before the first positional argument; the value form
 
 | Flag             | Effect                                                     |
 | ---------------- | ---------------------------------------------------------- |
-| `--config <path>` | Configuration file path (read once T1.8 lands)            |
+| `--config <path>` | Configuration file path (see docs/spec/config.md)          |
 | `--verbose`       | Verbose logging (wired up in T1.16)                       |
 | `--json`          | Machine-readable output where supported (`version` today) |
 | `-h`, `--help`    | Show the help text and exit 0                             |

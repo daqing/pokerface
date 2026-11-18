@@ -1,0 +1,300 @@
+// T1.8 tests for src/settings.emo — run with `emo test`. Env values come
+// from a FakeEnv so tests never mutate the process environment; config
+// fixtures live under TMPDIR with unique per-run names.
+
+const settings = src.settings
+const settings_runner = src.git.RealRunner.new()
+
+def temp_base_dir() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def cfg_file(name String) String {
+  return temp_base_dir() + "pokerface-settings-" + os.getpid().to_string() + "-" + name + ".yaml"
+}
+
+def write_cfg(path String, text String) {
+  case file.write(path, text) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("fixture config write failed: " + why) }
+  }
+}
+
+class FakeEnv {
+  def init(values Map[String, String]) {
+    self.values = values
+  }
+
+  def getenv(name String) (R, String) {
+    if self.values.has(name) {
+      return (R.ok, self.values.get(name))
+    }
+    return (R.error, "os: getenv " + name + ": is not set")
+  }
+}
+
+def test_flag_path_wins_over_env() {
+  const flag_file = cfg_file("flag-wins")
+  const env_file = cfg_file("env-loses")
+  write_cfg(flag_file, flag_file_text())
+  write_cfg(env_file, env_file_text())
+  const env = FakeEnv.new(Map.new(("POKERFACE_CONFIG", env_file)))
+  case settings.load(settings_runner, env, flag_file) {
+    (R.ok, s) then {
+      expect_equal("https://flag.example.com", s.registry_url)
+      expect_equal(flag_file, s.config_path)
+    }
+    (R.error, why) then { expect_fail("load failed: " + why) }
+  }
+}
+
+def test_env_config_path_used_without_flag() {
+  const env_file = cfg_file("env-used")
+  write_cfg(env_file, env_file_text())
+  const env = FakeEnv.new(Map.new(("POKERFACE_CONFIG", env_file)))
+  case settings.load(settings_runner, env, "") {
+    (R.ok, s) then {
+      expect_equal("https://env.example.com", s.registry_url)
+      expect_equal(env_file, s.config_path)
+    }
+    (R.error, why) then { expect_fail("load failed: " + why) }
+  }
+}
+
+def test_flag_missing_file_errors() {
+  const env = FakeEnv.new(Map.new())
+  case settings.load(settings_runner, env, cfg_file("not-there")) {
+    (R.ok, _) then { expect_fail("expected a missing-file error") }
+    (R.error, why) then { expect_true(why.index_of("not found (--config)") >= 0) }
+  }
+}
+
+def test_env_missing_file_errors() {
+  const env = FakeEnv.new(Map.new(("POKERFACE_CONFIG", cfg_file("not-there-either"))))
+  case settings.load(settings_runner, env, "") {
+    (R.ok, _) then { expect_fail("expected a missing-file error") }
+    (R.error, why) then { expect_true(why.index_of("not found (POKERFACE_CONFIG)") >= 0) }
+  }
+}
+
+def test_xdg_path_wins_over_home() {
+  const home = temp_base_dir() + "pokerface-settings-home-" + os.getpid().to_string()
+  const xdg = temp_base_dir() + "pokerface-settings-xdg-" + os.getpid().to_string()
+  case os.mkdir(home) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("fixture mkdir failed: " + why) }
+  }
+  case os.mkdir(home + "/.config") {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("fixture mkdir failed: " + why) }
+  }
+  case os.mkdir(home + "/.config/pokerface") {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("fixture mkdir failed: " + why) }
+  }
+  case os.mkdir(xdg) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("fixture mkdir failed: " + why) }
+  }
+  case os.mkdir(xdg + "/pokerface") {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("fixture mkdir failed: " + why) }
+  }
+  write_cfg(xdg + "/pokerface/config.yaml", xdg_file_text())
+  write_cfg(home + "/.config/pokerface/config.yaml", home_file_text())
+  const env_both = FakeEnv.new(Map.new(("HOME", home), ("XDG_CONFIG_HOME", xdg)))
+  case settings.load(settings_runner, env_both, "") {
+    (R.ok, s) then { expect_equal("https://xdg.example.com", s.registry_url) }
+    (R.error, why) then { expect_fail("load failed: " + why) }
+  }
+  const env_home_only = FakeEnv.new(Map.new(("HOME", home)))
+  case settings.load(settings_runner, env_home_only, "") {
+    (R.ok, s) then { expect_equal("https://home.example.com", s.registry_url) }
+    (R.error, why) then { expect_fail("load failed: " + why) }
+  }
+}
+
+def test_env_overrides_file_values() {
+  const path = cfg_file("env-overrides")
+  write_cfg(path, full_file_text())
+  const env = FakeEnv.new(Map.new(
+    ("POKERFACE_CONFIG", path),
+    ("POKERFACE_REGISTRY_URL", "https://env-override.example.com"),
+    ("POKERFACE_REGISTRY_TOKEN", "env-token"),
+    ("POKERFACE_CACHE_DIR", "/tmp/env-cache")
+  ))
+  case settings.load(settings_runner, env, "") {
+    (R.ok, s) then {
+      expect_equal("https://env-override.example.com", s.registry_url)
+      expect_equal("env-token", s.registry_token)
+      expect_equal("/tmp/env-cache", s.cache_dir)
+    }
+    (R.error, why) then { expect_fail("load failed: " + why) }
+  }
+}
+
+def test_file_values_used_without_env() {
+  const path = cfg_file("file-values")
+  write_cfg(path, full_file_text())
+  const env = FakeEnv.new(Map.new())
+  case settings.load(settings_runner, env, path) {
+    (R.ok, s) then {
+      expect_equal("https://file.example.com", s.registry_url)
+      expect_equal("file-token", s.registry_token)
+      expect_equal("/tmp/file-cache", s.cache_dir)
+    }
+    (R.error, why) then { expect_fail("load failed: " + why) }
+  }
+}
+
+def test_defaults_when_nothing_set() {
+  const env = FakeEnv.new(Map.new())
+  case settings.load(settings_runner, env, "") {
+    (R.ok, s) then {
+      expect_equal("", s.registry_url)
+      expect_equal("", s.registry_token)
+      expect_equal("", s.cache_dir)
+      expect_equal("", s.config_path)
+      expect_equal(0, s.warnings.length())
+    }
+    (R.error, why) then { expect_fail("load failed: " + why) }
+  }
+}
+
+def test_unknown_field_rejected() {
+  const path = cfg_file("unknown-field")
+  write_cfg(path, "bogus: 1\n")
+  const env = FakeEnv.new(Map.new(("POKERFACE_CONFIG", path)))
+  case settings.load(settings_runner, env, "") {
+    (R.ok, _) then { expect_fail("expected an unknown-field error") }
+    (R.error, why) then { expect_true(why.index_of("unknown field") >= 0) }
+  }
+}
+
+def test_invalid_yaml_rejected() {
+  const path = cfg_file("invalid-yaml")
+  write_cfg(path, "registry: [unclosed")
+  const env = FakeEnv.new(Map.new(("POKERFACE_CONFIG", path)))
+  case settings.load(settings_runner, env, "") {
+    (R.ok, _) then { expect_fail("expected an invalid-YAML error") }
+    (R.error, why) then { expect_true(why.index_of("invalid YAML") >= 0) }
+  }
+}
+
+def test_invalid_url_rejected() {
+  const path = cfg_file("invalid-url")
+  write_cfg(path, "registry:\n  url: registry.example.com\n")
+  const env = FakeEnv.new(Map.new(("POKERFACE_CONFIG", path)))
+  case settings.load(settings_runner, env, "") {
+    (R.ok, _) then { expect_fail("expected an invalid-url error") }
+    (R.error, why) then { expect_true(why.index_of("must start with https://") >= 0) }
+  }
+  const env2 = FakeEnv.new(Map.new(("POKERFACE_REGISTRY_URL", "registry.example.com")))
+  case settings.load(settings_runner, env2, "") {
+    (R.ok, _) then { expect_fail("expected an invalid-env-url error") }
+    (R.error, why) then { expect_true(why.index_of("POKERFACE_REGISTRY_URL") >= 0) }
+  }
+}
+
+def test_redact_never_shows_secret() {
+  const secret = "pf_super_secret_123"
+  const masked = settings.redact(secret)
+  expect_true(masked.index_of(secret) < 0)
+  expect_true(masked.index_of("pf_") < 0)
+  expect_true(masked.index_of("19") >= 0)
+  expect_equal("", settings.redact(""))
+}
+
+def test_summary_redacts_token() {
+  const path = cfg_file("summary")
+  write_cfg(path, full_file_text())
+  const env = FakeEnv.new(Map.new(("POKERFACE_CONFIG", path)))
+  case settings.load(settings_runner, env, "") {
+    (R.ok, s) then {
+      const text = settings.summary(s)
+      expect_true(text.index_of("https://file.example.com") >= 0)
+      expect_true(text.index_of("file-token") < 0)
+      expect_true(text.index_of("<redacted:") >= 0)
+    }
+    (R.error, why) then { expect_fail("load failed: " + why) }
+  }
+}
+
+def test_permission_warning() {
+  const path = cfg_file("perms")
+  write_cfg(path, full_file_text())
+  const env = FakeEnv.new(Map.new(("POKERFACE_CONFIG", path)))
+  case settings_runner.run(["chmod", "600", path], 5.0) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("chmod failed: " + why) }
+  }
+  case settings.load(settings_runner, env, "") {
+    (R.ok, s) then { expect_equal(0, s.warnings.length()) }
+    (R.error, why) then { expect_fail("load failed: " + why) }
+  }
+  case settings_runner.run(["chmod", "644", path], 5.0) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("chmod failed: " + why) }
+  }
+  case settings.load(settings_runner, env, "") {
+    (R.ok, s) then {
+      expect_equal(1, s.warnings.length())
+      expect_true(s.warnings[0].index_of("readable by group or others") >= 0)
+    }
+    (R.error, why) then { expect_fail("load failed: " + why) }
+  }
+}
+
+def test_warns_for_mode_digits() {
+  expect_false(settings.warns_for_mode("600"))
+  expect_true(settings.warns_for_mode("644"))
+  expect_true(settings.warns_for_mode("666"))
+  expect_true(settings.warns_for_mode("777"))
+  expect_false(settings.warns_for_mode("700"))
+  expect_false(settings.warns_for_mode("100"))
+}
+
+def test_real_env_source_reads_unset_as_error() {
+  const env = settings.RealEnv.new()
+  case env.getenv("POKERFACE_DEFINITELY_UNSET_FOR_TESTS") {
+    (R.ok, _) then { expect_fail("expected unset to be an error") }
+    (R.error, _) then { expect_true(true) }
+  }
+}
+
+def flag_file_text() String {
+  return "registry:\n  url: https://flag.example.com\n"
+}
+
+def env_file_text() String {
+  return "registry:\n  url: https://env.example.com\n"
+}
+
+def xdg_file_text() String {
+  return "registry:\n  url: https://xdg.example.com\n"
+}
+
+def home_file_text() String {
+  return "registry:\n  url: https://home.example.com\n"
+}
+
+def full_file_text() String {
+  return (
+    "registry:\n"
+    + "  url: https://file.example.com\n"
+    + "  token: file-token\n"
+    + "cache_dir: /tmp/file-cache\n"
+  )
+}

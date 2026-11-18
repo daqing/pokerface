@@ -77,7 +77,7 @@ Exit criteria:
 | [x] | T1.5 | `pokerface.lock.yaml` v0.1 spec and parser | T1.2 | 2h |
 | [x] | T1.6 | Git ref resolution: tag / branch / commit | T1.3 | 2-3h |
 | [x] | T1.7 | Read Git metadata and cache repository mirrors | T1.6, T1.5 | 3h |
-| [ ] | T1.8 | Configuration, credentials, and XDG paths | T1.1 | 2h |
+| [x] | T1.8 | Configuration, credentials, and XDG paths | T1.1 | 2h |
 | [ ] | T1.9 | Wire up the `resolve` command | T1.4-T1.8 | 2h |
 | [ ] | T1.10 | Registry authentication and manifest client | T1.5, T1.8 | 3h |
 | [ ] | T1.11 | Blob downloader: retries, verification, resume | T1.10 | 3-4h |
@@ -216,6 +216,8 @@ images:
 **Acceptance**: CLI flags > environment > config file > defaults; tokens never appear in `--verbose` logs; warn when the config file is group- or world-readable; `POKERFACE_CACHE_DIR` overrides the cache directory.
 
 **Depends on**: T1.1 · **Estimate**: 2h
+
+> **Notes** (2026-11-18, ~2h): Done. `src/settings.emo` resolves the config path (`--config` > `POKERFACE_CONFIG` > XDG > `~/.config`, explicit paths must exist) and applies `POKERFACE_REGISTRY_URL` / `POKERFACE_REGISTRY_TOKEN` / `POKERFACE_CACHE_DIR` overrides over file values. Env access is behind an injectable `EnvSource` (RealEnv/FakeEnv) so tests never mutate the process environment — os.setenv would leak across tests since they share one process. Permission check runs `stat` through the runner (BSD vs GNU picked via `uname`); group/other read bits produce a warning, a failed stat is silent. `redact()` renders `<redacted:<len>>` and `summary()` is the verbose dump — token never escapes. 14 tests; `emo test` 79/79. Gotchas: a class cannot be named `Settings` (module `settings` collision, T1.3's rule again) so it is `AppSettings`; `os.mkdir` does not create parents — fixtures mkdir level by level.
 
 #### T1.9 Wire Up the `resolve` Command
 

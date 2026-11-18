@@ -77,7 +77,7 @@
 | [x] | T1.5 | `pokerface.lock.yaml` v0.1 规范与解析 | T1.2 | 2h |
 | [x] | T1.6 | Git ref 解析：tag / branch / commit | T1.3 | 2-3h |
 | [x] | T1.7 | Git 元数据读取与镜像缓存 | T1.6、T1.5 | 3h |
-| [ ] | T1.8 | 配置、凭据与 XDG 路径 | T1.1 | 2h |
+| [x] | T1.8 | 配置、凭据与 XDG 路径 | T1.1 | 2h |
 | [ ] | T1.9 | `resolve` 命令串联 | T1.4-T1.8 | 2h |
 | [ ] | T1.10 | Registry 认证与 Manifest 客户端 | T1.5、T1.8 | 3h |
 | [ ] | T1.11 | Blob 下载器：重试、校验、续传 | T1.10 | 3-4h |
@@ -216,6 +216,8 @@ images:
 **验收**：CLI 参数 > 环境变量 > 配置文件 > 默认值；token 不出现在 `--verbose` 日志；配置文件权限过宽时给出警告；缓存目录可通过 `POKERFACE_CACHE_DIR` 覆盖。
 
 **依赖**：T1.1 · **预估**：2h
+
+> **笔记**（2026-11-18，约 2h）：完成。`src/settings.emo` 解析配置路径（`--config` > `POKERFACE_CONFIG` > XDG > `~/.config`，显式指定的文件必须存在），再以 `POKERFACE_REGISTRY_URL` / `POKERFACE_REGISTRY_TOKEN` / `POKERFACE_CACHE_DIR` 覆盖文件值。环境读取走可注入的 `EnvSource`（RealEnv/FakeEnv），测试不会污染进程环境——测试共享一个进程，`os.setenv` 会跨测试泄漏。权限检查经 runner 跑 `stat`（用 `uname` 区分 BSD/GNU），group/other 有读位即告警，stat 失败静默不告警。`redact()` 输出 `<redacted:<len>>`，`summary()` 是 verbose 输出形态——token 永不出现。14 个测试；`emo test` 79/79。踩坑：类不能叫 `Settings`（与模块 settings 撞名，T1.3 规则重现），改为 `AppSettings`；`os.mkdir` 不建父目录——fixture 需逐级创建。
 
 #### T1.9 `resolve` 命令串联
 

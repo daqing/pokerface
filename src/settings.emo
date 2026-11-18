@@ -1,0 +1,315 @@
+// T1.8: configuration, credentials, and XDG paths. Precedence: CLI flags >
+// environment > config file > defaults. Config candidates in order:
+// --config > POKERFACE_CONFIG > $XDG_CONFIG_HOME/pokerface/config.yaml >
+// ~/.config/pokerface/config.yaml. POKERFACE_REGISTRY_URL,
+// POKERFACE_REGISTRY_TOKEN, and POKERFACE_CACHE_DIR override file values.
+// Secrets never cross into summaries unredacted. Spec: docs/spec/config.md.
+
+require "os"
+require "file"
+require "yaml"
+
+const config_file_name = "config.yaml"
+
+interface EnvSource {
+  def getenv(name String) (R, String)
+}
+
+class RealEnv {
+  def init() {
+  }
+
+  def getenv(name String) (R, String) {
+    return os.getenv(name)
+  }
+}
+
+class AppSettings {
+  def init(registry_url String, registry_token String, cache_dir String, config_path String, warnings Array[String]) {
+    self.registry_url = registry_url
+    self.registry_token = registry_token
+    self.cache_dir = cache_dir
+    self.config_path = config_path
+    self.warnings = warnings
+  }
+}
+
+def cfg_error(path String, message String) String {
+  return "config: " + path + ": " + message
+}
+
+def load(runner src.git.CommandRunner, env EnvSource, config_flag String) (R, AppSettings) {
+  case resolve_config_path(env, config_flag) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, path) then {
+      var base = AppSettings.new("", "", "", "", [])
+      if path != "" {
+        case file.read(path) {
+          (R.error, why) then { return (R.error, cfg_error(path, "cannot read: " + why)) }
+          (R.ok, text) then {
+            case parse_config(text, path) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, parsed) then { base = parsed }
+            }
+          }
+        }
+        var stat_why = ""
+        case mode_of(runner, path) {
+          (R.ok, mode) then {
+            if warns_for_mode(mode) {
+              base = with_warning(base, "config file " + path + " is readable by group or others (mode " + mode + ") — chmod 600 recommended")
+            }
+          }
+          (R.error, why) then { stat_why = why }
+        }
+      }
+      return apply_env(base, env)
+    }
+  }
+}
+
+def resolve_config_path(env EnvSource, config_flag String) (R, String) {
+  if config_flag != "" {
+    case file.read(config_flag) {
+      (R.ok, _) then { return (R.ok, config_flag) }
+      (R.error, why) then { return (R.error, cfg_error(config_flag, "not found (--config): " + why)) }
+    }
+  }
+  var env_path = ""
+  case env.getenv("POKERFACE_CONFIG") {
+    (R.ok, v) then { env_path = v }
+    (R.error, _) then { env_path = "" }
+  }
+  if env_path != "" {
+    case file.read(env_path) {
+      (R.ok, _) then { return (R.ok, env_path) }
+      (R.error, why) then { return (R.error, cfg_error(env_path, "not found (POKERFACE_CONFIG): " + why)) }
+    }
+  }
+  var home = ""
+  case env.getenv("HOME") {
+    (R.ok, v) then { home = v }
+    (R.error, _) then { home = "" }
+  }
+  var xdg = ""
+  case env.getenv("XDG_CONFIG_HOME") {
+    (R.ok, v) then { xdg = v }
+    (R.error, _) then { xdg = "" }
+  }
+  if xdg != "" {
+    const (found, found_path) = try_candidate(xdg + "/pokerface/" + config_file_name)
+    if found {
+      return (R.ok, found_path)
+    }
+  }
+  if home != "" {
+    const (found, found_path) = try_candidate(home + "/.config/pokerface/" + config_file_name)
+    if found {
+      return (R.ok, found_path)
+    }
+  }
+  return (R.ok, "")
+}
+
+def try_candidate(path String) (Bool, String) {
+  case file.read(path) {
+    (R.ok, _) then { return (true, path) }
+    (R.error, _) then { return (false, "") }
+  }
+}
+
+def parse_config(text String, path String) (R, AppSettings) {
+  case yaml.decode(text) {
+    (R.error, why) then { return (R.error, cfg_error(path, "invalid YAML — " + why)) }
+    (R.ok, doc) then { return from_yaml(doc, path) }
+  }
+}
+
+def from_yaml(doc yaml.Yaml, path String) (R, AppSettings) {
+  if doc.is(yaml.YamlObject) {
+    var registry_url = ""
+    var registry_token = ""
+    var cache_dir = ""
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      case key {
+        "registry" then {
+          case parse_registry(value, path) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, pair) then {
+              const (url, token) = pair
+              registry_url = url
+              registry_token = token
+            }
+          }
+        }
+        "cache_dir" then {
+          if value.is(yaml.YamlString) {
+            cache_dir = value.as_string()
+          } else {
+            return (R.error, cfg_error(path, "cache_dir: expected a string, got " + src.config.kind_word(value.kind())))
+          }
+          if cache_dir == "" {
+            return (R.error, cfg_error(path, "cache_dir: must not be empty"))
+          }
+        }
+        _ then {
+          return (R.error, cfg_error(path, key + ": unknown field (known: registry, cache_dir)"))
+        }
+      }
+      i = i + 1
+    }
+    return (R.ok, AppSettings.new(registry_url, registry_token, cache_dir, path, []))
+  }
+  return (R.error, cfg_error(path, "expected a mapping at the top level, got " + src.config.kind_word(doc.kind())))
+}
+
+def parse_registry(value yaml.Yaml, path String) (R, (String, String)) {
+  if value.is(yaml.YamlObject) {
+    var url = ""
+    var token = ""
+    const entries = value.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, v) = entries[i]
+      case key {
+        "url" then {
+          if v.is(yaml.YamlString) {
+            url = v.as_string()
+          } else {
+            return (R.error, cfg_error(path, "registry.url: expected a string, got " + src.config.kind_word(v.kind())))
+          }
+          if url == "" {
+            return (R.error, cfg_error(path, "registry.url: must not be empty"))
+          }
+          if !url.starts_with("https://") && !url.starts_with("http://") {
+            return (R.error, cfg_error(path, "registry.url: must start with https:// or http://"))
+          }
+        }
+        "token" then {
+          if v.is(yaml.YamlString) {
+            token = v.as_string()
+          } else {
+            return (R.error, cfg_error(path, "registry.token: expected a string, got " + src.config.kind_word(v.kind())))
+          }
+          if token == "" {
+            return (R.error, cfg_error(path, "registry.token: must not be empty"))
+          }
+        }
+        _ then {
+          return (R.error, cfg_error(path, "registry." + key + ": unknown field (known: url, token)"))
+        }
+      }
+      i = i + 1
+    }
+    return (R.ok, (url, token))
+  }
+  return (R.error, cfg_error(path, "registry: expected a mapping, got " + src.config.kind_word(value.kind())))
+}
+
+def apply_env(s AppSettings, env EnvSource) (R, AppSettings) {
+  var url = s.registry_url
+  var token = s.registry_token
+  var cache = s.cache_dir
+  var ignored = ""
+  case env.getenv("POKERFACE_REGISTRY_URL") {
+    (R.ok, v) then {
+      if v != "" {
+        if !v.starts_with("https://") && !v.starts_with("http://") {
+          return (R.error, "config: POKERFACE_REGISTRY_URL: must start with https:// or http://")
+        }
+        url = v
+      }
+    }
+    (R.error, why) then { ignored = why }
+  }
+  case env.getenv("POKERFACE_REGISTRY_TOKEN") {
+    (R.ok, v) then {
+      if v != "" {
+        token = v
+      }
+    }
+    (R.error, why) then { ignored = why }
+  }
+  case env.getenv("POKERFACE_CACHE_DIR") {
+    (R.ok, v) then {
+      if v != "" {
+        cache = v
+      }
+    }
+    (R.error, why) then { ignored = why }
+  }
+  return (R.ok, AppSettings.new(url, token, cache, s.config_path, s.warnings))
+}
+
+def with_warning(s AppSettings, warning String) AppSettings {
+  return AppSettings.new(s.registry_url, s.registry_token, s.cache_dir, s.config_path, s.warnings.append(warning))
+}
+
+// BSD stat on macOS, GNU stat on Linux; an unreadable mode means no warning.
+def mode_of(runner src.git.CommandRunner, path String) (R, String) {
+  case runner.run(["uname", "-s"], 5.0) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, platform) then {
+      var argv = ["stat", "-c", "%a", path]
+      if platform.trim().starts_with("Darwin") {
+        argv = ["stat", "-f", "%Lp", path]
+      }
+      case runner.run(argv, 5.0) {
+        (R.ok, out) then { return (R.ok, out.trim()) }
+        (R.error, why) then { return (R.error, why) }
+      }
+    }
+  }
+}
+
+// The last three octal digits are group and other permissions; the read bit
+// is 4.
+def warns_for_mode(mode String) Bool {
+  if mode.length() < 3 {
+    return false
+  }
+  return digit_has_read(mode.substring(mode.length() - 2, 1)) || digit_has_read(mode.substring(mode.length() - 1, 1))
+}
+
+def digit_has_read(d String) Bool {
+  return d == "4" || d == "5" || d == "6" || d == "7"
+}
+
+// The one logging shape for secrets: never echo the value, only its length.
+def redact(secret String) String {
+  if secret == "" {
+    return ""
+  }
+  return "<redacted:" + secret.length().to_string() + ">"
+}
+
+// The --verbose settings dump: registry_token is redacted here and nowhere
+// prints the secret.
+def summary(s AppSettings) String {
+  var url = "(unset)"
+  if s.registry_url != "" {
+    url = s.registry_url
+  }
+  var token = "(unset)"
+  if s.registry_token != "" {
+    token = redact(s.registry_token)
+  }
+  var cache = "(unset)"
+  if s.cache_dir != "" {
+    cache = s.cache_dir
+  }
+  var config = "(none)"
+  if s.config_path != "" {
+    config = s.config_path
+  }
+  var out = "settings: config=" + config + " registry_url=" + url + " registry_token=" + token + " cache_dir=" + cache
+  var i = 0
+  while i < s.warnings.length() {
+    out = out + "\nwarning: " + s.warnings[i]
+    i = i + 1
+  }
+  return out
+}
