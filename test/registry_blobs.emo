@@ -372,7 +372,19 @@ class BlobFakeUploads {
     return (R.ok, registry.uploads.absent_session())
   }
 
+  def append(id String, body String, start Int64, ranged Bool) (R, Int64) {
+    return (R.error, "fake: append")
+  }
+
   def complete(id String, digest String, size Int64) (R, Bool) {
     return (R.ok, true)
+  }
+
+  def cancel(id String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def part_path(id String) (R, String) {
+    return (R.ok, "/tmp/fake-part")
   }
 }

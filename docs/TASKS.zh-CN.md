@@ -356,7 +356,7 @@ images:
 | [x] | T2.8 | Manifest GET / HEAD 与 tag / digest 解析 | T2.2、T2.3、T2.7 | 3h |
 | [x] | T2.9 | Blob GET 与 307 预签名重定向 | T2.4、T2.6、T2.8 | 2-3h |
 | [x] | T2.10 | Blob 上传：POST / PUT | T2.4、T2.7 | 3h |
-| [ ] | T2.11 | 分块上传与断点续传：PATCH / GET / DELETE | T2.10 | 3h |
+| [x] | T2.11 | 分块上传与断点续传：PATCH / GET / DELETE | T2.10 | 3h |
 | [ ] | T2.12 | Manifest PUT 与 tag 更新 | T2.3、T2.10、T2.11 | 2-3h |
 | [ ] | T2.13 | 解析 / 元数据 API | T2.8、T2.12 | 2h |
 | [ ] | T2.14 | 认证与 Token 服务 | T2.7 | 3-4h |
@@ -505,6 +505,8 @@ images:
 **验收**：多段 PATCH 后 PUT 成功；中途 GET 返回正确 `Range`；DELETE 后会话不可用；并发写同一会话被拒绝；异常中断的会话可过期清理。
 
 **依赖**：T2.10 · **预估**：3h
+
+> **备注**（2026-11-19，约 4h，含下述编译器排查）：已完成。`registry/uploads.emo` 补齐 OCI 分块协议：`PATCH` 追加分块，`Content-Range` 的 start 必须等于会话记录的偏移——乱序返回 416 `BLOB_UPLOAD_INVALID`，end 与请求体长度不符或格式非法（拒绝 `bytes=…` 前缀，规范钉死 `^[0-9]+-[0-9]+$`）返回 400；不带 Content-Range 的 PATCH 按流式盲追加（skopeo 的形态）；`GET` 返回 204 带 `Location` + `Range: 0-<最后字节>`（零字节时省略，`0-0` 会被解读为已收 1 字节）；`DELETE` 返回 204，此后对该会话的一切操作都是 404；收尾的 `PUT` 可按同样的偏移规则携带最后一块。分块数据落在 `<data_dir>/uploads/<id>.part`（`os.open_append`），migration 2 新增 `uploads.offset_bytes` 作为权威 CAS 参照；每次追加都在 `BEGIN IMMEDIATE` 内，并发写同一偏移的败者拿 416（PUT 收尾——`store.put_file`、blob 关联、会话完成——占用同一窗口：v0.1 有意让写锁全局化）。PUT 时 digest 不匹配会话与数据原样保留；每次 `start` 内的过期清扫现在也删掉被清扫会话的 part 文件。接口扩展（`append`/`cancel`/`part_path`，`UploadSession` 增加 `offset`），T2.10 的三个 fake 与 Service 构造同步更新。**最重要的发现：c target 拒绝裸方法调用。** 类体内的 `case write_part(id, body)`——不带 `self.` 前缀——能过检查器和解释器，但 IR 会降级成 `Type_ref`，c 代码生成器以 `the c target does not support this expression form (Type_ref)` 拒绝，并拖垮整个包的构建。定位方式是把 registry 树复制到干净目录做二分（一个包被污染后所有入口都失败，单文件探针必须在纯净树上做）；修法是机械的——类方法一律经 `self.` 调用——记录在此，因为检查器应当在读取处拒绝（E5016 式）而不是让代码生成崩掉。测试：`test/registry_uploads.emo` 新增 27 例（流式/带范围 PATCH、416、400、GET/DELETE 状态机、store/lookup/cancel 失败、真实 LocalStore 的 PATCH+PATCH+PUT、PUT 携带末块、skopeo 形态、digest 不匹配保留会话、空 blob、Content-Range 解析）+ db_selftest 新增 14 项（偏移推进与回读、part 文件按序持有分块、取消、带文件清理的过期清扫）；`emo test` 403/403，db selftest 103/103。已用 curl 实测（Content-Range 分块、GET 续传、DELETE、416、单请求 POST），并用真实 `skopeo copy oci:… docker://127.0.0.1:…` 推送（流式 PATCH 形态）。后续：PUT 期间的会话级互斥替代全局写锁、可配置 TTL、硬崩溃留下的孤儿 part 文件。
 
 #### T2.12 Manifest PUT 与 tag 更新
 

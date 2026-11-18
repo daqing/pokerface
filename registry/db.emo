@@ -67,6 +67,11 @@ def migrations() Array[Migration] {
         + "expires_at INTEGER NOT NULL)",
       "CREATE INDEX IF NOT EXISTS idx_tags_digest ON tags (repository_id, digest)",
       "CREATE INDEX IF NOT EXISTS idx_uploads_expiry ON uploads (state, expires_at)"
+    ]),
+    // T2.11: chunked uploads track how many bytes a session already holds.
+    // Sessions created before this migration answer 0.
+    Migration.new(2, "upload chunk offsets", [
+      "ALTER TABLE uploads ADD COLUMN offset_bytes INTEGER NOT NULL DEFAULT 0"
     ])
   ]
 }
@@ -578,6 +583,19 @@ class Database {
     return state
   }
 
+  // The session's accumulated chunk size (migration 2's column; 0 for
+  // sessions that predate it or have received nothing).
+  def upload_offset(id String) Int64 {
+    const stmt = self.handle.prepare("SELECT offset_bytes FROM uploads WHERE id = ?1")
+    stmt.bind_text(1, id)
+    var offset = 0
+    if stmt.step() {
+      offset = stmt.column_int(0)
+    }
+    stmt.finalize()
+    return offset
+  }
+
   def upload_repository(id String) Int64 {
     const stmt = self.handle.prepare("SELECT repository_id FROM uploads WHERE id = ?1")
     stmt.bind_text(1, id)
@@ -628,7 +646,8 @@ class Database {
 
   // The T2.10 session view: the state plus the repository's NAME ("" / "" for
   // an unknown id). The join turns the stored repository_id into the name the
-  // upload routes compare against the request path.
+  // upload routes compare against the request path. The accumulated chunk
+  // size rides the separate upload_offset.
   def upload_info(id String) (String, String) {
     const stmt = self.handle.prepare(
       "SELECT u.state, r.name FROM uploads AS u "
@@ -656,5 +675,53 @@ class Database {
     stmt.step()
     stmt.finalize()
     return self.handle.changes() > 0
+  }
+
+  // Records a session's accumulated chunk size (T2.11). The pending guard
+  // keeps a cancelled or completed session from growing again.
+  def set_upload_offset(id String, offset Int64) Bool {
+    const stmt = self.handle.prepare(
+      "UPDATE uploads SET offset_bytes = ?1 WHERE id = ?2 AND state = ?3")
+    stmt.bind_int(1, offset)
+    stmt.bind_text(2, id)
+    stmt.bind_text(3, upload_pending)
+    stmt.step()
+    stmt.finalize()
+    return self.handle.changes() > 0
+  }
+
+  // Cancels a session only while it is still pending — a DELETE racing a
+  // completing PUT loses this check.
+  def cancel_pending_upload(id String) Bool {
+    const stmt = self.handle.prepare(
+      "UPDATE uploads SET state = ?1 WHERE id = ?2 AND state = ?3")
+    stmt.bind_text(1, upload_cancelled)
+    stmt.bind_text(2, id)
+    stmt.bind_text(3, upload_pending)
+    stmt.step()
+    stmt.finalize()
+    return self.handle.changes() > 0
+  }
+
+  // Drops pending sessions whose deadline passed and answers the ids that
+  // went, so the caller can clean their part files. Completed and cancelled
+  // rows stay for the audit trail.
+  def expire_upload_ids(now Int64) Array[String] {
+    const select = self.handle.prepare(
+      "SELECT id FROM uploads WHERE state = ?1 AND expires_at <= ?2")
+    select.bind_text(1, upload_pending)
+    select.bind_int(2, now)
+    var ids = []
+    while select.step() {
+      ids = ids.append(select.column_text(0))
+    }
+    select.finalize()
+    const delete = self.handle.prepare(
+      "DELETE FROM uploads WHERE state = ?1 AND expires_at <= ?2")
+    delete.bind_text(1, upload_pending)
+    delete.bind_int(2, now)
+    delete.step()
+    delete.finalize()
+    return ids
   }
 }

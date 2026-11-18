@@ -64,6 +64,16 @@ def is_not_found(reason String) Bool {
   return reason.starts_with(not_found_prefix)
 }
 
+// Both backends word their put/put_file failures the same way ("... digest
+// mismatch — the body hashes to ..."), so the upload routes can map a
+// client-data error to 400 DIGEST_INVALID and everything else to 500 without
+// each backend exposing a typed error.
+const mismatch_marker = "digest mismatch"
+
+def is_digest_mismatch(reason String) Bool {
+  return reason.index_of(mismatch_marker) >= 0
+}
+
 def not_found(digest String) String {
   return not_found_prefix + digest
 }

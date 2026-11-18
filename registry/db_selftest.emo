@@ -10,6 +10,7 @@
 // two connections side by side. Exit 0 when every check passes.
 
 require "os"
+require "file"
 require "crypto"
 
 class Report {
@@ -114,8 +115,8 @@ def main() Int64 {
 }
 
 def check_migrations(report Report, db registry.db.Database) {
-  report.number(db.schema_version(), 1, "fresh database records schema version 1")
-  report.number(db.applied_versions().length(), 1, "a fresh database has one migration row")
+  report.number(db.schema_version(), 2, "fresh database records schema version 2")
+  report.number(db.applied_versions().length(), 2, "a fresh database has two migration rows")
   report.check(db.ping(), "ping answers on a fresh database")
   report.text(db.pragma_text("journal_mode"), "wal", "journal mode is WAL")
   report.number(db.pragma_int("busy_timeout"), 5000, "busy timeout is 5000 ms")
@@ -240,10 +241,13 @@ def check_blob_links(report Report, db registry.db.Database, path String) {
   }
 }
 
-// The T2.10 upload-session wrapper: start, lookup, complete (with the blob
-// link), and the expiry sweep that rides along with every start.
+// The T2.10/T2.11 upload-session wrapper: start, chunked appends with offset
+// bookkeeping and real part files, completion (with the blob link and the
+// part-file cleanup), cancellation, and the expiry sweep that rides along
+// with every start.
 def check_upload_sessions(report Report, db registry.db.Database, path String) {
-  const sessions = registry.uploads.DbUploadSessions.new(path)
+  const dir = path + "-uploads"
+  const sessions = registry.uploads.DbUploadSessions.new(path, dir)
   var first = ""
   case sessions.start("uploads/check") {
     (R.ok, id) then {
@@ -265,6 +269,7 @@ def check_upload_sessions(report Report, db registry.db.Database, path String) {
     (R.ok, session) then {
       report.text(session.state, "pending", "a new session is pending")
       report.text(session.repository, "uploads/check", "the session names its repository")
+      report.number(session.offset, 0, "a new session holds no bytes")
     }
     (R.error, why) then { report.check(false, "session lookup failed: " + why) }
   }
@@ -275,7 +280,36 @@ def check_upload_sessions(report Report, db registry.db.Database, path String) {
     }
     (R.error, why) then { report.check(false, "missing-session lookup failed: " + why) }
   }
-  case sessions.complete(first, blob_digest, 1234) {
+  // Chunked appends: offsets advance, the part file holds the bytes in order,
+  // and an out-of-order chunk is rejected with the offset it contradicts.
+  case sessions.append(first, "abc", 0, true) {
+    (R.ok, offset) then { report.number(offset, 3, "the first chunk advances the offset to 3") }
+    (R.error, why) then { report.check(false, "first append failed: " + why) }
+  }
+  case sessions.append(first, "abc", 0, true) {
+    (R.ok, _) then { report.check(false, "an out-of-order append was accepted") }
+    (R.error, why) then {
+      report.check(why.starts_with("uploads: offset mismatch:"), "an out-of-order append names the offset mismatch")
+    }
+  }
+  case sessions.append(first, "de", 3, true) {
+    (R.ok, offset) then { report.number(offset, 5, "the second chunk advances the offset to 5") }
+    (R.error, why) then { report.check(false, "second append failed: " + why) }
+  }
+  case sessions.lookup(first) {
+    (R.ok, session) then { report.number(session.offset, 5, "the session reports five received bytes") }
+    (R.error, why) then { report.check(false, "offset lookup failed: " + why) }
+  }
+  case sessions.part_path(first) {
+    (R.ok, part) then {
+      case file.read(part) {
+        (R.error, why) then { report.check(false, "part file read failed: " + why) }
+        (R.ok, body) then { report.text(body, "abcde", "the part file holds the chunks in order") }
+      }
+    }
+    (R.error, why) then { report.check(false, "part path failed: " + why) }
+  }
+  case sessions.complete(first, blob_digest, 5) {
     (R.ok, won) then { report.check(won, "completing a pending session wins") }
     (R.error, why) then { report.check(false, "session completion failed: " + why) }
   }
@@ -284,19 +318,80 @@ def check_upload_sessions(report Report, db registry.db.Database, path String) {
     (R.error, why) then { report.check(false, "completed lookup failed: " + why) }
   }
   const repo = db.repository_id("uploads/check")
-  report.number(db.blob_size(repo, blob_digest), 1234, "completion linked the blob")
-  case sessions.complete(first, blob_digest, 1234) {
+  report.number(db.blob_size(repo, blob_digest), 5, "completion linked the blob")
+  case sessions.part_path(first) {
+    (R.ok, part) then {
+      case file.read(part) {
+        (R.error, _) then { report.check(true, "completion removed the part file") }
+        (R.ok, _) then { report.check(false, "completion left the part file behind") }
+      }
+    }
+    (R.error, why) then { report.check(false, "completed part path failed: " + why) }
+  }
+  case sessions.append(first, "more", 5, true) {
+    (R.ok, _) then { report.check(false, "an append to a completed session was accepted") }
+    (R.error, why) then {
+      report.check(why.starts_with("uploads: not pending:"), "an append to a completed session names the state")
+    }
+  }
+  case sessions.complete(first, blob_digest, 5) {
     (R.ok, won) then { report.check(!won, "completing a completed session loses the race") }
     (R.error, why) then { report.check(false, "second completion failed: " + why) }
   }
-  case sessions.complete("missing-session", blob_digest, 1234) {
+  case sessions.complete("missing-session", blob_digest, 5) {
     (R.ok, won) then { report.check(!won, "completing an unknown session answers false") }
     (R.error, why) then { report.check(false, "unknown-session completion failed: " + why) }
   }
-  // The expiry sweep inside start: a stale pending row goes away.
-  db.create_upload("stale-upload", repo, registry.db.now_seconds() - 1)
+  // Cancellation: the part file goes away and the session is unusable.
+  var third = ""
   case sessions.start("uploads/check") {
-    (R.ok, _) then { report.text(db.upload_state("stale-upload"), "", "start swept the expired session") }
+    (R.ok, id) then {
+      third = id
+      const (_, _) = sessions.append(third, "xy", 0, true)
+      case sessions.cancel(third) {
+        (R.ok, ok) then { report.check(ok, "cancelling a pending session works") }
+        (R.error, why) then { report.check(false, "cancel failed: " + why) }
+      }
+      case sessions.lookup(third) {
+        (R.ok, session) then { report.text(session.state, "cancelled", "the session is cancelled") }
+        (R.error, why) then { report.check(false, "cancelled lookup failed: " + why) }
+      }
+      case sessions.cancel(third) {
+        (R.ok, ok) then { report.check(!ok, "cancelling twice answers false") }
+        (R.error, why) then { report.check(false, "second cancel failed: " + why) }
+      }
+      case sessions.append(third, "z", 2, true) {
+        (R.ok, _) then { report.check(false, "an append to a cancelled session was accepted") }
+        (R.error, why) then {
+          report.check(why.starts_with("uploads: not pending:"), "an append to a cancelled session names the state")
+        }
+      }
+      case sessions.part_path(third) {
+        (R.ok, part) then {
+          case file.read(part) {
+            (R.error, _) then { report.check(true, "cancellation removed the part file") }
+            (R.ok, _) then { report.check(false, "cancellation left the part file behind") }
+          }
+        }
+        (R.error, why) then { report.check(false, "cancelled part path failed: " + why) }
+      }
+    }
+    (R.error, why) then { report.check(false, "third session start failed: " + why) }
+  }
+  // The expiry sweep inside start: a stale pending row and its part file go.
+  db.create_upload("stale-upload", repo, registry.db.now_seconds() - 1)
+  case file.write(dir + "/stale-upload" + ".part", "stale bytes") {
+    (R.error, why) then { report.check(false, "stale part write failed: " + why) }
+    (R.ok, _) then { }
+  }
+  case sessions.start("uploads/check") {
+    (R.ok, _) then {
+      report.text(db.upload_state("stale-upload"), "", "start swept the expired session")
+      case file.read(dir + "/stale-upload" + ".part") {
+        (R.error, _) then { report.check(true, "start swept the expired part file") }
+        (R.ok, _) then { report.check(false, "start left the expired part file behind") }
+      }
+    }
     (R.error, why) then { report.check(false, "sweeping start failed: " + why) }
   }
   report.check(db.delete_repository(repo), "the uploads/check repository cleans up")
@@ -331,8 +426,8 @@ def check_cascades(report Report, db registry.db.Database) {
 }
 
 def check_restart(report Report, db registry.db.Database) {
-  report.number(db.schema_version(), 1, "reopening keeps schema version 1")
-  report.number(db.applied_versions().length(), 1, "reopening does not re-run the migration")
+  report.number(db.schema_version(), 2, "reopening keeps schema version 2")
+  report.number(db.applied_versions().length(), 2, "reopening does not re-run the migrations")
   report.check(db.ping(), "the reopened database answers")
   report.number(db.repository_id("acme/app"), 0, "data stays deleted across a restart")
   report.check(db.ensure_repository("acme/app") > 0, "the reopened database accepts writes")

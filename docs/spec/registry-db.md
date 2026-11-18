@@ -38,8 +38,15 @@ blobs(repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCA
       PRIMARY KEY (repository_id, digest))
 uploads(id TEXT PRIMARY KEY, repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
         state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'cancelled')),
-        created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)
+        created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+        offset_bytes INTEGER NOT NULL DEFAULT 0)
 ```
+
+Migration 2 (T2.11) added `uploads.offset_bytes` — the authoritative count
+of chunk bytes a session holds — as an `ALTER TABLE`; sessions created
+before it answer 0. The migration list is append-only: a released migration
+is never edited, and a deployed database applies only the versions it is
+missing.
 
 Indexes: `idx_tags_digest` (tag → manifest lookups) and `idx_uploads_expiry`
 (the expiry sweep).

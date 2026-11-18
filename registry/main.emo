@@ -106,7 +106,7 @@ def serve(config registry.config.RegistryConfig, blob_health registry.blobstore.
       const db_health = registry.db.Health.new(config.db_path)
       const manifests = registry.manifests.DbManifests.new(config.db_path)
       const blob_links = registry.blobs.DbBlobLinks.new(config.db_path)
-      const uploads = registry.uploads.DbUploadSessions.new(config.db_path)
+      const uploads = registry.uploads.DbUploadSessions.new(config.db_path, config.data_dir + "/uploads")
       const service = registry.router.Service.new(config, db_health, blob_health, blob_store, blob_links, manifests, uploads)
       const handler = -> (req httpd.Request) {
         return registry.router.handle(req, service)

@@ -1,23 +1,34 @@
-// T2.10: the minimal OCI blob upload flow. `POST /v2/<name>/blobs/uploads/`
+// T2.10/T2.11: the OCI blob upload flow. `POST /v2/<name>/blobs/uploads/`
 // opens a session (202, Location + Docker-Upload-UUID); `PUT .../uploads/<id>`
-// with a `?digest=` query uploads the whole body, verifies the digest, stores
-// the bytes, links the blob into the repository, and completes the session
-// (201, Location + Docker-Content-Digest). A POST that already carries a
-// `?digest=` is the spec's single-request monolithic upload: session, bytes,
-// and completion in one request.
+// with a `?digest=` query closes it — appending the optional final chunk,
+// verifying the digest over everything received, storing the bytes, linking
+// the blob into the repository, and completing the session (201,
+// Location + Docker-Content-Digest). A POST that already carries a `?digest=`
+// is the spec's single-request monolithic upload: session, bytes, and
+// completion in one request.
 //
-// The body is hashed before anything is stored: a mismatch answers 400
-// DIGEST_INVALID and touches neither the blob store nor the session, so
-// nothing partial survives a failed upload. The blob store keeps bytes under
-// their digest, which makes re-uploads free; the `blobs` row is the
-// repository's link and `INSERT OR IGNORE` keeps it single. Completing marks
-// the session completed under a `state = 'pending'` guard, so a PUT that
-// races a twin loses the transition and answers 404.
+// T2.11 completes the chunked protocol: `PATCH` appends a chunk (verified
+// against the session's offset — an out-of-order chunk is 416, per the
+// distribution spec), `GET` reports the progress (204 + `Range: 0-<last>`),
+// and `DELETE` cancels (204; the session is unusable afterwards). The final
+// chunk may ride the closing PUT with its own Content-Range.
 //
-// Housekeeping rides along with session creation: every `start` first deletes
-// pending sessions whose deadline passed (an indexed, cheap sweep), so
-// abandoned uploads cannot accumulate. The TTL is a module constant for v0.1;
-// a config knob is a follow-up.
+// Chunk data accumulates in `<uploads_dir>/<id>.part` (os.open_append), and
+// the database holds the authoritative offset (`uploads.offset_bytes`,
+// migration 2). Every append runs inside BEGIN IMMEDIATE: writers serialize,
+// and the offset a PATCH claims (its Content-Range start) must equal the
+// recorded one — that CAS is how concurrent writes to one session are
+// rejected. PUT finalizes inside the same window: store.put_file streams the
+// part file into the blob store (both backends verify the digest and answer
+// the recognizable "digest mismatch" failure), the blob link and completion
+// commit atomically, and the part file is removed after the commit. The
+// registry-wide write lock is held for that copy — a deliberate v0.1
+// tradeoff; per-session exclusion without it is future work.
+//
+// Housekeeping rides along with session creation: every `start` first
+// deletes pending sessions whose deadline passed and removes their part
+// files, so abandoned uploads cannot accumulate. The TTL is a module
+// constant for v0.1; a config knob is a follow-up.
 //
 // Sessions are an interface (UploadSessions) like the manifest and blob-link
 // stores, so the route runs in the interpreter against a fake;
@@ -38,52 +49,102 @@ const route_bare = "/blobs/uploads"
 const session_ttl_seconds = 86400
 const name_max_length = 255
 const state_pending = "pending"
+const part_suffix = ".part"
+// Stable prefixes the handler classifies: not-pending and cancelled sessions
+// answer 404, an offset disagreement answers 416, anything else is 500.
+const not_pending_prefix = "uploads: not pending: "
+const offset_mismatch_prefix = "uploads: offset mismatch: "
 
 class UploadSession {
-  def init(state String, repository String) {
+  def init(state String, repository String, offset Int64) {
     self.state = state
     self.repository = repository
+    self.offset = offset
   }
 }
 
 def absent_session() UploadSession {
-  return UploadSession.new("", "")
+  return UploadSession.new("", "", 0)
 }
 
 interface UploadSessions {
   def start(repository String) (R, String)
   def lookup(id String) (R, UploadSession)
+  def append(id String, body String, start Int64, ranged Bool) (R, Int64)
   def complete(id String, digest String, size Int64) (R, Bool)
+  def cancel(id String) (R, Bool)
+  def part_path(id String) (R, String)
 }
 
 class DbUploadSessions {
-  def init(db_path String) {
+  def init(db_path String, uploads_dir String) {
     self.db_path = db_path
+    self.uploads_dir = uploads_dir
   }
 
-  // Expires stale sessions, creates the repository row when new, and records
-  // a pending session — one transaction, one connection.
+  // Expires stale sessions (and their part files), creates the repository row
+  // when new, and records a pending session — one transaction for the
+  // database; part-file cleanup follows the commit, files not being
+  // transactional.
   def start(repository String) (R, String) {
     const db = registry.db.connect(self.db_path)
     db.begin()
-    db.expire_uploads(registry.db.now_seconds())
+    const swept = db.expire_upload_ids(registry.db.now_seconds())
     const id = new_upload_id()
     db.create_upload(id, db.ensure_repository(repository), registry.db.now_seconds() + session_ttl_seconds)
     db.commit()
     db.close()
+    self.remove_parts(swept)
     return (R.ok, id)
   }
 
   def lookup(id String) (R, registry.uploads.UploadSession) {
     const db = registry.db.connect(self.db_path)
     const info = db.upload_info(id)
+    const offset = db.upload_offset(id)
     db.close()
     const (state, repository) = info
-    return (R.ok, UploadSession.new(state, repository))
+    return (R.ok, UploadSession.new(state, repository, offset))
   }
 
-  // Links the blob and completes the session atomically. False means the
-  // session was not pending any more — the caller answers 404.
+  // Appends a chunk under the write lock: the session must be pending and —
+  // for a ranged chunk — its recorded offset must equal the chunk's start.
+  // The offset update is the CAS concurrent writers race for.
+  def append(id String, body String, start Int64, ranged Bool) (R, Int64) {
+    const db = registry.db.connect(self.db_path)
+    db.begin()
+    const state = db.upload_state(id)
+    if state != state_pending {
+      db.rollback()
+      db.close()
+      return (R.error, not_pending_prefix + id)
+    }
+    const offset = db.upload_offset(id)
+    if ranged && start != offset {
+      db.rollback()
+      db.close()
+      return (R.error, offset_mismatch_prefix + "session holds " + offset.to_string()
+        + " bytes, the chunk starts at " + start.to_string())
+    }
+    case self.write_part(id, body) {
+      (R.error, why) then {
+        db.rollback()
+        db.close()
+        return (R.error, why)
+      }
+      (R.ok, _) then {
+        const next = offset + body.to_bytes().length()
+        db.set_upload_offset(id, next)
+        db.commit()
+        db.close()
+        return (R.ok, next)
+      }
+    }
+  }
+
+  // Links the blob and completes the session atomically, then removes the
+  // part data. False means the session was not pending any more — the caller
+  // answers 404.
   def complete(id String, digest String, size Int64) (R, Bool) {
     const db = registry.db.connect(self.db_path)
     db.begin()
@@ -95,11 +156,96 @@ class DbUploadSessions {
     }
     db.commit()
     db.close()
+    if won {
+      case self.part_path(id) {
+        (R.ok, path) then { const (_, _) = os.unlink(path) }
+        (R.error, _) then { }
+      }
+    }
     return (R.ok, won)
+  }
+
+  // Cancels a pending session and removes its part data. False means there
+  // was nothing cancellable (unknown, completed, already cancelled).
+  def cancel(id String) (R, Bool) {
+    const db = registry.db.connect(self.db_path)
+    db.begin()
+    const ok = db.cancel_pending_upload(id)
+    db.commit()
+    db.close()
+    if ok {
+      case self.part_path(id) {
+        (R.ok, path) then { const (_, _) = os.unlink(path) }
+        (R.error, _) then { }
+      }
+    }
+    return (R.ok, ok)
+  }
+
+  // The file holding the session's accumulated chunk bytes; the PUT
+  // finalization hands this to the blob store's put_file.
+  def part_path(id String) (R, String) {
+    return (R.ok, self.uploads_dir + "/" + id + part_suffix)
+  }
+
+  // Appends to the part file, creating it (and the directory) when new. An
+  // empty body still creates the file, so a chunk-less PUT can finalize an
+  // empty blob.
+  def write_part(id String, body String) (R, Bool) {
+    case ensure_uploads_dir(self.uploads_dir) {
+      (R.error, why) then { return (R.error, "uploads: " + why) }
+      (R.ok, _) then {
+        case self.part_path(id) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, path) then {
+            case os.open_append(path) {
+              (R.error, why) then { return (R.error, "uploads: cannot open " + path + ": " + why) }
+              (R.ok, fd) then {
+                case os.write(fd, body) {
+                  (R.error, why) then {
+                    const (_, _) = os.close(fd)
+                    return (R.error, "uploads: cannot write " + path + ": " + why)
+                  }
+                  (R.ok, _) then {
+                    const (_, _) = os.close(fd)
+                    return (R.ok, true)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Removes the part files of swept session ids. Best effort: a file that
+  // survives becomes an orphan a later sweep does not know about.
+  def remove_parts(ids Array[String]) {
+    var i = 0
+    while i < ids.length() {
+      case self.part_path(ids[i]) {
+        (R.ok, path) then { const (_, _) = os.unlink(path) }
+        (R.error, _) then { }
+      }
+      i = i + 1
+    }
   }
 }
 
-// The upload id: 32 hex characters over pid and monotonic time. Two POSTs are
+def ensure_uploads_dir(dir String) (R, Bool) {
+  case os.mkdir(dir) {
+    (R.ok, _) then { return (R.ok, true) }
+    (R.error, _) then {
+      case os.list_dir(dir) {
+        (R.ok, _) then { return (R.ok, true) }
+        (R.error, why) then { return (R.error, dir + ": not a directory: " + why) }
+      }
+    }
+  }
+}
+
+// The upload id: 64 hex characters over pid and monotonic time. Two POSTs are
 // separate httpd connection processes, so the pid differs; keep-alive
 // requests in one process differ in the monotonic nanoseconds.
 def new_upload_id() String {
@@ -230,12 +376,13 @@ def handle(req httpd.Request, sessions UploadSessions, store registry.blobstore.
     }
     return start(req, repository, sessions, store)
   }
-  // The item path serves PUT in T2.10; GET (offset), PATCH (append), and
-  // DELETE (cancel) arrive with the chunked upload in T2.11.
-  if req.method != "PUT" {
-    return registry.api.method_not_allowed("PUT")
+  case req.method {
+    "PUT" then { return finish(req, repository, id, sessions, store) }
+    "PATCH" then { return chunk(req, repository, id, sessions) }
+    "GET" then { return status(req, repository, id, sessions) }
+    "DELETE" then { return cancel(req, repository, id, sessions) }
+    _ then { return registry.api.method_not_allowed("GET, PATCH, PUT, DELETE") }
   }
-  return finish(req, repository, id, sessions, store)
 }
 
 def start(req httpd.Request, repository String, sessions UploadSessions, store registry.blobstore.BlobStore) httpd.Response {
@@ -261,6 +408,69 @@ def start(req httpd.Request, repository String, sessions UploadSessions, store r
   }
 }
 
+// PATCH: append one chunk. The Content-Range is the spec's bare
+// `<start>-<end>` (inclusive both ends); its start must equal the session's
+// recorded offset — out-of-order chunks are 416 — and its end must name the
+// chunk's last byte. A PATCH without the header streams blindly, which is
+// what clients like skopeo do for whole-layer uploads.
+def chunk(req httpd.Request, repository String, id String, sessions UploadSessions) httpd.Response {
+  case parse_content_range(req.header("Content-Range")) {
+    (R.error, why) then {
+      return registry.api.bad_request(registry.api.code_blob_upload_invalid, "invalid Content-Range", why)
+    }
+    (R.ok, range) then {
+      const body_len = req.body.to_bytes().length()
+      if range.ranged && (range.end < range.start || range.end != range.start + body_len - 1) {
+        return registry.api.bad_request(registry.api.code_blob_upload_invalid, "Content-Range does not match the body length", req.header("Content-Range"))
+      }
+      case sessions.append(id, req.body, range.start, range.ranged) {
+        (R.error, why) then { return append_error(why, id) }
+        (R.ok, offset) then { return progress_response(repository, id, offset, 202) }
+      }
+    }
+  }
+}
+
+// GET: the current offset and location of an active session — the resume
+// path after a 416.
+def status(req httpd.Request, repository String, id String, sessions UploadSessions) httpd.Response {
+  case sessions.lookup(id) {
+    (R.error, why) then { return registry.api.server_error("upload session lookup failed", why) }
+    (R.ok, session) then {
+      if session.state != state_pending || session.repository != repository {
+        return registry.api.not_found(registry.api.code_blob_upload_unknown, "upload session not found", id)
+      }
+      return progress_response(repository, id, session.offset, 204)
+    }
+  }
+}
+
+// DELETE: cancel a pending session; it is unusable afterwards.
+def cancel(req httpd.Request, repository String, id String, sessions UploadSessions) httpd.Response {
+  case sessions.lookup(id) {
+    (R.error, why) then { return registry.api.server_error("upload session lookup failed", why) }
+    (R.ok, session) then {
+      if session.state != state_pending || session.repository != repository {
+        return registry.api.not_found(registry.api.code_blob_upload_unknown, "upload session not found", id)
+      }
+      case sessions.cancel(id) {
+        (R.error, why) then { return registry.api.server_error("upload cancellation failed", why) }
+        (R.ok, gone) then {
+          if !gone {
+            return registry.api.not_found(registry.api.code_blob_upload_unknown, "upload session not found", id)
+          }
+          return httpd.response(204, [], "")
+        }
+      }
+    }
+  }
+}
+
+// PUT: close the session. The optional final chunk is appended under the
+// same offset rules as PATCH; the digest then covers everything the session
+// received. The body is verified by the blob store's put_file before
+// anything is linked, so a mismatch answers 400 and leaves the session
+// pending with its data intact.
 def finish(req httpd.Request, repository String, id String, sessions UploadSessions, store registry.blobstore.BlobStore) httpd.Response {
   const digest = query_digest(req)
   if digest == "" {
@@ -275,14 +485,55 @@ def finish(req httpd.Request, repository String, id String, sessions UploadSessi
       if session.state != state_pending || session.repository != repository {
         return registry.api.not_found(registry.api.code_blob_upload_unknown, "upload session not found", id)
       }
-      return store_and_complete(repository, id, digest, req.body, sessions, store)
+      return finalize(req, repository, id, digest, sessions, store)
     }
   }
 }
 
-// The upload's second half, shared by PUT and the single-request POST: hash
-// the body, store the bytes, link the blob, complete the session. The hash
-// check runs first, so a mismatch stores nothing anywhere.
+def finalize(req httpd.Request, repository String, id String, digest String, sessions UploadSessions, store registry.blobstore.BlobStore) httpd.Response {
+  case parse_content_range(req.header("Content-Range")) {
+    (R.error, why) then {
+      return registry.api.bad_request(registry.api.code_blob_upload_invalid, "invalid Content-Range", why)
+    }
+    (R.ok, range) then {
+      const body_len = req.body.to_bytes().length()
+      if range.ranged && (range.end < range.start || range.end != range.start + body_len - 1) {
+        return registry.api.bad_request(registry.api.code_blob_upload_invalid, "Content-Range does not match the body length", req.header("Content-Range"))
+      }
+      case sessions.append(id, req.body, range.start, range.ranged) {
+        (R.error, why) then { return append_error(why, id) }
+        (R.ok, _) then {
+          case sessions.part_path(id) {
+            (R.error, why) then { return registry.api.server_error("upload data path failed", why) }
+            (R.ok, part) then {
+              case store.put_file(digest, part) {
+                (R.error, why) then { return store_failure(digest, why) }
+                (R.ok, info) then {
+                  case sessions.complete(id, digest, info.size) {
+                    (R.error, why) then { return registry.api.server_error("upload completion failed", why) }
+                    (R.ok, won) then {
+                      if !won {
+                        return registry.api.not_found(registry.api.code_blob_upload_unknown, "upload session not found", id)
+                      }
+                      return httpd.response(201, [
+                        ("Location", route_prefix + repository + "/blobs/" + digest),
+                        ("Docker-Content-Digest", digest)
+                      ], "")
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// The POST monolithic path: hash the body first, so a mismatch answers 400
+// and touches neither the blob store nor the session. The store's own put
+// re-verifies; its mismatch branch is unreachable from here.
 def store_and_complete(repository String, id String, digest String, body String, sessions UploadSessions, store registry.blobstore.BlobStore) httpd.Response {
   const actual = "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
   if actual != digest {
@@ -290,7 +541,7 @@ def store_and_complete(repository String, id String, digest String, body String,
       "the body hashes to " + actual + ", not " + digest)
   }
   case store.put(digest, body) {
-    (R.error, why) then { return registry.api.server_error("blob store write failed", why) }
+    (R.error, why) then { return store_failure(digest, why) }
     (R.ok, info) then {
       case sessions.complete(id, digest, info.size) {
         (R.error, why) then { return registry.api.server_error("upload completion failed", why) }
@@ -306,6 +557,74 @@ def store_and_complete(repository String, id String, digest String, body String,
       }
     }
   }
+}
+
+def store_failure(digest String, why String) httpd.Response {
+  if registry.blobstore.is_digest_mismatch(why) {
+    return registry.api.bad_request(registry.api.code_digest_invalid, "digest mismatch", why)
+  }
+  return registry.api.server_error("blob store write failed", why)
+}
+
+// Classifies the session store's failures: a gone session is a 404, an
+// offset disagreement a 416, anything else the server's fault.
+def append_error(why String, id String) httpd.Response {
+  if why.starts_with(offset_mismatch_prefix) {
+    return httpd.response(416, [
+      ("Content-Type", "application/json; charset=utf-8")
+    ], registry.api.error_body(registry.api.code_blob_upload_invalid,
+      "chunk does not continue the upload at its current offset", why))
+  }
+  if why.starts_with(not_pending_prefix) {
+    return registry.api.not_found(registry.api.code_blob_upload_unknown, "upload session not found", id)
+  }
+  return registry.api.server_error("upload append failed", why)
+}
+
+// The PATCH answer (202) and the GET answer (204) share the headers: the
+// session's Location and, once anything was received, the spec's
+// `Range: 0-<last byte>` progress marker.
+def progress_response(repository String, id String, offset Int64, status_code Int64) httpd.Response {
+  var headers = [
+    ("Location", upload_location(repository, id)),
+    ("Docker-Upload-UUID", id)
+  ]
+  if offset > 0 {
+    headers = headers.append(("Range", "0-" + (offset - 1).to_string()))
+  }
+  return httpd.response(status_code, headers, "")
+}
+
+// The parsed Content-Range: the spec's bare `<start>-<end>`, inclusive on
+// both ends. `ranged` is false when the header was absent (streaming append).
+// A class rather than a nested tuple: the c target rejects tuple literals of
+// this shape.
+class ContentRange {
+  def init(ranged Bool, start Int64, end Int64) {
+    self.ranged = ranged
+    self.start = start
+    self.end = end
+  }
+}
+
+// An absent header answers not-ranged (streaming append).
+def parse_content_range(value String) (R, ContentRange) {
+  if value == "" {
+    return (R.ok, ContentRange.new(false, 0, 0))
+  }
+  const dash = value.index_of("-")
+  if dash <= 0 {
+    return (R.error, "expected <start>-<end>, got '" + value + "'")
+  }
+  const end_text = value.substring(dash + 1, value.length() - dash - 1)
+  if end_text.index_of("-") >= 0 {
+    return (R.error, "expected <start>-<end>, got '" + value + "'")
+  }
+  const start_text = value.substring(0, dash)
+  if !registry.blobstore.all_digits(start_text) || !registry.blobstore.all_digits(end_text) {
+    return (R.error, "expected <start>-<end>, got '" + value + "'")
+  }
+  return (R.ok, ContentRange.new(true, start_text.to_int64(), end_text.to_int64()))
 }
 
 // "" when the query has no digest. An empty value (`?digest=`) reads back as
