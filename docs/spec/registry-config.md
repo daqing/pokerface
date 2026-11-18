@@ -31,6 +31,7 @@ listen:
   host: 127.0.0.1
   port: 5000
 data_dir: ./data
+# db_path: ./data/registry.db               # optional; this is the default
 store:
   backend: fs
   root: ./data/blobs
@@ -51,6 +52,7 @@ A copy lives at `registry/registry.example.yaml`.
 | `listen.host` | string | `127.0.0.1` | non-empty |
 | `listen.port` | integer | `5000` | 0–65535; `0` picks an ephemeral port and the server prints the real one |
 | `data_dir` | string | `./data` | non-empty |
+| `db_path` | string | `<data_dir>/registry.db` | non-empty; the SQLite database ([registry-db.md](registry-db.md)) |
 | `store.backend` | string | `fs` | `fs` or `s3` |
 | `store.root` | string | `./data/blobs` | non-empty; for `fs`, the blob directory |
 | `limits.max_body_bytes` | integer | `16777216` (16 MiB) | positive; oversized request bodies get 413 |
@@ -70,6 +72,7 @@ values name the variable.
 | `POKERFACE_REGISTRY_CONFIG` | config file path (when `--config` is absent) |
 | `POKERFACE_REGISTRY_LISTEN` | `host:port` |
 | `POKERFACE_REGISTRY_DATA_DIR` | `data_dir` |
+| `POKERFACE_REGISTRY_DB_PATH` | `db_path` |
 | `POKERFACE_REGISTRY_STORE_BACKEND` | `store.backend` |
 | `POKERFACE_REGISTRY_STORE_ROOT` | `store.root` |
 | `POKERFACE_REGISTRY_MAX_BODY_BYTES` | `limits.max_body_bytes` |
@@ -90,8 +93,10 @@ values name the variable.
 Readiness checks in v0.1:
 
 - `data_dir` — the directory exists (created when absent) and a probe file can
-  be written and removed. This is where T2.2's SQLite database will live, and
-  T2.2 adds a database check.
+  be written and removed.
+- `db` — a short-lived connection opens the SQLite database, after a header
+  read that catches a missing file, a directory, or a non-database file
+  ([registry-db.md](registry-db.md)).
 - `store` — for `fs`, the blob root is usable the same way. `s3` reports not
   ready with "s3 backend is not implemented until T2.6". T2.4/T2.6 replace
   the check with the real store.
@@ -126,5 +131,5 @@ stderr.
 | Code | Meaning |
 | --- | --- |
 | 0 | Clean shutdown (or `--help`). |
-| 1 | Missing/invalid configuration, bind failure. |
+| 1 | Missing/invalid configuration, bind failure, database start-up failure. |
 | 2 | Bad command line (unknown option, `--config` without a value). |

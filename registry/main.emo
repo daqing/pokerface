@@ -1,6 +1,7 @@
-// T2.1: registry service entry point. Loads a YAML/env configuration, binds
-// the configured address, serves the health endpoints (and a /v2/ placeholder
-// until T2.7), and stops cleanly when the shutdown file appears.
+// T2.1/T2.2: registry service entry point. Loads a YAML/env configuration,
+// opens and migrates the SQLite database, binds the configured address, serves
+// the health endpoints (and a /v2/ placeholder until T2.7), and stops cleanly
+// when the shutdown file appears.
 //
 // Emo exposes no custom signal handler, so SIGTERM/SIGINT are ignored by the
 // server process and a launcher (scripts/run-registry.sh) turns the signal
@@ -57,6 +58,16 @@ def main() Int64 {
       return 1
     }
     (R.ok, config) then {
+      case registry.db.ensure_parent(config.db_path) {
+        (R.error, why) then {
+          eprint("registry: db " + config.db_path + ": " + why + "\n")
+          return 1
+        }
+        (R.ok, _) then { }
+      }
+      // Migrations run here, once; a failure ends start-up with SQLite's own
+      // message. Requests then probe with short-lived connections.
+      registry.db.open(config.db_path).close()
       return serve(config)
     }
   }
@@ -75,8 +86,9 @@ def serve(config registry.config.RegistryConfig) Int64 {
     }
     (R.ok, listener) then {
       const port = listener.port()
+      const db_health = registry.db.Health.new(config.db_path)
       const handler = -> (req httpd.Request) {
-        return registry.health.handle(req, config)
+        return registry.health.handle(req, config, db_health)
       }
       const server = httpd.serve_with(listener, handler, server_options(config))
       // Raw writes: supervisors/scripts poll these readiness lines.

@@ -15,6 +15,7 @@
 | [runtime-import.md](runtime-import.md) | Docker/Podman/containerd import via skopeo, verification, cleanup. | `src/runtime.emo` |
 | [cache.md](cache.md) | Cache layout, marker, TTL/size limits, `cache ls/rm/verify`. | `src/cache.emo`, `src/commands/cache.emo` |
 | [registry-config.md](registry-config.md) | Registry service config, health/readiness, request limits, shutdown (M2/T2.1). | `registry/config.emo`, `registry/health.emo`, `registry/main.emo` |
+| [registry-db.md](registry-db.md) | SQLite schema, migrations, pragmas, readiness, and the split test story (M2/T2.2). | `registry/db.emo`, `registry/db_selftest.emo` |
 
 ## M1 flow
 

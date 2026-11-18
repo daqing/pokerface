@@ -1,0 +1,628 @@
+// T2.2: the registry's SQLite data layer — schema migrations recorded one row
+// per applied version, and the CRUD the distribution handlers will call.
+//
+// The sqlite3 package is c-target only and the interpreter refuses its foreign
+// calls (E3009), so `emo test` cannot execute SQL here. The pure parts
+// (migrations, pragmas, path helpers) are covered by test/registry_db.emo;
+// registry/db_selftest.emo is the compiled counterpart that opens a real
+// database and exercises every CRUD path. Spec: docs/spec/registry-db.md.
+//
+// Emo has no Option, so lookups use sentinels: repository ids and upload rows
+// answer 0/""/false when absent, sizes answer -1. AUTOINCREMENT ids start at 1.
+
+require "sqlite3"
+require "os"
+require "time"
+
+const busy_timeout_ms = 5000
+const upload_pending = "pending"
+const upload_completed = "completed"
+const upload_cancelled = "cancelled"
+
+class Migration {
+  def init(version Int64, name String, statements Array[String]) {
+    self.version = version
+    self.name = name
+    self.statements = statements
+  }
+}
+
+// Every migration ever shipped, ascending. append() a new one; never edit a
+// released migration — deployed databases have already recorded its version.
+def migrations() Array[Migration] {
+  return [
+    Migration.new(1, "initial schema", [
+      "CREATE TABLE IF NOT EXISTS repositories ("
+        + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        + "name TEXT NOT NULL UNIQUE, "
+        + "created_at INTEGER NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS manifests ("
+        + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        + "repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE, "
+        + "digest TEXT NOT NULL, "
+        + "media_type TEXT NOT NULL, "
+        + "size INTEGER NOT NULL CHECK (size >= 0), "
+        + "body TEXT NOT NULL, "
+        + "created_at INTEGER NOT NULL, "
+        + "UNIQUE (repository_id, digest))",
+      "CREATE TABLE IF NOT EXISTS tags ("
+        + "repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE, "
+        + "tag TEXT NOT NULL, "
+        + "digest TEXT NOT NULL, "
+        + "updated_at INTEGER NOT NULL, "
+        + "PRIMARY KEY (repository_id, tag), "
+        + "FOREIGN KEY (repository_id, digest) "
+        + "REFERENCES manifests(repository_id, digest) ON DELETE CASCADE)",
+      "CREATE TABLE IF NOT EXISTS blobs ("
+        + "repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE, "
+        + "digest TEXT NOT NULL, "
+        + "size INTEGER NOT NULL CHECK (size >= 0), "
+        + "created_at INTEGER NOT NULL, "
+        + "PRIMARY KEY (repository_id, digest))",
+      "CREATE TABLE IF NOT EXISTS uploads ("
+        + "id TEXT PRIMARY KEY, "
+        + "repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE, "
+        + "state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'cancelled')), "
+        + "created_at INTEGER NOT NULL, "
+        + "expires_at INTEGER NOT NULL)",
+      "CREATE INDEX IF NOT EXISTS idx_tags_digest ON tags (repository_id, digest)",
+      "CREATE INDEX IF NOT EXISTS idx_uploads_expiry ON uploads (state, expires_at)"
+    ])
+  ]
+}
+
+// The pragmas every connection applies before it is handed out. WAL lets
+// readers run while a writer commits; busy_timeout makes a second writer wait
+// instead of failing with SQLITE_BUSY; foreign_keys enforces the references
+// above (SQLite leaves them off by default).
+def pragmas() Array[String] {
+  return [
+    "PRAGMA journal_mode=WAL",
+    "PRAGMA synchronous=NORMAL",
+    "PRAGMA busy_timeout=" + busy_timeout_ms.to_string(),
+    "PRAGMA foreign_keys=ON"
+  ]
+}
+
+def now_seconds() Int64 {
+  return time.now().unix_ms() / 1000
+}
+
+// Creates the database's parent directory when absent. One level only: a
+// nested path is the caller's job, and a failure here is reported by the
+// sqlite3 open that follows.
+def ensure_parent(path String) (R, Bool) {
+  const dir = parent_dir(path)
+  if dir == "" {
+    return (R.ok, true)
+  }
+  case os.mkdir(dir) {
+    (R.ok, _) then { return (R.ok, true) }
+    (R.error, _) then {
+      case os.list_dir(dir) {
+        (R.ok, _) then { return (R.ok, true) }
+        (R.error, why) then { return (R.error, "not a directory: " + why) }
+      }
+    }
+  }
+}
+
+def parent_dir(path String) String {
+  var i = path.length() - 1
+  while i >= 0 {
+    if path.substring(i, 1) == "/" {
+      if i == 0 {
+        return "/"
+      }
+      return path.substring(0, i)
+    }
+    i = i - 1
+  }
+  return ""
+}
+
+// Opens (creating when absent) the database at `path` and applies the
+// pragmas. Migrations are the caller's job: `open` runs them for the service
+// start-up, while the readiness probe only connects.
+def connect(path String) Database {
+  const (_, _) = ensure_parent(path)
+  const handle = sqlite3.open(path)
+  const database = Database.new(handle, path)
+  database.configure()
+  return database
+}
+
+// Connects and records any migration the database has not applied yet.
+def open(path String) Database {
+  const database = connect(path)
+  database.migrate()
+  return database
+}
+
+// The /readyz database check. It opens its own short-lived connection on
+// every probe instead of sharing the start-up handle: httpd runs one process
+// per connection, so a long-lived connection would be forked into every
+// request process. The probe does not migrate — start-up already did.
+class Health {
+  def init(file_path String) {
+    self.file_path = file_path
+  }
+
+  def path() String {
+    return self.file_path
+  }
+
+  def ping() Bool {
+    case ensure_parent(self.file_path) {
+      (R.error, _) then { return false }
+      (R.ok, _) then { }
+    }
+    if !looks_like_sqlite(self.file_path) {
+      return false
+    }
+    const database = connect(self.file_path)
+    const ok = database.ping()
+    database.close()
+    return ok
+  }
+}
+
+// A 16-byte header read catches the cases where sqlite3.open would raise —
+// a missing file, a directory in the way, permissions, or a file that is not
+// a database — so /readyz answers 503 instead of dropping the connection.
+def looks_like_sqlite(path String) Bool {
+  case os.open_read(path) {
+    (R.error, _) then { return false }
+    (R.ok, fd) then {
+      var head = ""
+      case os.read(fd, 15) {
+        (R.ok, text) then { head = text }
+        (R.error, _) then { head = "" }
+      }
+      const (_, _) = os.close(fd)
+      return head == "SQLite format 3"
+    }
+  }
+}
+
+class Database {
+  def init(handle sqlite3.Database, file_path String) {
+    self.handle = handle
+    self.file_path = file_path
+  }
+
+  def path() String {
+    return self.file_path
+  }
+
+  def close() {
+    self.handle.close()
+  }
+
+  def configure() {
+    const list = pragmas()
+    var i = 0
+    while i < list.length() {
+      self.handle.exec(list[i])
+      i = i + 1
+    }
+  }
+
+  // The /readyz database check. It touches the real database, so a failed or
+  // reorganised file shows up as not ready. A raise here ends the request's
+  // connection process, httpd's contract for a broken assertion.
+  def ping() Bool {
+    const stmt = self.handle.prepare("SELECT 1")
+    const row = stmt.step()
+    stmt.finalize()
+    return row
+  }
+
+  def pragma_text(name String) String {
+    const stmt = self.handle.prepare("PRAGMA " + name)
+    var value = ""
+    if stmt.step() {
+      value = stmt.column_text(0)
+    }
+    stmt.finalize()
+    return value
+  }
+
+  def pragma_int(name String) Int64 {
+    const stmt = self.handle.prepare("PRAGMA " + name)
+    var value = 0
+    if stmt.step() {
+      value = stmt.column_int(0)
+    }
+    stmt.finalize()
+    return value
+  }
+
+  // The stored SQL of one table or index, for diagnostics and the compiled
+  // self-check's constraint assertions. "" when the object does not exist.
+  def schema_sql(name String) String {
+    const stmt = self.handle.prepare("SELECT sql FROM sqlite_master WHERE name = ?1")
+    stmt.bind_text(1, name)
+    var value = ""
+    if stmt.step() {
+      value = stmt.column_text(0)
+    }
+    stmt.finalize()
+    return value
+  }
+
+  def begin() {
+    self.handle.exec("BEGIN IMMEDIATE")
+  }
+
+  def commit() {
+    self.handle.exec("COMMIT")
+  }
+
+  def rollback() {
+    self.handle.exec("ROLLBACK")
+  }
+
+  // -------------------------------------------------------------------------
+  // Migrations. Transactions start with BEGIN IMMEDIATE so a concurrent
+  // starter waits on the lock, then re-checks the version inside it. Emo has
+  // no catch: a failing statement ends the process and SQLite rolls the open
+  // transaction back when the connection closes.
+
+  def migrate() {
+    self.handle.exec(
+      "CREATE TABLE IF NOT EXISTS schema_version ("
+        + "version INTEGER PRIMARY KEY, "
+        + "applied_at INTEGER NOT NULL)")
+    const list = migrations()
+    var i = 0
+    while i < list.length() {
+      const migration = list[i]
+      self.handle.exec("BEGIN IMMEDIATE")
+      if !self.has_version(migration.version) {
+        var j = 0
+        while j < migration.statements.length() {
+          self.handle.exec(migration.statements[j])
+          j = j + 1
+        }
+        self.record_version(migration.version)
+      }
+      self.handle.exec("COMMIT")
+      i = i + 1
+    }
+  }
+
+  def applied_versions() Array[Int64] {
+    const stmt = self.handle.prepare("SELECT version FROM schema_version ORDER BY version")
+    var out = []
+    while stmt.step() {
+      out = out.append(stmt.column_int(0))
+    }
+    stmt.finalize()
+    return out
+  }
+
+  def schema_version() Int64 {
+    const versions = self.applied_versions()
+    var latest = 0
+    var i = 0
+    while i < versions.length() {
+      if versions[i] > latest {
+        latest = versions[i]
+      }
+      i = i + 1
+    }
+    return latest
+  }
+
+  def has_version(version Int64) Bool {
+    const stmt = self.handle.prepare("SELECT 1 FROM schema_version WHERE version = ?1")
+    stmt.bind_int(1, version)
+    const found = stmt.step()
+    stmt.finalize()
+    return found
+  }
+
+  def record_version(version Int64) {
+    const stmt = self.handle.prepare("INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)")
+    stmt.bind_int(1, version)
+    stmt.bind_int(2, now_seconds())
+    stmt.step()
+    stmt.finalize()
+  }
+
+  // -------------------------------------------------------------------------
+  // Repositories.
+
+  def ensure_repository(name String) Int64 {
+    const stmt = self.handle.prepare("INSERT OR IGNORE INTO repositories (name, created_at) VALUES (?1, ?2)")
+    stmt.bind_text(1, name)
+    stmt.bind_int(2, now_seconds())
+    stmt.step()
+    stmt.finalize()
+    return self.repository_id(name)
+  }
+
+  def repository_id(name String) Int64 {
+    const stmt = self.handle.prepare("SELECT id FROM repositories WHERE name = ?1")
+    stmt.bind_text(1, name)
+    var id = 0
+    if stmt.step() {
+      id = stmt.column_int(0)
+    }
+    stmt.finalize()
+    return id
+  }
+
+  def repository_exists(name String) Bool {
+    return self.repository_id(name) > 0
+  }
+
+  def delete_repository(id Int64) Bool {
+    const stmt = self.handle.prepare("DELETE FROM repositories WHERE id = ?1")
+    stmt.bind_int(1, id)
+    stmt.step()
+    stmt.finalize()
+    return self.handle.changes() > 0
+  }
+
+  // -------------------------------------------------------------------------
+  // Manifests: one row per digest, body kept verbatim (the registry serves the
+  // exact bytes it stored). Re-putting a digest is a no-op.
+
+  def put_manifest(repository_id Int64, digest String, media_type String, size Int64, body String) Bool {
+    const stmt = self.handle.prepare(
+      "INSERT OR IGNORE INTO manifests "
+        + "(repository_id, digest, media_type, size, body, created_at) "
+        + "VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+    stmt.bind_int(1, repository_id)
+    stmt.bind_text(2, digest)
+    stmt.bind_text(3, media_type)
+    stmt.bind_int(4, size)
+    stmt.bind_text(5, body)
+    stmt.bind_int(6, now_seconds())
+    stmt.step()
+    stmt.finalize()
+    return self.handle.changes() > 0
+  }
+
+  def manifest_exists(repository_id Int64, digest String) Bool {
+    const stmt = self.handle.prepare(
+      "SELECT 1 FROM manifests WHERE repository_id = ?1 AND digest = ?2")
+    stmt.bind_int(1, repository_id)
+    stmt.bind_text(2, digest)
+    const found = stmt.step()
+    stmt.finalize()
+    return found
+  }
+
+  def manifest_media_type(repository_id Int64, digest String) String {
+    return self.manifest_column(repository_id, digest, "media_type")
+  }
+
+  def manifest_body(repository_id Int64, digest String) String {
+    return self.manifest_column(repository_id, digest, "body")
+  }
+
+  def manifest_size(repository_id Int64, digest String) Int64 {
+    const stmt = self.handle.prepare(
+      "SELECT size FROM manifests WHERE repository_id = ?1 AND digest = ?2")
+    stmt.bind_int(1, repository_id)
+    stmt.bind_text(2, digest)
+    var size = -1
+    if stmt.step() {
+      size = stmt.column_int(0)
+    }
+    stmt.finalize()
+    return size
+  }
+
+  def manifest_column(repository_id Int64, digest String, column String) String {
+    const stmt = self.handle.prepare(
+      "SELECT " + column + " FROM manifests WHERE repository_id = ?1 AND digest = ?2")
+    stmt.bind_int(1, repository_id)
+    stmt.bind_text(2, digest)
+    var value = ""
+    if stmt.step() {
+      value = stmt.column_text(0)
+    }
+    stmt.finalize()
+    return value
+  }
+
+  def list_manifest_digests(repository_id Int64) Array[String] {
+    const stmt = self.handle.prepare(
+      "SELECT digest FROM manifests WHERE repository_id = ?1 ORDER BY digest")
+    stmt.bind_int(1, repository_id)
+    var out = []
+    while stmt.step() {
+      out = out.append(stmt.column_text(0))
+    }
+    stmt.finalize()
+    return out
+  }
+
+  // -------------------------------------------------------------------------
+  // Tags. A tag names a manifest in the same repository; the composite
+  // foreign key keeps that true, and ON DELETE CASCADE drops a tag with the
+  // manifest or repository it pointed at.
+
+  def put_tag(repository_id Int64, tag String, digest String) {
+    const stmt = self.handle.prepare(
+      "INSERT OR REPLACE INTO tags (repository_id, tag, digest, updated_at) "
+        + "VALUES (?1, ?2, ?3, ?4)")
+    stmt.bind_int(1, repository_id)
+    stmt.bind_text(2, tag)
+    stmt.bind_text(3, digest)
+    stmt.bind_int(4, now_seconds())
+    stmt.step()
+    stmt.finalize()
+  }
+
+  def tag_digest(repository_id Int64, tag String) String {
+    const stmt = self.handle.prepare(
+      "SELECT digest FROM tags WHERE repository_id = ?1 AND tag = ?2")
+    stmt.bind_int(1, repository_id)
+    stmt.bind_text(2, tag)
+    var digest = ""
+    if stmt.step() {
+      digest = stmt.column_text(0)
+    }
+    stmt.finalize()
+    return digest
+  }
+
+  def list_tags(repository_id Int64) Array[String] {
+    const stmt = self.handle.prepare(
+      "SELECT tag FROM tags WHERE repository_id = ?1 ORDER BY tag")
+    stmt.bind_int(1, repository_id)
+    var out = []
+    while stmt.step() {
+      out = out.append(stmt.column_text(0))
+    }
+    stmt.finalize()
+    return out
+  }
+
+  def delete_tag(repository_id Int64, tag String) Bool {
+    const stmt = self.handle.prepare(
+      "DELETE FROM tags WHERE repository_id = ?1 AND tag = ?2")
+    stmt.bind_int(1, repository_id)
+    stmt.bind_text(2, tag)
+    stmt.step()
+    stmt.finalize()
+    return self.handle.changes() > 0
+  }
+
+  // -------------------------------------------------------------------------
+  // Blobs: which repository references which digest, and at what size. The
+  // bytes live in the BlobStore (T2.4); this table is the metadata index.
+
+  def put_blob(repository_id Int64, digest String, size Int64) Bool {
+    const stmt = self.handle.prepare(
+      "INSERT OR IGNORE INTO blobs (repository_id, digest, size, created_at) "
+        + "VALUES (?1, ?2, ?3, ?4)")
+    stmt.bind_int(1, repository_id)
+    stmt.bind_text(2, digest)
+    stmt.bind_int(3, size)
+    stmt.bind_int(4, now_seconds())
+    stmt.step()
+    stmt.finalize()
+    return self.handle.changes() > 0
+  }
+
+  def blob_size(repository_id Int64, digest String) Int64 {
+    const stmt = self.handle.prepare(
+      "SELECT size FROM blobs WHERE repository_id = ?1 AND digest = ?2")
+    stmt.bind_int(1, repository_id)
+    stmt.bind_text(2, digest)
+    var size = -1
+    if stmt.step() {
+      size = stmt.column_int(0)
+    }
+    stmt.finalize()
+    return size
+  }
+
+  def blob_exists(repository_id Int64, digest String) Bool {
+    return self.blob_size(repository_id, digest) >= 0
+  }
+
+  def list_blob_digests(repository_id Int64) Array[String] {
+    const stmt = self.handle.prepare(
+      "SELECT digest FROM blobs WHERE repository_id = ?1 ORDER BY digest")
+    stmt.bind_int(1, repository_id)
+    var out = []
+    while stmt.step() {
+      out = out.append(stmt.column_text(0))
+    }
+    stmt.finalize()
+    return out
+  }
+
+  def delete_blob(repository_id Int64, digest String) Bool {
+    const stmt = self.handle.prepare(
+      "DELETE FROM blobs WHERE repository_id = ?1 AND digest = ?2")
+    stmt.bind_int(1, repository_id)
+    stmt.bind_text(2, digest)
+    stmt.step()
+    stmt.finalize()
+    return self.handle.changes() > 0
+  }
+
+  // -------------------------------------------------------------------------
+  // Upload sessions. The state column only accepts the three known values,
+  // so a typo fails at the database rather than being stored.
+
+  def create_upload(id String, repository_id Int64, expires_at Int64) {
+    const stmt = self.handle.prepare(
+      "INSERT INTO uploads (id, repository_id, state, created_at, expires_at) "
+        + "VALUES (?1, ?2, ?3, ?4, ?5)")
+    stmt.bind_text(1, id)
+    stmt.bind_int(2, repository_id)
+    stmt.bind_text(3, upload_pending)
+    stmt.bind_int(4, now_seconds())
+    stmt.bind_int(5, expires_at)
+    stmt.step()
+    stmt.finalize()
+  }
+
+  def upload_state(id String) String {
+    const stmt = self.handle.prepare("SELECT state FROM uploads WHERE id = ?1")
+    stmt.bind_text(1, id)
+    var state = ""
+    if stmt.step() {
+      state = stmt.column_text(0)
+    }
+    stmt.finalize()
+    return state
+  }
+
+  def upload_repository(id String) Int64 {
+    const stmt = self.handle.prepare("SELECT repository_id FROM uploads WHERE id = ?1")
+    stmt.bind_text(1, id)
+    var repository_id = 0
+    if stmt.step() {
+      repository_id = stmt.column_int(0)
+    }
+    stmt.finalize()
+    return repository_id
+  }
+
+  def set_upload_state(id String, state String) Bool {
+    const stmt = self.handle.prepare("UPDATE uploads SET state = ?1 WHERE id = ?2")
+    stmt.bind_text(1, state)
+    stmt.bind_text(2, id)
+    stmt.step()
+    stmt.finalize()
+    return self.handle.changes() > 0
+  }
+
+  def complete_upload(id String) Bool {
+    return self.set_upload_state(id, upload_completed)
+  }
+
+  def cancel_upload(id String) Bool {
+    return self.set_upload_state(id, upload_cancelled)
+  }
+
+  def delete_upload(id String) Bool {
+    const stmt = self.handle.prepare("DELETE FROM uploads WHERE id = ?1")
+    stmt.bind_text(1, id)
+    stmt.step()
+    stmt.finalize()
+    return self.handle.changes() > 0
+  }
+
+  // Drops pending sessions whose deadline passed and answers how many went.
+  // Completed and cancelled rows stay for the audit trail.
+  def expire_uploads(now Int64) Int64 {
+    const stmt = self.handle.prepare(
+      "DELETE FROM uploads WHERE state = ?1 AND expires_at <= ?2")
+    stmt.bind_text(1, upload_pending)
+    stmt.bind_int(2, now)
+    stmt.step()
+    stmt.finalize()
+    return self.handle.changes()
+  }
+}

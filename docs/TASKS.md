@@ -347,7 +347,7 @@ Exit criteria:
 | Status | ID | Task | Depends on | Estimate |
 | --- | --- | --- | --- | --- |
 | [x] | T2.1 | Service skeleton, configuration, and health checks | T1.2 | 2h |
-| [ ] | T2.2 | SQLite data layer and migrations | T2.1 | 2-3h |
+| [x] | T2.2 | SQLite data layer and migrations | T2.1 | 2-3h |
 | [ ] | T2.3 | OCI manifest / index model and validation | T1.5 | 2-3h |
 | [ ] | T2.4 | BlobStore interface and local filesystem backend | T2.1 | 2h |
 | [ ] | T2.5 | AWS SigV4 signing and presigned URLs | T2.1 | 3h |
@@ -397,6 +397,8 @@ Suggested tables:
 - `uploads(id, repository_id, state, created_at, expires_at)`
 
 **Depends on**: T2.1 · **Estimate**: 2-3h
+
+> **Notes** (2026-11-18, ~2.5h): Done. `registry/db.emo` wraps the stdlib `sqlite3` package (added as a `c`-target dep): `open`/`connect` apply WAL, `synchronous=NORMAL`, `busy_timeout=5000`, and `foreign_keys=ON`, then `migrate` records each version in `schema_version` inside `BEGIN IMMEDIATE`, re-checking the version so two starting servers cannot both apply one. Schema v1 is the five suggested tables with their constraints: unique repository names, `UNIQUE (repository_id, digest)` on manifests, `PRIMARY KEY (repository_id, tag)` plus a composite FK making a tag name a manifest in the same repository, `CHECK (size >= 0)`, and `CHECK (state IN ('pending','completed','cancelled'))` on uploads; deletes cascade from the repository. CRUD covers all five tables with sentinels instead of `Option` (0, -1, ""), plus `begin`/`commit`/`rollback` for the multi-row writes of T2.8. Config gained `db_path` (default `<data_dir>/registry.db`, `POKERFACE_REGISTRY_DB_PATH`), and `/readyz` gained a `db` check — `registry.db.Health` opens a short-lived connection per probe (httpd runs one process per connection, so a shared handle would be forked into every request) and reads the 16-byte header first, so a directory or garbage file answers 503 instead of dropping the connection; verified the check flips 200→503→200 without a restart. **Testing** is split because the sqlite3 package is `c`-only and `emo test` always interprets (E3009): the pure parts (migration order, table/constraint text, pragmas, path helpers, `ensure_parent`) are in `test/registry_db.emo` under `emo test`, while `registry/db_selftest.emo` + `scripts/check-registry-db.sh` cover the real database — 62 checks including every CRUD path, the FK cascade, the `CHECK` constraints, migration idempotency across reopen, and a writer/reader pair. Also verified against the system `sqlite3` CLI that the created file reports `schema_version` 1 and `journal_mode=wal`. Gotchas: Emo fields are immutable after `init` (mutate through `Box`); `PRAGMA journal_mode=WAL` needs the file on a writable path, and a `db_path` that is a directory fails start-up with SQLite's own message and exit 1; `emo build` refuses any entry under `test/`, which is why the compiled checker lives beside the code.
 
 #### T2.3 OCI Manifest / Index Model and Validation
 

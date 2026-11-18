@@ -7,6 +7,10 @@ listen:
 
 data_dir: ./data
 
+# The SQLite metadata database (T2.2). Optional; defaults to
+# <data_dir>/registry.db.
+# db_path: ./data/registry.db
+
 store:
   backend: fs
   root: ./data/blobs

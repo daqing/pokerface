@@ -54,6 +54,7 @@ def full_config() String {
     + "  host: 127.0.0.1\n"
     + "  port: 5100\n"
     + "data_dir: /tmp/reg-data\n"
+    + "db_path: /tmp/reg-data/custom.db\n"
     + "store:\n"
     + "  backend: fs\n"
     + "  root: /tmp/reg-blobs\n"
@@ -74,6 +75,7 @@ def expect_config_ok(result (R, registry.config.RegistryConfig), label String) r
       return registry.config.RegistryConfig.new(
         registry.config.RegistryListen.new("", 0),
         "",
+        "",
         registry.config.RegistryStore.new("", ""),
         registry.config.RegistryLimits.new(0, 0, 0, 0),
         "",
@@ -90,6 +92,7 @@ def test_full_config_parses() {
   expect_equal("127.0.0.1", config.listen.host)
   expect_equal(5100, config.listen.port)
   expect_equal("/tmp/reg-data", config.data_dir)
+  expect_equal("/tmp/reg-data/custom.db", config.db_path)
   expect_equal("fs", config.store.backend)
   expect_equal("/tmp/reg-blobs", config.store.root)
   expect_equal(2048, config.limits.max_body_bytes)
@@ -107,6 +110,7 @@ def test_defaults_apply_to_an_empty_mapping() {
   expect_equal("127.0.0.1", config.listen.host)
   expect_equal(5000, config.listen.port)
   expect_equal("./data", config.data_dir)
+  expect_equal("./data/registry.db", config.db_path)
   expect_equal("fs", config.store.backend)
   expect_equal("./data/blobs", config.store.root)
   expect_equal(16777216, config.limits.max_body_bytes)
@@ -149,6 +153,7 @@ def test_env_overrides_file_values() {
   const env = RegFakeEnv.new(Map.new(
     ("POKERFACE_REGISTRY_LISTEN", "0.0.0.0:6000"),
     ("POKERFACE_REGISTRY_DATA_DIR", "/tmp/env-data"),
+    ("POKERFACE_REGISTRY_DB_PATH", "/tmp/env-data/env.db"),
     ("POKERFACE_REGISTRY_STORE_BACKEND", "s3"),
     ("POKERFACE_REGISTRY_STORE_ROOT", "bucket/key"),
     ("POKERFACE_REGISTRY_MAX_BODY_BYTES", "4096"),
@@ -161,6 +166,7 @@ def test_env_overrides_file_values() {
   expect_equal("0.0.0.0", config.listen.host)
   expect_equal(6000, config.listen.port)
   expect_equal("/tmp/env-data", config.data_dir)
+  expect_equal("/tmp/env-data/env.db", config.db_path)
   expect_equal("s3", config.store.backend)
   expect_equal("bucket/key", config.store.root)
   expect_equal(4096, config.limits.max_body_bytes)
@@ -230,6 +236,7 @@ def test_summary_contains_the_effective_values() {
   const text = reg_config.summary(config)
   expect_true(text.index_of("listen=127.0.0.1:5100") >= 0)
   expect_true(text.index_of("store=fs:/tmp/reg-blobs") >= 0)
+  expect_true(text.index_of("db=/tmp/reg-data/custom.db") >= 0)
   expect_true(text.index_of("max_body=2048") >= 0)
   expect_true(text.index_of("shutdown_file=/tmp/reg-stop") >= 0)
 }

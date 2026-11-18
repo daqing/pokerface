@@ -15,6 +15,7 @@ const default_max_header_bytes = 1048576
 const default_read_timeout = 30
 const default_idle_timeout = 5
 const shutdown_file_name = "registry.shutdown"
+const db_file_name = "registry.db"
 const known_backends = ["fs", "s3"]
 
 class RegistryListen {
@@ -41,9 +42,10 @@ class RegistryStore {
 }
 
 class RegistryConfig {
-  def init(listen RegistryListen, data_dir String, store RegistryStore, limits RegistryLimits, shutdown_file String, config_path String) {
+  def init(listen RegistryListen, data_dir String, db_path String, store RegistryStore, limits RegistryLimits, shutdown_file String, config_path String) {
     self.listen = listen
     self.data_dir = data_dir
+    self.db_path = db_path
     self.store = store
     self.limits = limits
     self.shutdown_file = shutdown_file
@@ -59,6 +61,7 @@ def defaults(config_path String) RegistryConfig {
   return RegistryConfig.new(
     RegistryListen.new(default_host, default_port),
     default_data_dir,
+    "",
     RegistryStore.new(default_store_backend, default_store_root),
     RegistryLimits.new(default_max_body_bytes, default_max_header_bytes, default_read_timeout, default_idle_timeout),
     "",
@@ -130,6 +133,12 @@ def from_yaml(doc yaml.Yaml, path String) (R, RegistryConfig) {
             (R.ok, text) then { config = with_data_dir(config, text) }
           }
         }
+        "db_path" then {
+          case string_value(value, path, "db_path") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { config = with_db_path(config, text) }
+          }
+        }
         "store" then {
           case parse_store(value, path) {
             (R.error, why) then { return (R.error, why) }
@@ -149,7 +158,7 @@ def from_yaml(doc yaml.Yaml, path String) (R, RegistryConfig) {
           }
         }
         _ then {
-          return (R.error, cfg_error(path, key + ": unknown field (known: listen, data_dir, store, limits, shutdown_file)"))
+          return (R.error, cfg_error(path, key + ": unknown field (known: listen, data_dir, db_path, store, limits, shutdown_file)"))
         }
       }
       i = i + 1
@@ -300,6 +309,7 @@ def kind_word(kind yaml.YamlKind) String {
 def apply_env(config RegistryConfig, env src.settings.EnvSource) (R, RegistryConfig) {
   var listen = config.listen
   var data_dir = config.data_dir
+  var db_path = config.db_path
   var store = config.store
   var limits = config.limits
   var shutdown_file = config.shutdown_file
@@ -318,6 +328,14 @@ def apply_env(config RegistryConfig, env src.settings.EnvSource) (R, RegistryCon
     (R.ok, v) then {
       if v != "" {
         data_dir = v
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_DB_PATH") {
+    (R.ok, v) then {
+      if v != "" {
+        db_path = v
       }
     }
     (R.error, _) then { }
@@ -390,7 +408,7 @@ def apply_env(config RegistryConfig, env src.settings.EnvSource) (R, RegistryCon
     }
     (R.error, _) then { }
   }
-  const merged = RegistryConfig.new(listen, data_dir, store, limits, shutdown_file, config.config_path)
+  const merged = RegistryConfig.new(listen, data_dir, db_path, store, limits, shutdown_file, config.config_path)
   return validate(merged)
 }
 
@@ -461,7 +479,11 @@ def validate(config RegistryConfig) (R, RegistryConfig) {
   if shutdown_file == "" {
     shutdown_file = config.data_dir + "/" + shutdown_file_name
   }
-  return (R.ok, RegistryConfig.new(config.listen, config.data_dir, config.store, config.limits, shutdown_file, config.config_path))
+  var db_path = config.db_path
+  if db_path == "" {
+    db_path = config.data_dir + "/" + db_file_name
+  }
+  return (R.ok, RegistryConfig.new(config.listen, config.data_dir, db_path, config.store, config.limits, shutdown_file, config.config_path))
 }
 
 def in_array(items Array[String], wanted String) Bool {
@@ -477,29 +499,34 @@ def in_array(items Array[String], wanted String) Bool {
 
 // Small rebuilders keep RegistryConfig immutable without a mutable builder.
 def with_listen(config RegistryConfig, listen RegistryListen) RegistryConfig {
-  return RegistryConfig.new(listen, config.data_dir, config.store, config.limits, config.shutdown_file, config.config_path)
+  return RegistryConfig.new(listen, config.data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path)
 }
 
 def with_data_dir(config RegistryConfig, data_dir String) RegistryConfig {
-  return RegistryConfig.new(config.listen, data_dir, config.store, config.limits, config.shutdown_file, config.config_path)
+  return RegistryConfig.new(config.listen, data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path)
+}
+
+def with_db_path(config RegistryConfig, db_path String) RegistryConfig {
+  return RegistryConfig.new(config.listen, config.data_dir, db_path, config.store, config.limits, config.shutdown_file, config.config_path)
 }
 
 def with_store(config RegistryConfig, store RegistryStore) RegistryConfig {
-  return RegistryConfig.new(config.listen, config.data_dir, store, config.limits, config.shutdown_file, config.config_path)
+  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, store, config.limits, config.shutdown_file, config.config_path)
 }
 
 def with_limits(config RegistryConfig, limits RegistryLimits) RegistryConfig {
-  return RegistryConfig.new(config.listen, config.data_dir, config.store, limits, config.shutdown_file, config.config_path)
+  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, limits, config.shutdown_file, config.config_path)
 }
 
 def with_shutdown_file(config RegistryConfig, shutdown_file String) RegistryConfig {
-  return RegistryConfig.new(config.listen, config.data_dir, config.store, config.limits, shutdown_file, config.config_path)
+  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, config.limits, shutdown_file, config.config_path)
 }
 
 def summary(config RegistryConfig) String {
   return (
     "registry: listen=" + config.listen.host + ":" + config.listen.port.to_string()
     + " data_dir=" + config.data_dir
+    + " db=" + config.db_path
     + " store=" + config.store.backend + ":" + config.store.root
     + " max_body=" + config.limits.max_body_bytes.to_string()
     + " max_header=" + config.limits.max_header_bytes.to_string()

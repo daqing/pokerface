@@ -347,7 +347,7 @@ images:
 | 状态 | ID | 任务 | 依赖 | 预估 |
 | --- | --- | --- | --- | --- |
 | [x] | T2.1 | 服务骨架、配置与健康检查 | T1.2 | 2h |
-| [ ] | T2.2 | SQLite 数据层与迁移 | T2.1 | 2-3h |
+| [x] | T2.2 | SQLite 数据层与迁移 | T2.1 | 2-3h |
 | [ ] | T2.3 | OCI Manifest / Index 模型与校验 | T1.5 | 2-3h |
 | [ ] | T2.4 | BlobStore 接口与本地文件后端 | T2.1 | 2h |
 | [ ] | T2.5 | AWS SigV4 签名与预签名 URL | T2.1 | 3h |
@@ -397,6 +397,8 @@ images:
 - `uploads(id, repository_id, state, created_at, expires_at)`
 
 **依赖**：T2.1 · **预估**：2-3h
+
+> **备注**（2026-11-18，约 2.5h）：已完成。`registry/db.emo` 封装标准库 `sqlite3` 包（已作为 c-target 依赖加入）：`open`/`connect` 应用 WAL、`synchronous=NORMAL`、`busy_timeout=5000`、`foreign_keys=ON`，随后 `migrate` 在 `BEGIN IMMEDIATE` 中把每个版本写入 `schema_version`，并在事务内复查版本，两个同时启动的服务不会重复应用同一迁移。Schema v1 就是任务建议的五张表及其约束：仓库名唯一、manifests 上 `UNIQUE (repository_id, digest)`、tags 上 `PRIMARY KEY (repository_id, tag)` 加复合外键（tag 必须指向同仓库的 manifest）、`CHECK (size >= 0)`、uploads 的 `CHECK (state IN (...))`；删除仓库会级联删除。CRUD 覆盖五张表，用哨兵值（0、-1、""）代替 `Option`，并提供 `begin`/`commit`/`rollback` 供 T2.8 的多行写入使用。配置新增 `db_path`（默认 `<data_dir>/registry.db`，环境变量 `POKERFACE_REGISTRY_DB_PATH`），`/readyz` 新增 `db` 检查——`registry.db.Health` 每次探测新建短连接（httpd 是一连接一进程，共享句柄会被 fork 进每个请求进程），并先读 16 字节文件头，因此目录或垃圾文件会返回 503 而不是直接断连；已验证该检查在不重启的情况下 200→503→200。**测试拆分**：sqlite3 包仅支持 c target，而 `emo test` 永远走解释器（E3009），所以纯逻辑（迁移顺序、建表/约束文本、pragma、路径处理、`ensure_parent`）放在 `test/registry_db.emo` 由 `emo test` 覆盖，真实数据库由 `registry/db_selftest.emo` + `scripts/check-registry-db.sh` 覆盖——62 项检查，含全部 CRUD、外键级联、`CHECK` 约束、重开后的迁移幂等性、以及写连接/读连接并存。另外用系统 `sqlite3` 命令确认生成的文件 `schema_version` 为 1、`journal_mode=wal`。注意：Emo 的字段在 `init` 之后不可变（用 `Box` 改值）；`PRAGMA journal_mode=WAL` 要求文件所在路径可写，`db_path` 指向目录时启动失败、打印 SQLite 自己的报错并以 1 退出；`emo build` 拒绝 `test/` 下的入口，所以编译版检查器放在代码旁边。
 
 #### T2.3 OCI Manifest / Index 模型与校验
 

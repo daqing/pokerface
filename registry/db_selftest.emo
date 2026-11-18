@@ -1,0 +1,243 @@
+// T2.2: compiled checks for the SQLite data layer. `emo test` always
+// interprets, and the sqlite3 package refuses interpreted foreign calls
+// (E3009), so the real CRUD coverage lives in this entry point instead:
+//
+//   emo build -o .emo-build/db-selftest registry/db_selftest.emo
+//   .emo-build/db-selftest
+//
+// It opens a fresh database under TMPDIR, exercises every CRUD path and the
+// schema constraints, reopens it to prove migrations are idempotent, and runs
+// two connections side by side. Exit 0 when every check passes.
+
+require "os"
+
+class Report {
+  def init() {
+    self.total = Box.new(0)
+    self.failures = Box.new(0)
+  }
+
+  def check(ok Bool, label String) {
+    self.total.replace(self.total.read() + 1)
+    if ok {
+      println("ok " + label)
+    } else {
+      self.failures.replace(self.failures.read() + 1)
+      println("FAIL " + label)
+    }
+  }
+
+  def text(actual String, expected String, label String) {
+    if actual != expected {
+      println("  got '" + actual + "', want '" + expected + "'")
+    }
+    self.check(actual == expected, label)
+  }
+
+  def number(actual Int64, expected Int64, label String) {
+    if actual != expected {
+      println("  got " + actual.to_string() + ", want " + expected.to_string())
+    }
+    self.check(actual == expected, label)
+  }
+
+  def failure_count() Int64 {
+    return self.failures.read()
+  }
+
+  def total_count() Int64 {
+    return self.total.read()
+  }
+}
+
+def temp_base() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+const manifest_digest = "sha256:0f343b0931126a20f133d67c2b018a3a2a3f2f5e3a5b8a4a1f2e3d4c5b6a7980"
+const index_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+const blob_digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+const manifest_media_type = "application/vnd.oci.image.manifest.v1+json"
+
+def main() Int64 {
+  const report = Report.new()
+  const dir = temp_base() + "pokerface-registry-db-" + os.getpid().to_string()
+  case os.mkdir(dir) {
+    (R.ok, _) then { }
+    (R.error, why) then {
+      eprint("db selftest: cannot create " + dir + ": " + why + "\n")
+      return 1
+    }
+  }
+  const path = dir + "/registry.db"
+
+  const db = registry.db.open(path)
+  check_migrations(report, db)
+  check_repositories(report, db)
+  check_manifests(report, db)
+  check_tags(report, db)
+  check_blobs(report, db)
+  check_uploads(report, db)
+  check_cascades(report, db)
+  db.close()
+
+  const reopened = registry.db.open(path)
+  check_restart(report, reopened)
+  check_concurrent_readers(report, reopened)
+  reopened.close()
+
+  cleanup(path, dir)
+
+  if report.failure_count() == 0 {
+    println("registry db: " + report.total_count().to_string() + " checks passed")
+    return 0
+  }
+  println("registry db: " + report.failure_count().to_string() + " of "
+    + report.total_count().to_string() + " checks failed")
+  return 1
+}
+
+def check_migrations(report Report, db registry.db.Database) {
+  report.number(db.schema_version(), 1, "fresh database records schema version 1")
+  report.number(db.applied_versions().length(), 1, "a fresh database has one migration row")
+  report.check(db.ping(), "ping answers on a fresh database")
+  report.text(db.pragma_text("journal_mode"), "wal", "journal mode is WAL")
+  report.number(db.pragma_int("busy_timeout"), 5000, "busy timeout is 5000 ms")
+  report.number(db.pragma_int("foreign_keys"), 1, "foreign keys are enforced")
+  report.check(db.schema_sql("repositories").index_of("name TEXT NOT NULL UNIQUE") >= 0,
+    "repositories.name is unique and not null")
+  report.check(db.schema_sql("manifests").index_of("UNIQUE (repository_id, digest)") >= 0,
+    "manifests are unique per repository and digest")
+  report.check(db.schema_sql("manifests").index_of("size INTEGER NOT NULL CHECK (size >= 0)") >= 0,
+    "manifest sizes are non-negative")
+  report.check(db.schema_sql("tags").index_of("PRIMARY KEY (repository_id, tag)") >= 0,
+    "tags are keyed by repository and tag")
+  report.check(db.schema_sql("tags").index_of("FOREIGN KEY (repository_id, digest)") >= 0,
+    "a tag names a manifest in the same repository")
+  report.check(db.schema_sql("uploads").index_of("CHECK (state IN") >= 0,
+    "upload states are constrained")
+  report.check(db.schema_sql("idx_uploads_expiry") != "", "the upload expiry index exists")
+}
+
+def check_repositories(report Report, db registry.db.Database) {
+  const repo = db.ensure_repository("acme/app")
+  report.check(repo > 0, "ensure_repository answers an id")
+  report.number(db.ensure_repository("acme/app"), repo, "ensure_repository is idempotent")
+  report.check(db.repository_exists("acme/app"), "repository_exists sees the row")
+  report.number(db.repository_id("missing/app"), 0, "a missing repository answers 0")
+}
+
+def check_manifests(report Report, db registry.db.Database) {
+  const repo = db.repository_id("acme/app")
+  const body = "{\"schemaVersion\":2}"
+  report.check(db.put_manifest(repo, manifest_digest, manifest_media_type, body.length(), body),
+    "put_manifest inserts")
+  report.check(!db.put_manifest(repo, manifest_digest, manifest_media_type, body.length(), body),
+    "put_manifest ignores a duplicate digest")
+  report.check(db.manifest_exists(repo, manifest_digest), "manifest_exists sees the row")
+  report.text(db.manifest_media_type(repo, manifest_digest), manifest_media_type,
+    "media type round-trips")
+  report.number(db.manifest_size(repo, manifest_digest), body.length(), "size round-trips")
+  report.text(db.manifest_body(repo, manifest_digest), body, "body round-trips")
+  report.number(db.list_manifest_digests(repo).length(), 1, "one manifest is listed")
+  report.text(db.manifest_body(repo, index_digest), "", "a missing manifest answers an empty body")
+  report.number(db.manifest_size(repo, index_digest), -1, "a missing manifest answers -1")
+  report.check(db.put_manifest(repo, index_digest, "application/vnd.oci.image.index.v1+json", 2, "{}"),
+    "a second manifest inserts")
+}
+
+def check_tags(report Report, db registry.db.Database) {
+  const repo = db.repository_id("acme/app")
+  db.put_tag(repo, "latest", manifest_digest)
+  report.text(db.tag_digest(repo, "latest"), manifest_digest, "tag_digest reads the tag back")
+  db.put_tag(repo, "v1", index_digest)
+  report.number(db.list_tags(repo).length(), 2, "two tags are listed")
+  report.check(db.delete_tag(repo, "v1"), "delete_tag removes the row")
+  report.text(db.tag_digest(repo, "v1"), "", "a deleted tag answers an empty digest")
+  report.check(!db.delete_tag(repo, "v1"), "delete_tag on a missing tag answers false")
+}
+
+def check_blobs(report Report, db registry.db.Database) {
+  const repo = db.repository_id("acme/app")
+  report.check(db.put_blob(repo, blob_digest, 1234), "put_blob inserts")
+  report.check(!db.put_blob(repo, blob_digest, 1234), "put_blob ignores a duplicate digest")
+  report.number(db.blob_size(repo, blob_digest), 1234, "blob_size round-trips")
+  report.check(db.blob_exists(repo, blob_digest), "blob_exists sees the row")
+  report.number(db.blob_size(repo, index_digest), -1, "a missing blob answers -1")
+  report.number(db.list_blob_digests(repo).length(), 1, "one blob is listed")
+}
+
+def check_uploads(report Report, db registry.db.Database) {
+  const repo = db.repository_id("acme/app")
+  const now = registry.db.now_seconds()
+  db.create_upload("up-1", repo, now + 3600)
+  report.text(db.upload_state("up-1"), "pending", "a new upload is pending")
+  report.number(db.upload_repository("up-1"), repo, "the upload names its repository")
+  report.check(db.complete_upload("up-1"), "complete_upload updates the row")
+  report.text(db.upload_state("up-1"), "completed", "the upload is completed")
+  db.create_upload("up-2", repo, now + 3600)
+  report.check(db.cancel_upload("up-2"), "cancel_upload updates the row")
+  report.text(db.upload_state("up-2"), "cancelled", "the upload is cancelled")
+  db.create_upload("up-3", repo, now - 1)
+  report.number(db.expire_uploads(now), 1, "expire_uploads drops the expired pending session")
+  report.text(db.upload_state("up-3"), "", "the expired upload is gone")
+  report.check(!db.delete_upload("up-3"), "delete_upload on a missing row answers false")
+}
+
+def check_cascades(report Report, db registry.db.Database) {
+  const repo = db.repository_id("acme/app")
+  report.check(db.delete_repository(repo), "delete_repository removes the row")
+  report.check(!db.repository_exists("acme/app"), "the repository is gone")
+  report.number(db.list_manifest_digests(repo).length(), 0, "deleting a repository drops its manifests")
+  report.number(db.list_tags(repo).length(), 0, "deleting a repository drops its tags")
+  report.number(db.list_blob_digests(repo).length(), 0, "deleting a repository drops its blobs")
+  report.text(db.upload_state("up-1"), "", "deleting a repository drops its uploads")
+  report.check(!db.delete_repository(repo), "delete_repository on a missing row answers false")
+}
+
+def check_restart(report Report, db registry.db.Database) {
+  report.number(db.schema_version(), 1, "reopening keeps schema version 1")
+  report.number(db.applied_versions().length(), 1, "reopening does not re-run the migration")
+  report.check(db.ping(), "the reopened database answers")
+  report.number(db.repository_id("acme/app"), 0, "data stays deleted across a restart")
+  report.check(db.ensure_repository("acme/app") > 0, "the reopened database accepts writes")
+}
+
+def check_concurrent_readers(report Report, opened registry.db.Database) {
+  const path = opened.path()
+  const writer = registry.db.open(path)
+  const reader = registry.db.open(path)
+  writer.begin()
+  writer.ensure_repository("txn/app")
+  report.number(reader.repository_id("txn/app"), 0, "a second connection does not see an uncommitted write")
+  writer.commit()
+  report.check(reader.repository_id("txn/app") > 0, "a second connection reads after the commit")
+  report.check(reader.ping(), "both connections answer while the other is open")
+  writer.close()
+  reader.close()
+}
+
+def cleanup(path String, dir String) {
+  const (_, _) = os.unlink(path)
+  const (_, _) = os.unlink(path + "-wal")
+  const (_, _) = os.unlink(path + "-shm")
+  const (_, _) = os.rmdir(dir)
+}
+
+def eprint(text String) {
+  const (_, _) = os.write(2, text)
+}
+
+os._exit(main())

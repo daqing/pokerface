@@ -30,11 +30,30 @@ def make_config(data_dir String, store_root String, backend String) registry.con
   return registry.config.RegistryConfig.new(
     registry.config.RegistryListen.new("127.0.0.1", 5000),
     data_dir,
+    data_dir + "/registry.db",
     registry.config.RegistryStore.new(backend, store_root),
     registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
     data_dir + "/registry.shutdown",
     "<test>"
   )
+}
+
+class FakeDb {
+  def init(ok Bool) {
+    self.ok = ok
+  }
+
+  def ping() Bool {
+    return self.ok
+  }
+
+  def path() String {
+    return "/tmp/fake-registry.db"
+  }
+}
+
+def ready_db() FakeDb {
+  return FakeDb.new(true)
 }
 
 def dir_exists(path String) Bool {
@@ -61,10 +80,10 @@ def test_ready_when_directories_are_writable() {
   const data = health_tmp("data")
   const store = health_tmp("store")
   const config = make_config(data, store, "fs")
-  const response = reg_health.ready_response(config)
+  const response = reg_health.ready_response(config, ready_db())
   expect_equal(200, response.status)
   expect_equal("ready\n", response.body)
-  expect_true(reg_health.ready(config))
+  expect_true(reg_health.ready(config, ready_db()))
   expect_true(dir_exists(data))
   expect_true(dir_exists(store))
   case os.list_dir(data) {
@@ -78,8 +97,8 @@ def test_ready_is_503_when_data_dir_is_not_usable() {
   write_blocking_file(blocked)
   const store = health_tmp("store-ok")
   const config = make_config(blocked, store, "fs")
-  expect_true(!reg_health.ready(config))
-  const response = reg_health.ready_response(config)
+  expect_true(!reg_health.ready(config, ready_db()))
+  const response = reg_health.ready_response(config, ready_db())
   expect_equal(503, response.status)
   expect_true(response.body.index_of("data_dir") >= 0)
 }
@@ -89,8 +108,8 @@ def test_ready_is_503_when_store_is_not_usable() {
   const blocked = health_tmp("blocked-store")
   write_blocking_file(blocked)
   const config = make_config(data, blocked, "fs")
-  expect_true(!reg_health.ready(config))
-  const response = reg_health.ready_response(config)
+  expect_true(!reg_health.ready(config, ready_db()))
+  const response = reg_health.ready_response(config, ready_db())
   expect_equal(503, response.status)
   expect_true(response.body.index_of("store") >= 0)
 }
@@ -98,10 +117,22 @@ def test_ready_is_503_when_store_is_not_usable() {
 def test_s3_store_is_not_ready_until_implemented() {
   const data = health_tmp("data-s3")
   const config = make_config(data, "bucket/key", "s3")
-  expect_true(!reg_health.ready(config))
-  const response = reg_health.ready_response(config)
+  expect_true(!reg_health.ready(config, ready_db()))
+  const response = reg_health.ready_response(config, ready_db())
   expect_equal(503, response.status)
   expect_true(response.body.index_of("s3 backend is not implemented") >= 0)
+}
+
+def test_ready_is_503_when_the_database_is_down() {
+  const data = health_tmp("data-db-down")
+  const store = health_tmp("store-db-down")
+  const config = make_config(data, store, "fs")
+  const db = FakeDb.new(false)
+  expect_true(!reg_health.ready(config, db))
+  const response = reg_health.ready_response(config, db)
+  expect_equal(503, response.status)
+  expect_true(response.body.index_of("db: /tmp/fake-registry.db") >= 0)
+  expect_true(response.body.index_of("SELECT 1 failed") >= 0)
 }
 
 def test_method_not_allowed() {
