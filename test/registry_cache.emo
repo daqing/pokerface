@@ -1,0 +1,267 @@
+// T2.15 tests for caching policy — run with `emo test`.
+//
+// The ETag matcher is a table test; the handler legs reuse the T2.9/T2.8
+// fakes to pin the headers on GET/HEAD, the 304 on an If-None-Match hit,
+// the short policy on tag manifests versus the immutable one on digest
+// manifests, and no-cache on the presigned 307.
+
+const blobs = registry.blobs
+const manifests = registry.manifests
+const cache = registry.cache
+const api = registry.api
+
+require "httpd"
+require "json"
+require "crypto"
+
+const digest_value = "sha256:0f343b0931126a20f133d67c2b018a3a2a3f2f5e3a5b8a4a1f2e3d4c5b6a7980"
+const manifest_type = "application/vnd.oci.image.manifest.v1+json"
+
+// ---------------------------------------------------------------------------
+// The ETag matcher.
+
+def test_etag_matches_table() {
+  const quoted = "\"" + digest_value + "\""
+  expect_true(cache.etag_matches(quoted, digest_value))
+  expect_true(cache.etag_matches(digest_value, digest_value))
+  expect_true(cache.etag_matches("W/" + quoted, digest_value))
+  expect_true(cache.etag_matches("*", digest_value))
+  expect_true(cache.etag_matches(" \"sha256:aaaa\" , " + quoted + " , \"sha256:bbbb\"", digest_value))
+  expect_true(!cache.etag_matches("", digest_value))
+  expect_true(!cache.etag_matches("\"sha256:aaaa\"", digest_value))
+  expect_true(!cache.etag_matches("sha256:aaaa", digest_value))
+  // `*` answers on presence alone — the handlers only ask when content
+  // exists, so an empty digest never reaches here.
+  expect_true(cache.etag_matches("*", ""))
+}
+
+// ---------------------------------------------------------------------------
+// Fakes.
+
+class CacheFakeLinks {
+  def init(found Bool) {
+    self.found = Box.new(found)
+  }
+
+  def linked(repository String, digest String) (R, registry.blobs.BlobLink) {
+    return (R.ok, registry.blobs.BlobLink.new(self.found.read(), 5))
+  }
+}
+
+class CacheFakeStore {
+  def init(body String) {
+    self.body = Box.new(body)
+  }
+
+  def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put")
+  }
+
+  def put_file(digest String, source String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put_file")
+  }
+
+  def get(digest String) (R, String) {
+    return (R.ok, self.body.read())
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    return (R.error, "fake: range")
+  }
+
+  def head(digest String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, 5, true))
+  }
+
+  def delete(digest String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def presign_get(digest String, ttl_seconds Int64) String {
+    return ""
+  }
+}
+
+class CachePresignStore {
+  def init(url String) {
+    self.url = Box.new(url)
+  }
+
+  def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put")
+  }
+
+  def put_file(digest String, source String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put_file")
+  }
+
+  def get(digest String) (R, String) {
+    return (R.error, registry.blobstore.not_found(digest))
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    return (R.error, "fake: range")
+  }
+
+  def head(digest String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, 5, true))
+  }
+
+  def delete(digest String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def presign_get(digest String, ttl_seconds Int64) String {
+    return self.url.read()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers.
+
+def make_request(method String, path String) httpd.Request {
+  return httpd.Request.new(
+    method: method,
+    target: path,
+    path: path,
+    query: Map.new(),
+    proto: "HTTP/1.1",
+    headers: [],
+    body: "",
+    params: Map.new()
+  )
+}
+
+def make_request_header(method String, path String, name String, value String) httpd.Request {
+  return httpd.Request.new(
+    method: method,
+    target: path,
+    path: path,
+    query: Map.new(),
+    proto: "HTTP/1.1",
+    headers: [(name, value)],
+    body: "",
+    params: Map.new()
+  )
+}
+
+def header_value(headers Array[(String, String)], name String) String {
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == name.lower() {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+def manifest_body() String {
+  return "{\"schemaVersion\":2,\"mediaType\":\"" + manifest_type + "\",\"config\":{},\"layers\":[]}"
+}
+
+def manifest_digest_of(body String) String {
+  return "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+class CacheFakeManifests {
+  def init(body String) {
+    self.body = Box.new(body)
+  }
+
+  def lookup(repository String, reference String) (R, registry.manifests.ManifestPayload) {
+    const body = self.body.read()
+    return (R.ok, registry.manifests.ManifestPayload.new(true, manifest_digest_of(body), manifest_type, body))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Blobs.
+
+def test_blob_get_carries_immutable_caching() {
+  const response = blobs.handle(make_request("GET", "/v2/acme/app/blobs/" + digest_value), CacheFakeLinks.new(true), CacheFakeStore.new("hello"))
+  expect_equal(200, response.status)
+  expect_equal("\"" + digest_value + "\"", header_value(response.headers, "etag"))
+  expect_equal("public, max-age=31536000, immutable", header_value(response.headers, "cache-control"))
+}
+
+def test_blob_head_carries_the_validators() {
+  const response = blobs.handle(make_request("HEAD", "/v2/acme/app/blobs/" + digest_value), CacheFakeLinks.new(true), CacheFakeStore.new("hello"))
+  expect_equal(200, response.status)
+  expect_equal("\"" + digest_value + "\"", header_value(response.headers, "etag"))
+  expect_equal("public, max-age=31536000, immutable", header_value(response.headers, "cache-control"))
+}
+
+def test_blob_if_none_match_hit_answers_304() {
+  const request = make_request_header("GET", "/v2/acme/app/blobs/" + digest_value, "If-None-Match", "\"" + digest_value + "\"")
+  const response = blobs.handle(request, CacheFakeLinks.new(true), CacheFakeStore.new("hello"))
+  expect_equal(304, response.status)
+  expect_equal("", response.body)
+  expect_equal("\"" + digest_value + "\"", header_value(response.headers, "etag"))
+  expect_equal("public, max-age=31536000, immutable", header_value(response.headers, "cache-control"))
+}
+
+def test_blob_if_none_match_star_and_weak_forms() {
+  const star = blobs.handle(make_request_header("GET", "/v2/acme/app/blobs/" + digest_value, "If-None-Match", "*"), CacheFakeLinks.new(true), CacheFakeStore.new("hello"))
+  expect_equal(304, star.status)
+  const weak = blobs.handle(make_request_header("GET", "/v2/acme/app/blobs/" + digest_value, "If-None-Match", "W/\"" + digest_value + "\""), CacheFakeLinks.new(true), CacheFakeStore.new("hello"))
+  expect_equal(304, weak.status)
+  const miss = blobs.handle(make_request_header("GET", "/v2/acme/app/blobs/" + digest_value, "If-None-Match", "\"sha256:aaaa\""), CacheFakeLinks.new(true), CacheFakeStore.new("hello"))
+  expect_equal(200, miss.status)
+}
+
+def test_the_presigned_307_is_not_cached() {
+  const response = blobs.handle(make_request("GET", "/v2/acme/app/blobs/" + digest_value), CacheFakeLinks.new(true), CachePresignStore.new("https://minio.local/blob?sig=1"))
+  expect_equal(307, response.status)
+  expect_equal("no-cache", header_value(response.headers, "cache-control"))
+}
+
+// ---------------------------------------------------------------------------
+// Manifests.
+
+def test_tag_manifest_gets_the_short_policy() {
+  const body = manifest_body()
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/latest"), CacheFakeManifests.new(body), CacheFakeLinks.new(false), CacheFakeWriter.new())
+  expect_equal(200, response.status)
+  expect_equal("\"" + manifest_digest_of(body) + "\"", header_value(response.headers, "etag"))
+  expect_equal("public, max-age=60, must-revalidate", header_value(response.headers, "cache-control"))
+}
+
+def test_digest_manifest_gets_the_immutable_policy() {
+  const body = manifest_body()
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/" + manifest_digest_of(body)), CacheFakeManifests.new(body), CacheFakeLinks.new(false), CacheFakeWriter.new())
+  expect_equal(200, response.status)
+  expect_equal("public, max-age=31536000, immutable", header_value(response.headers, "cache-control"))
+}
+
+def test_manifest_if_none_match_hit_answers_304() {
+  const body = manifest_body()
+  const request = make_request_header("GET", "/v2/acme/app/manifests/latest", "If-None-Match", "\"" + manifest_digest_of(body) + "\"")
+  const response = manifests.handle(request, CacheFakeManifests.new(body), CacheFakeLinks.new(false), CacheFakeWriter.new())
+  expect_equal(304, response.status)
+  expect_equal("", response.body)
+  expect_equal("\"" + manifest_digest_of(body) + "\"", header_value(response.headers, "etag"))
+  expect_equal("public, max-age=60, must-revalidate", header_value(response.headers, "cache-control"))
+}
+
+def test_manifest_head_carries_the_policy() {
+  const body = manifest_body()
+  const response = manifests.handle(make_request("HEAD", "/v2/acme/app/manifests/latest"), CacheFakeManifests.new(body), CacheFakeLinks.new(false), CacheFakeWriter.new())
+  expect_equal(200, response.status)
+  expect_equal("public, max-age=60, must-revalidate", header_value(response.headers, "cache-control"))
+  expect_equal("\"" + manifest_digest_of(body) + "\"", header_value(response.headers, "etag"))
+}
+
+class CacheFakeWriter {
+  def init() {
+  }
+
+  def put(repository String, media_type String, body String) (R, String) {
+    return (R.ok, "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+  }
+
+  def tag(repository String, tag String, digest String) (R, Bool) {
+    return (R.ok, true)
+  }
+}

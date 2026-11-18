@@ -360,7 +360,7 @@ Exit criteria:
 | [x] | T2.12 | Manifest PUT and tag updates | T2.3, T2.10, T2.11 | 2-3h |
 | [x] | T2.13 | Resolve / metadata API | T2.8, T2.12 | 2h |
 | [x] | T2.14 | Authentication and token service | T2.7 | 3-4h |
-| [ ] | T2.15 | Cache headers, ETag, and CDN behavior | T2.8, T2.9 | 2h |
+| [x] | T2.15 | Cache headers, ETag, and CDN behavior | T2.8, T2.9 | 2h |
 | [ ] | T2.16 | Tag listing and pagination | T2.12 | 2h |
 | [ ] | T2.17 | Deployment: registry + MinIO + Caddy | T2.6, T2.14 | 3h |
 | [ ] | T2.18 | Observability and audit logging | T2.1 | 2-3h |
@@ -553,6 +553,8 @@ Suggested tables:
 **Acceptance**: Blobs return long-lived caching plus `immutable`; manifests return short caching or `no-cache`; `If-None-Match` hits return 304; new requests see the new digest after a tag update; CDN caching never pins an old manifest for long.
 
 **Depends on**: T2.8, T2.9 · **Estimate**: 2h
+
+> **Notes** (2026-11-19, ~1.5h): Done. New `registry/cache.emo` carries the policy and the validators: blobs answer `ETag: "sha256:…"` (the digest is the validator) with `Cache-Control: public, max-age=31536000, immutable` on GET **and** HEAD; manifests answer the same immutable pair when fetched **by digest** and `public, max-age=60, must-revalidate` when fetched **by tag** — a tag update therefore takes effect within a minute on any honoring CDN and never pins an old manifest longer; the presigned 307 is `no-cache` (a cached redirect could hand out an expired signature; the MinIO-served object bytes carry their own headers, noted for the CDN/ops docs). `If-None-Match` follows RFC 7232: `*`, weak `W/`, comma lists, optional quoting — a hit answers 304 with the same validators and no body, before any body work; a mismatch answers 200 fresh, and a tag update makes the old ETag miss immediately (verified live: PUT a new manifest to a tag, the next GET serves the new digest). Tests: 11 in `test/registry_cache.emo` (matcher table, blob/manifest GET/HEAD headers, 304 forms, 307 no-cache, tag-vs-digest policies); `emo test` 470/470. Manually verified with curl over a live registry (headers, 304s on blob and manifest, freshness after a tag update). Gotcha: arrays have no `+` concatenation — a `with_cache` helper appends the policy headers; the tag-vs-digest flag passed to the manifests handler was initially inverted (digest-valid ≠ by-tag), caught by the tests.
 
 #### T2.16 Tag Listing and Pagination
 

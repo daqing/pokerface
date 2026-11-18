@@ -1,0 +1,121 @@
+// T2.15: caching policy for the distribution API. Blobs are immutable —
+// their digest is both the ETag and the cache key — so they carry long-lived
+// caching with `immutable`. Manifests are mutable through tags: a tag
+// reference answers a short `max-age` with `must-revalidate` (a tag update
+// takes effect within the minute, never pinned longer), while a manifest
+// fetched by digest is immutable like a blob. `If-None-Match` hits answer
+// 304 with the same validators and no body.
+//
+// The ETag is the quoted digest (`"sha256:…"`); the comparison follows RFC
+// 7232: `*` matches anything present, the `W/` weak prefix compares equal,
+// the list form matches any member, and the quoting is optional on the
+// client side.
+// Spec: docs/spec/registry-cache.md.
+
+const blob_cache_control = "public, max-age=31536000, immutable"
+const manifest_tag_cache_control = "public, max-age=60, must-revalidate"
+const redirect_cache_control = "no-cache"
+
+// The response headers for immutable content: the digest is the validator.
+def blob_headers(digest String) Array[(String, String)] {
+  return [
+    ("ETag", "\"" + digest + "\""),
+    ("Cache-Control", blob_cache_control)
+  ]
+}
+
+// A manifest fetched by tag stays fresh for a minute and must revalidate
+// after that; by digest it is immutable.
+def manifest_headers(digest String, by_tag Bool) Array[(String, String)] {
+  var cache_control = blob_cache_control
+  if by_tag {
+    cache_control = manifest_tag_cache_control
+  }
+  return [
+    ("ETag", "\"" + digest + "\""),
+    ("Cache-Control", cache_control)
+  ]
+}
+
+// Appends the cache headers to a response's header list (arrays have no
+// concatenation operator).
+def with_cache(headers Array[(String, String)], cache Array[(String, String)]) Array[(String, String)] {
+  var out = headers
+  var i = 0
+  while i < cache.length() {
+    out = out.append(cache[i])
+    i = i + 1
+  }
+  return out
+}
+
+// The 304 answer: the same validators, an empty body.
+def not_modified(headers Array[(String, String)]) httpd.Response {
+  return httpd.response(304, headers, "")
+}
+
+// Whether an If-None-Match header matches the digest: `*` matches anything
+// present, weak `W/` prefixes compare equal, the list form matches any
+// member, quotes are optional.
+def etag_matches(header String, digest String) Bool {
+  if header == "" {
+    return false
+  }
+  if trim(header) == "*" {
+    return true
+  }
+  var start = 0
+  var i = 0
+  while i <= header.length() {
+    if i == header.length() || header.substring(i, 1) == "," {
+      if item_matches(header.substring(start, i - start), digest) {
+        return true
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return false
+}
+
+def item_matches(item String, digest String) Bool {
+  var text = trim(item)
+  if text.starts_with("W/") {
+    text = text.substring(2, text.length() - 2)
+  }
+  if text.starts_with("\"") && text.length() >= 2 && ends_with_quote(text) {
+    text = text.substring(1, text.length() - 2)
+  }
+  return text == digest
+}
+
+def ends_with_quote(text String) Bool {
+  return text.substring(text.length() - 1, 1) == "\""
+}
+
+def trim(text String) String {
+  var start = 0
+  var end = text.length()
+  while start < end {
+    const c = text.substring(start, 1)
+    if c == " " || c == "\t" {
+      start = start + 1
+    } else {
+      break
+    }
+  }
+  while end > start {
+    const c = text.substring(end - 1, 1)
+    if c == " " || c == "\t" {
+      end = end - 1
+    } else {
+      break
+    }
+  }
+  return text.substring(start, end - start)
+}
+
+// Whether the request's If-None-Match matches, read off the request.
+def not_requested(req httpd.Request, digest String) Bool {
+  return etag_matches(req.header("If-None-Match"), digest)
+}

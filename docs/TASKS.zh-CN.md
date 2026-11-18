@@ -360,7 +360,7 @@ images:
 | [x] | T2.12 | Manifest PUT 与 tag 更新 | T2.3、T2.10、T2.11 | 2-3h |
 | [x] | T2.13 | 解析 / 元数据 API | T2.8、T2.12 | 2h |
 | [x] | T2.14 | 认证与 Token 服务 | T2.7 | 3-4h |
-| [ ] | T2.15 | 缓存头、ETag 与 CDN 行为 | T2.8、T2.9 | 2h |
+| [x] | T2.15 | 缓存头、ETag 与 CDN 行为 | T2.8、T2.9 | 2h |
 | [ ] | T2.16 | Tag 列表与分页 | T2.12 | 2h |
 | [ ] | T2.17 | 部署编排：Registry + MinIO + Caddy | T2.6、T2.14 | 3h |
 | [ ] | T2.18 | 可观测性与审计 | T2.1 | 2-3h |
@@ -553,6 +553,8 @@ images:
 **验收**：Blob 返回长缓存 + `immutable`；Manifest 返回短缓存或 `no-cache`；`If-None-Match` 命中返回 304；tag 更新后新请求能看到新 digest；不因 CDN 缓存导致旧 Manifest 长期不更新。
 
 **依赖**：T2.8、T2.9 · **预估**：2h
+
+> **备注**（2026-11-19，约 1.5h）：已完成。新增 `registry/cache.emo` 承载策略与验证器：blob 在 GET **与** HEAD 上回答 `ETag: "sha256:…"`（摘要即验证器）与 `Cache-Control: public, max-age=31536000, immutable`；manifest 按 **digest** 拉取时同样不可变，按 **tag** 拉取时为 `public, max-age=60, must-revalidate`——tag 更新在任何遵守规范的 CDN 上最多一分钟生效，旧 manifest 绝不被钉住更久；预签名 307 为 `no-cache`（缓存的重定向可能发放过期签名；MinIO 侧对象字节自带响应头，已写进 CDN/运维文档）。`If-None-Match` 遵循 RFC 7232：`*`、弱 `W/`、逗号列表、可选引号都匹配——命中在进入任何取体工作之前返回 304（同样的验证器、无 body），不匹配返回全新 200；tag 更新后旧 ETag 立即失效（实测：向同一 tag PUT 新 manifest，下一次 GET 立即返回新 digest）。测试：`test/registry_cache.emo` 11 例（匹配器表、blob/manifest GET/HEAD 头、304 形态、307 no-cache、tag 与 digest 两种策略）；`emo test` 470/470。已用 curl 在实机验证（响应头、blob 与 manifest 的 304、tag 更新后的新鲜度）。踩坑：数组没有 `+` 拼接——用 `with_cache` 助手追加策略头；传给 manifests 处理器的 tag/digest 标志起初写反（digest-valid ≠ by-tag），测试抓到。
 
 #### T2.16 Tag 列表与分页
 

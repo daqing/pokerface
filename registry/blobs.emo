@@ -114,9 +114,12 @@ def handle(req httpd.Request, links BlobLinks, store registry.blobstore.BlobStor
           if req.method == "HEAD" {
             return head_response(digest, size_of(info.size, link.size))
           }
+          if registry.cache.not_requested(req, digest) {
+            return registry.cache.not_modified(registry.cache.blob_headers(digest))
+          }
           const url = store.presign_get(digest, 0)
           if url != "" {
-            return httpd.response(307, [("Location", url), ("Docker-Content-Digest", digest)], "")
+            return httpd.response(307, [("Location", url), ("Cache-Control", registry.cache.redirect_cache_control), ("Docker-Content-Digest", digest)], "")
           }
           case store.get(digest) {
             (R.error, why) then {
@@ -126,11 +129,11 @@ def handle(req httpd.Request, links BlobLinks, store registry.blobstore.BlobStor
               return registry.api.server_error("blob read failed", why)
             }
             (R.ok, body) then {
-              return httpd.response(200, [
+              return httpd.response(200, registry.cache.with_cache([
                 ("Content-Type", content_type),
                 ("Docker-Content-Digest", digest),
                 ("Content-Length", body.to_bytes().length().to_string())
-              ], body)
+              ], registry.cache.blob_headers(digest)), body)
             }
           }
         }
@@ -147,10 +150,10 @@ def size_of(store_size Int64, link_size Int64) Int64 {
 }
 
 def head_response(digest String, size Int64) httpd.Response {
-  var headers = [
+  var headers = registry.cache.with_cache([
     ("Content-Type", content_type),
     ("Docker-Content-Digest", digest)
-  ]
+  ], registry.cache.blob_headers(digest))
   if size >= 0 {
     headers = headers.append(("Content-Length", size.to_string()))
   }
