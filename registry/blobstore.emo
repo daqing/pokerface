@@ -1,0 +1,404 @@
+// T2.4: the blob storage abstraction. A digest names immutable bytes; the
+// store answers put/put_file/get/read_range/head/delete and, when a backend
+// can hand out a direct URL, presign_get.
+//
+// The local backend writes under <root>/sha256/<hex>:
+//
+//   <hex>        the blob bytes
+//   <hex>.size   its byte count, so head and Content-Length need no stat
+//                (Emo's os has none) and no read of a multi-megabyte layer
+//   .tmp-...     a write in progress; never served
+//
+// A put streams to a temp file, hashing and counting as it goes, verifies the
+// digest, records the size, and renames the temp file into place — the rename
+// is the commit point, so a reader never sees a partial blob. The size record
+// is written first: a crash between the two renames leaves an orphan size
+// record (harmless, cleaned by the next put) instead of a blob whose length
+// is unknown.
+//
+// Paths are built from the validated hex only, so a digest can never escape
+// the root. Missing content is an ordinary error tuple whose message starts
+// with "blobstore: not found:"; is_not_found() tells it apart from a backend
+// failure, and the route layer maps it to 404 BLOB_UNKNOWN.
+//
+// presign_get answers "" for backends without presigning (the local one); the
+// caller then serves the bytes from get/read_range. The S3 backend (T2.6)
+// returns a real URL. Spec: docs/spec/registry-blobstore.md.
+
+require "os"
+require "file"
+require "crypto"
+
+const chunk_size = 65536
+const digest_dir = "sha256"
+const size_suffix = ".size"
+const temp_prefix = ".tmp-"
+const not_found_prefix = "blobstore: not found: "
+
+class BlobInfo {
+  def init(digest String, size Int64, exists Bool) {
+    self.digest = digest
+    self.size = size
+    self.exists = exists
+  }
+}
+
+interface BlobStore {
+  def put(digest String, body String) (R, BlobInfo)
+  def put_file(digest String, source String) (R, BlobInfo)
+  def get(digest String) (R, String)
+  def read_range(digest String, offset Int64, length Int64) (R, String)
+  def head(digest String) (R, BlobInfo)
+  def delete(digest String) (R, Bool)
+  def presign_get(digest String, ttl_seconds Int64) String
+}
+
+def is_not_found(reason String) Bool {
+  return reason.starts_with(not_found_prefix)
+}
+
+def not_found(digest String) String {
+  return not_found_prefix + digest
+}
+
+// Creates <root>/sha256 and answers the store. A root that is a file, or one
+// that cannot be created, is a startup error.
+def open(root String) (R, LocalStore) {
+  if root == "" {
+    return (R.error, "blobstore: root must not be empty")
+  }
+  case ensure_dir(root) {
+    (R.error, why) then { return (R.error, "blobstore: " + why) }
+    (R.ok, _) then {
+      case ensure_dir(root + "/" + digest_dir) {
+        (R.error, why) then { return (R.error, "blobstore: " + why) }
+        (R.ok, _) then { return (R.ok, LocalStore.new(root)) }
+      }
+    }
+  }
+}
+
+def ensure_dir(path String) (R, Bool) {
+  case os.mkdir(path) {
+    (R.ok, _) then { return (R.ok, true) }
+    (R.error, _) then {
+      case os.list_dir(path) {
+        (R.ok, _) then { return (R.ok, true) }
+        (R.error, why) then { return (R.error, path + ": not a directory: " + why) }
+      }
+    }
+  }
+}
+
+class LocalStore {
+  def init(root String) {
+    self.root = root
+  }
+
+  def root_path() String {
+    return self.root
+  }
+
+  def dir() String {
+    return self.root + "/" + digest_dir
+  }
+
+  def blob_path(digest String) (R, String) {
+    case validate(self.dir(), digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, path) then { return (R.ok, path) }
+    }
+  }
+
+  def size_path(digest String) (R, String) {
+    case self.blob_path(digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, path) then { return (R.ok, path + size_suffix) }
+    }
+  }
+
+  def put(digest String, body String) (R, BlobInfo) {
+    case self.prepare(digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, paths) then {
+        const (blob, record) = paths
+        const actual = "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+        if actual != digest {
+          return (R.error, "blobstore: " + digest + ": digest mismatch — the body hashes to " + actual)
+        }
+        const size = body.to_bytes().length()
+        if existing_blob(blob) && has_size_record(record) {
+          return (R.ok, BlobInfo.new(digest, size, true))
+        }
+        const temp = temp_path(blob)
+        case file.write(temp, body) {
+          (R.error, why) then { return (R.error, "blobstore: cannot write " + temp + ": " + why) }
+          (R.ok, _) then {
+            case commit(temp, blob, record, size) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, _) then { return (R.ok, BlobInfo.new(digest, size, true)) }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  def put_file(digest String, source String) (R, BlobInfo) {
+    case self.prepare(digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, paths) then {
+        const (blob, record) = paths
+        if existing_blob(blob) && has_size_record(record) {
+          return (R.ok, BlobInfo.new(digest, read_size(record), true))
+        }
+        const temp = temp_path(blob)
+        case copy_verified(source, temp, digest) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, size) then {
+            case commit(temp, blob, record, size) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, _) then { return (R.ok, BlobInfo.new(digest, size, true)) }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  def get(digest String) (R, String) {
+    case self.blob_path(digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, blob) then {
+        if !existing_blob(blob) {
+          return (R.error, not_found(digest))
+        }
+        case file.read(blob) {
+          (R.error, why) then { return (R.error, "blobstore: cannot read " + blob + ": " + why) }
+          (R.ok, body) then { return (R.ok, body) }
+        }
+      }
+    }
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    if offset < 0 || length < 0 {
+      return (R.error, "blobstore: " + digest + ": range needs a non-negative offset and length")
+    }
+    case self.get(digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, body) then {
+        const size = body.to_bytes().length()
+        if offset > size {
+          return (R.error, "blobstore: " + digest + ": range starts at " + offset.to_string() + ", past the end at " + size.to_string())
+        }
+        var take = length
+        const available = size - offset
+        if take > available {
+          take = available
+        }
+        return (R.ok, body.substring(offset, take))
+      }
+    }
+  }
+
+  // Present/absent and its size. Size -1 means the bytes are there but the
+  // size record is missing or unreadable (a crash left it behind); the caller
+  // can fall back to get()'s body length.
+  def head(digest String) (R, BlobInfo) {
+    case self.prepare(digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, paths) then {
+        const (blob, record) = paths
+        if !existing_blob(blob) {
+          return (R.ok, BlobInfo.new(digest, -1, false))
+        }
+        case file.read(record) {
+          (R.error, _) then { return (R.ok, BlobInfo.new(digest, -1, true)) }
+          (R.ok, text) then {
+            if !all_digits(text) {
+              return (R.ok, BlobInfo.new(digest, -1, true))
+            }
+            return (R.ok, BlobInfo.new(digest, text.to_int64(), true))
+          }
+        }
+      }
+    }
+  }
+
+  def delete(digest String) (R, Bool) {
+    case self.prepare(digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, paths) then {
+        const (blob, record) = paths
+        var removed = false
+        if existing_blob(blob) {
+          case os.unlink(blob) {
+            (R.error, why) then { return (R.error, "blobstore: cannot delete " + blob + ": " + why) }
+            (R.ok, _) then { removed = true }
+          }
+        }
+        const (_, _) = os.unlink(record)
+        return (R.ok, removed)
+      }
+    }
+  }
+
+  def presign_get(digest String, ttl_seconds Int64) String {
+    return ""
+  }
+
+  // Validated paths for one digest: the blob and its size record.
+  def prepare(digest String) (R, (String, String)) {
+    case validate(self.dir(), digest) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, blob) then { return (R.ok, (blob, blob + size_suffix)) }
+    }
+  }
+}
+
+def validate(dir String, digest String) (R, String) {
+  const hex = registry.digest.hex(digest)
+  if hex == "" {
+    return (R.error, "blobstore: invalid digest '" + digest + "' (expected sha256:<64 lowercase hex>)")
+  }
+  return (R.ok, dir + "/" + hex)
+}
+
+def temp_path(blob String) String {
+  const slash = blob.length()
+  const name = blob.substring(slash - 64, 64)
+  return blob.substring(0, slash - 64) + temp_prefix + os.getpid().to_string() + "-" + name
+}
+
+// Commits a fully written, digest-verified temp file: record the size first,
+// then rename the bytes into place. A failed rename removes the temp file and
+// leaves any renamed size record behind — harmless, and the next put rewrites
+// it.
+def commit(temp String, blob String, record String, size Int64) (R, Bool) {
+  const record_temp = record + temp_prefix + os.getpid().to_string()
+  case file.write(record_temp, size.to_string()) {
+    (R.error, why) then {
+      os.unlink(temp)
+      return (R.error, "blobstore: cannot write " + record_temp + ": " + why)
+    }
+    (R.ok, _) then {
+      case os.rename(record_temp, record) {
+        (R.error, why) then {
+          os.unlink(temp)
+          os.unlink(record_temp)
+          return (R.error, "blobstore: cannot record the size at " + record + ": " + why)
+        }
+        (R.ok, _) then {
+          case os.rename(temp, blob) {
+            (R.error, why) then {
+              os.unlink(temp)
+              return (R.error, "blobstore: cannot move " + temp + " into place: " + why)
+            }
+            (R.ok, _) then { return (R.ok, true) }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Streams source into temp, hashing and counting; verifies the digest before
+// answering the size. The temp file is removed on every failure.
+def copy_verified(source String, temp String, digest String) (R, Int64) {
+  case os.open_read(source) {
+    (R.error, why) then { return (R.error, "blobstore: cannot read " + source + ": " + why) }
+    (R.ok, in_fd) then {
+      case os.open_write(temp) {
+        (R.error, why) then {
+          const (_, _) = os.close(in_fd)
+          return (R.error, "blobstore: cannot create " + temp + ": " + why)
+        }
+        (R.ok, out_fd) then {
+          const hash = crypto.sha2.new()
+          var size = 0
+          var failure = ""
+          while true {
+            case os.read(in_fd, chunk_size) {
+              (R.error, why) then {
+                failure = "read from " + source + " failed: " + why
+                break
+              }
+              (R.ok, chunk) then {
+                if chunk == "" {
+                  break
+                }
+                case os.write(out_fd, chunk) {
+                  (R.error, why) then {
+                    failure = "write to " + temp + " failed: " + why
+                    break
+                  }
+                  (R.ok, _) then {
+                    hash.write(chunk.to_bytes())
+                    size = size + chunk.length()
+                  }
+                }
+              }
+            }
+          }
+          const (_, _) = os.close(in_fd)
+          const (_, _) = os.close(out_fd)
+          if failure != "" {
+            os.unlink(temp)
+            return (R.error, "blobstore: " + failure)
+          }
+          const actual = "sha256:" + crypto.hex_encode(hash.sum())
+          if actual != digest {
+            os.unlink(temp)
+            return (R.error, "blobstore: " + digest + ": digest mismatch — the source hashes to " + actual)
+          }
+          return (R.ok, size)
+        }
+      }
+    }
+  }
+}
+
+def existing_blob(path String) Bool {
+  case os.open_read(path) {
+    (R.error, _) then { return false }
+    (R.ok, fd) then {
+      const (_, _) = os.close(fd)
+      return true
+    }
+  }
+}
+
+def has_size_record(path String) Bool {
+  case file.read(path) {
+    (R.error, _) then { return false }
+    (R.ok, _) then { return true }
+  }
+}
+
+def read_size(path String) Int64 {
+  case file.read(path) {
+    (R.error, _) then { return -1 }
+    (R.ok, text) then {
+      if all_digits(text) {
+        return text.to_int64()
+      }
+      return -1
+    }
+  }
+}
+
+def all_digits(text String) Bool {
+  if text == "" {
+    return false
+  }
+  var i = 0
+  while i < text.length() {
+    const c = text.substring(i, 1)
+    if c != "0" && c != "1" && c != "2" && c != "3" && c != "4" && c != "5" && c != "6" && c != "7" && c != "8" && c != "9" {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}

@@ -1,0 +1,31 @@
+// T2.4: the one digest shape the registry stores and serves — "sha256:"
+// followed by exactly 64 lowercase hex characters. Blob keys, manifest
+// digests, and layer diff ids all go through here, so the store's path
+// builder and the document parser cannot disagree about what is valid.
+
+const prefix = "sha256:"
+const hex_length = 64
+const lower_hex = "0123456789abcdef"
+
+// The hex part, or "" for anything that is not `sha256:<64 lowercase hex>`.
+def hex(digest String) String {
+  if digest.length() != prefix.length() + hex_length {
+    return ""
+  }
+  if !digest.starts_with(prefix) {
+    return ""
+  }
+  const body = digest.substring(prefix.length(), hex_length)
+  var i = 0
+  while i < hex_length {
+    if lower_hex.index_of(body.substring(i, 1)) < 0 {
+      return ""
+    }
+    i = i + 1
+  }
+  return body
+}
+
+def valid(digest String) Bool {
+  return hex(digest) != ""
+}

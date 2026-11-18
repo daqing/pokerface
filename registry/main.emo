@@ -68,6 +68,15 @@ def main() Int64 {
       // Migrations run here, once; a failure ends start-up with SQLite's own
       // message. Requests then probe with short-lived connections.
       registry.db.open(config.db_path).close()
+      if config.store.backend == "fs" {
+        case registry.blobstore.open(config.store.root) {
+          (R.error, why) then {
+            eprint(why + "\n")
+            return 1
+          }
+          (R.ok, _) then { }
+        }
+      }
       return serve(config)
     }
   }

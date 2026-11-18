@@ -349,7 +349,7 @@ Exit criteria:
 | [x] | T2.1 | Service skeleton, configuration, and health checks | T1.2 | 2h |
 | [x] | T2.2 | SQLite data layer and migrations | T2.1 | 2-3h |
 | [x] | T2.3 | OCI manifest / index model and validation | T1.5 | 2-3h |
-| [ ] | T2.4 | BlobStore interface and local filesystem backend | T2.1 | 2h |
+| [x] | T2.4 | BlobStore interface and local filesystem backend | T2.1 | 2h |
 | [ ] | T2.5 | AWS SigV4 signing and presigned URLs | T2.1 | 3h |
 | [ ] | T2.6 | S3 / MinIO BlobStore adapter | T2.4, T2.5 | 3h |
 | [ ] | T2.7 | `/v2/` base protocol and error format | T2.1, T2.2 | 1-2h |
@@ -421,6 +421,8 @@ Suggested tables:
 **Acceptance**: Writes use a temp file plus atomic rename; reads support Range; paths cannot escape the root; data survives a restart; `presign_get` returns empty for backends without presigning, and the caller falls back to direct streaming.
 
 **Depends on**: T2.1 · **Estimate**: 2h
+
+> **Notes** (2026-11-18, ~2h): Done. `registry/blobstore.emo` defines `BlobStore` (`put`, `put_file`, `get`, `read_range`, `head`, `delete`, `presign_get`) and `LocalStore`, which lays blobs out as `<root>/sha256/<hex>` plus a tiny `<hex>.size` record. The size record exists because Emo's `os` has no `stat` and `file` only reads whole files — without it, HEAD/Content-Length would read a whole layer. Put streams to `.tmp-<pid>-<hex>` hashing and counting, rejects a digest mismatch (temp removed, nothing stored), writes the size record through its own temp-and-rename, then renames the blob into place; the rename is the commit point, so no reader sees a partial blob, and a crash between the renames leaves only a harmless orphan record that the next put repairs. Re-putting an existing digest is a no-op (one copy). `read_range` validates non-negative offset/length, errors past the end, and clips at EOF; `head` answers exists=false for missing and size=-1 for "bytes present, record missing"; `delete` removes both and answers whether the blob existed; `presign_get` returns "" so callers stream. Missing content is `blobstore: not found: <digest>` plus `is_not_found()`. Digest validation moved to a new `registry/digest.emo` shared with `registry/oci.emo`, and paths are built from the validated hex only — `..`, `/`, other algorithms, and uppercase are rejected before any filesystem call. `registry/main.emo` now opens the fs store at startup (creating `<root>/sha256`); a root that is a file exits 1 with the path and reason, verified manually along with `/readyz` 200 and the created layout. Tests: 14 in `test/registry_blobstore.emo` (round-trip + restart, dedup, mismatch leftovers, streamed put_file over 64 KiB, not-found, range clipping, escape attempts, delete idempotency, empty blob, missing-record repair, interface conformance, file-in-the-way root); `emo test` 278/278. Gotchas: there is no typed `const` binding, so interface conformance is exercised by passing `LocalStore` to a `BlobStore`-typed helper; `os.open_read` is the only cheap existence check (no stat), which is why existence and size live in separate files.
 
 #### T2.5 AWS SigV4 Signing and Presigned URLs
 

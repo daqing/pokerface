@@ -1,0 +1,368 @@
+// T2.4 tests for the blob store and its local backend — run with `emo test`.
+//
+// Each test gets its own root under TMPDIR; nothing here shells out, so the
+// whole file runs in the interpreter.
+
+const reg_blob = registry.blobstore
+
+require "os"
+require "file"
+require "crypto"
+
+def bs_tmp_base() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def bs_tmp(name String) String {
+  return bs_tmp_base() + "pokerface-registry-blob-" + os.getpid().to_string() + "-" + name
+}
+
+def sha(body String) String {
+  return "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+def open_store(name String) registry.blobstore.LocalStore {
+  const root = bs_tmp(name)
+  case reg_blob.open(root) {
+    (R.ok, store) then { return store }
+    (R.error, why) then {
+      expect_fail("cannot open the store: " + why)
+      return reg_blob.LocalStore.new(root)
+    }
+  }
+}
+
+def digests_dir(store registry.blobstore.LocalStore) String {
+  return store.dir()
+}
+
+def entries(store registry.blobstore.LocalStore) Int64 {
+  case os.list_dir(digests_dir(store)) {
+    (R.ok, names) then { return names.length() }
+    (R.error, why) then {
+      expect_fail("cannot list the store: " + why)
+      return -1
+    }
+  }
+}
+
+def test_put_get_head_and_restart() {
+  const store = open_store("roundtrip")
+  const body = "hello from a blobstore fixture\n"
+  const digest = sha(body)
+  case store.put(digest, body) {
+    (R.ok, info) then {
+      expect_true(info.exists)
+      expect_equal(body.to_bytes().length(), info.size)
+    }
+    (R.error, why) then { expect_fail("put failed: " + why) }
+  }
+  case store.get(digest) {
+    (R.ok, text) then { expect_equal(body, text) }
+    (R.error, why) then { expect_fail("get failed: " + why) }
+  }
+  case store.head(digest) {
+    (R.ok, info) then {
+      expect_true(info.exists)
+      expect_equal(body.to_bytes().length(), info.size)
+    }
+    (R.error, why) then { expect_fail("head failed: " + why) }
+  }
+  case reg_blob.open(store.root_path()) {
+    (R.ok, reopened) then {
+      case reopened.get(digest) {
+        (R.ok, text) then { expect_equal(body, text) }
+        (R.error, why) then { expect_fail("get after restart failed: " + why) }
+      }
+      case reopened.head(digest) {
+        (R.ok, info) then { expect_equal(body.to_bytes().length(), info.size) }
+        (R.error, why) then { expect_fail("head after restart failed: " + why) }
+      }
+    }
+    (R.error, why) then { expect_fail("reopening the store failed: " + why) }
+  }
+}
+
+def test_put_is_idempotent_and_stores_one_copy() {
+  const store = open_store("dedup")
+  const body = "deduplicated\n"
+  const digest = sha(body)
+  case store.put(digest, body) {
+    (R.ok, _) then { }
+    (R.error, why) then { expect_fail("first put failed: " + why) }
+  }
+  case store.put(digest, body) {
+    (R.ok, _) then { }
+    (R.error, why) then { expect_fail("second put failed: " + why) }
+  }
+  expect_equal(2, entries(store))
+}
+
+def test_put_rejects_a_digest_mismatch() {
+  const store = open_store("badput")
+  case store.put(sha("something else"), "not what the digest says") {
+    (R.ok, _) then { expect_fail("a mismatched digest was accepted") }
+    (R.error, why) then { expect_true(why.index_of("digest mismatch") >= 0) }
+  }
+  expect_equal(0, entries(store))
+}
+
+def long_body() String {
+  var text = ""
+  var i = 0
+  while i < 7000 {
+    text = text + "0123456789"
+    i = i + 1
+  }
+  return text
+}
+
+def test_put_file_streams_and_verifies() {
+  const store = open_store("putfile")
+  const body = long_body()
+  const digest = sha(body)
+  const source = bs_tmp("putfile-source")
+  case file.write(source, body) {
+    (R.error, why) then { expect_fail("cannot write the source: " + why) }
+    (R.ok, _) then { }
+  }
+  case store.put_file(digest, source) {
+    (R.ok, info) then { expect_equal(70000, info.size) }
+    (R.error, why) then { expect_fail("put_file failed: " + why) }
+  }
+  case store.get(digest) {
+    (R.ok, text) then { expect_equal(70000, text.to_bytes().length()) }
+    (R.error, why) then { expect_fail("get failed: " + why) }
+  }
+}
+
+def test_put_file_rejects_a_wrong_digest() {
+  const store = open_store("putfile-bad")
+  const source = bs_tmp("putfile-bad-source")
+  case file.write(source, "the actual bytes") {
+    (R.error, why) then { expect_fail("cannot write the source: " + why) }
+    (R.ok, _) then { }
+  }
+  case store.put_file(sha("different bytes"), source) {
+    (R.ok, _) then { expect_fail("a mismatched source was accepted") }
+    (R.error, why) then { expect_true(why.index_of("digest mismatch") >= 0) }
+  }
+  expect_equal(0, entries(store))
+}
+
+def test_missing_content_is_not_found() {
+  const store = open_store("missing")
+  const digest = sha("absent")
+  case store.get(digest) {
+    (R.ok, _) then { expect_fail("get found a missing blob") }
+    (R.error, why) then { expect_true(reg_blob.is_not_found(why)) }
+  }
+  case store.head(digest) {
+    (R.ok, info) then { expect_true(!info.exists) }
+    (R.error, why) then { expect_fail("head failed: " + why) }
+  }
+  case store.read_range(digest, 0, 1) {
+    (R.ok, _) then { expect_fail("read_range found a missing blob") }
+    (R.error, why) then { expect_true(reg_blob.is_not_found(why)) }
+  }
+  case store.delete(digest) {
+    (R.ok, removed) then { expect_true(!removed) }
+    (R.error, why) then { expect_fail("delete failed: " + why) }
+  }
+}
+
+def test_range_reads_clip_at_the_end() {
+  const store = open_store("range")
+  const body = "0123456789"
+  const digest = sha(body)
+  case store.put(digest, body) {
+    (R.ok, _) then { }
+    (R.error, why) then { expect_fail("put failed: " + why) }
+  }
+  case store.read_range(digest, 2, 3) {
+    (R.ok, text) then { expect_equal("234", text) }
+    (R.error, why) then { expect_fail("range 2,3 failed: " + why) }
+  }
+  case store.read_range(digest, 8, 10) {
+    (R.ok, text) then { expect_equal("89", text) }
+    (R.error, why) then { expect_fail("range 8,10 failed: " + why) }
+  }
+  case store.read_range(digest, 10, 1) {
+    (R.ok, text) then { expect_equal("", text) }
+    (R.error, why) then { expect_fail("range at the end failed: " + why) }
+  }
+  case store.read_range(digest, 11, 1) {
+    (R.ok, _) then { expect_fail("a range past the end was accepted") }
+    (R.error, why) then { expect_true(why.index_of("past the end") >= 0) }
+  }
+  case store.read_range(digest, -1, 1) {
+    (R.ok, _) then { expect_fail("a negative offset was accepted") }
+    (R.error, _) then { }
+  }
+  case store.read_range(digest, 0, -1) {
+    (R.ok, _) then { expect_fail("a negative length was accepted") }
+    (R.error, _) then { }
+  }
+}
+
+def test_paths_cannot_escape_the_root() {
+  const store = open_store("escape")
+  const digests = [
+    "sha256:../../outside",
+    "sha256:/etc/passwd",
+    "md5:0f343b0931126a20f133d67c2b018a3a",
+    "",
+    "sha256:0F343B0931126A20F133D67C2B018A3A2A3F2F5E3A5B8A4A1F2E3D4C5B6A7980"
+  ]
+  var i = 0
+  while i < digests.length() {
+    case store.put(digests[i], "x") {
+      (R.ok, _) then { expect_fail("put accepted '" + digests[i] + "'") }
+      (R.error, why) then { expect_true(why.index_of("invalid digest") >= 0) }
+    }
+    case store.get(digests[i]) {
+      (R.ok, _) then { expect_fail("get accepted '" + digests[i] + "'") }
+      (R.error, why) then { expect_true(why.index_of("invalid digest") >= 0) }
+    }
+    case store.delete(digests[i]) {
+      (R.ok, _) then { expect_fail("delete accepted '" + digests[i] + "'") }
+      (R.error, why) then { expect_true(why.index_of("invalid digest") >= 0) }
+    }
+    i = i + 1
+  }
+  case os.list_dir(store.root_path()) {
+    (R.ok, names) then { expect_equal(1, names.length()) }
+    (R.error, why) then { expect_fail("cannot list the root: " + why) }
+  }
+}
+
+def test_delete_removes_blob_and_record() {
+  const store = open_store("delete")
+  const body = "to be deleted\n"
+  const digest = sha(body)
+  case store.put(digest, body) {
+    (R.ok, _) then { }
+    (R.error, why) then { expect_fail("put failed: " + why) }
+  }
+  case store.delete(digest) {
+    (R.ok, removed) then { expect_true(removed) }
+    (R.error, why) then { expect_fail("delete failed: " + why) }
+  }
+  expect_equal(0, entries(store))
+  case store.get(digest) {
+    (R.ok, _) then { expect_fail("get found a deleted blob") }
+    (R.error, why) then { expect_true(reg_blob.is_not_found(why)) }
+  }
+  case store.delete(digest) {
+    (R.ok, removed) then { expect_true(!removed) }
+    (R.error, why) then { expect_fail("second delete failed: " + why) }
+  }
+}
+
+def test_presign_get_is_empty_for_the_local_backend() {
+  const store = open_store("presign")
+  const digest = sha("presign")
+  case store.put(digest, "presign") {
+    (R.ok, _) then { }
+    (R.error, why) then { expect_fail("put failed: " + why) }
+  }
+  expect_equal("", store.presign_get(digest, 300))
+}
+
+def test_empty_blob_round_trips() {
+  const store = open_store("empty")
+  const digest = sha("")
+  case store.put(digest, "") {
+    (R.ok, info) then { expect_equal(0, info.size) }
+    (R.error, why) then { expect_fail("put failed: " + why) }
+  }
+  case store.head(digest) {
+    (R.ok, info) then {
+      expect_true(info.exists)
+      expect_equal(0, info.size)
+    }
+    (R.error, why) then { expect_fail("head failed: " + why) }
+  }
+  case store.get(digest) {
+    (R.ok, text) then { expect_equal("", text) }
+    (R.error, why) then { expect_fail("get failed: " + why) }
+  }
+}
+
+def test_head_survives_a_missing_size_record() {
+  const store = open_store("norecord")
+  const body = "recordless\n"
+  const digest = sha(body)
+  case store.put(digest, body) {
+    (R.ok, _) then { }
+    (R.error, why) then { expect_fail("put failed: " + why) }
+  }
+  const record = digests_dir(store) + "/" + registry.digest.hex(digest) + reg_blob.size_suffix
+  case os.unlink(record) {
+    (R.error, why) then { expect_fail("cannot remove the record: " + why) }
+    (R.ok, _) then { }
+  }
+  case store.head(digest) {
+    (R.ok, info) then {
+      expect_true(info.exists)
+      expect_equal(-1, info.size)
+    }
+    (R.error, why) then { expect_fail("head failed: " + why) }
+  }
+  case store.get(digest) {
+    (R.ok, text) then { expect_equal(body, text) }
+    (R.error, why) then { expect_fail("get failed: " + why) }
+  }
+  case store.put(digest, body) {
+    (R.ok, _) then { }
+    (R.error, why) then { expect_fail("repairing put failed: " + why) }
+  }
+  case store.head(digest) {
+    (R.ok, info) then { expect_equal(body.to_bytes().length(), info.size) }
+    (R.error, why) then { expect_fail("head after repair failed: " + why) }
+  }
+  expect_equal(2, entries(store))
+}
+
+def interface_roundtrip(store registry.blobstore.BlobStore) Bool {
+  const body = "through the interface\n"
+  const digest = sha(body)
+  case store.put(digest, body) {
+    (R.ok, _) then {
+      case store.get(digest) {
+        (R.ok, text) then { return text == body }
+        (R.error, _) then { return false }
+      }
+    }
+    (R.error, _) then { return false }
+  }
+}
+
+def test_local_store_satisfies_the_interface() {
+  const store = open_store("iface")
+  expect_true(interface_roundtrip(store))
+}
+
+def test_open_rejects_a_file_in_the_way() {
+  const path = bs_tmp("blocked-root")
+  case file.write(path, "not a directory") {
+    (R.ok, _) then { }
+    (R.error, why) then { expect_fail("cannot write " + path + ": " + why) }
+  }
+  case reg_blob.open(path) {
+    (R.ok, _) then { expect_fail("open accepted a file as the root") }
+    (R.error, why) then { expect_true(why.index_of("not a directory") >= 0) }
+  }
+}

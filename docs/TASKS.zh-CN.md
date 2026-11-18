@@ -349,7 +349,7 @@ images:
 | [x] | T2.1 | 服务骨架、配置与健康检查 | T1.2 | 2h |
 | [x] | T2.2 | SQLite 数据层与迁移 | T2.1 | 2-3h |
 | [x] | T2.3 | OCI Manifest / Index 模型与校验 | T1.5 | 2-3h |
-| [ ] | T2.4 | BlobStore 接口与本地文件后端 | T2.1 | 2h |
+| [x] | T2.4 | BlobStore 接口与本地文件后端 | T2.1 | 2h |
 | [ ] | T2.5 | AWS SigV4 签名与预签名 URL | T2.1 | 3h |
 | [ ] | T2.6 | S3 / MinIO BlobStore 适配 | T2.4、T2.5 | 3h |
 | [ ] | T2.7 | `/v2/` 基础协议与错误格式 | T2.1、T2.2 | 1-2h |
@@ -421,6 +421,8 @@ images:
 **验收**：写入采用临时文件 + 原子 rename；读取支持 Range；路径不穿越出根目录；重启后数据仍在；`presign_get` 在不支持预签名的后端返回空值，由上层回退到直接流式返回。
 
 **依赖**：T2.1 · **预估**：2h
+
+> **备注**（2026-11-18，约 2h）：已完成。`registry/blobstore.emo` 定义 `BlobStore`（`put`、`put_file`、`get`、`read_range`、`head`、`delete`、`presign_get`）和 `LocalStore`，布局为 `<root>/sha256/<hex>` 加一个很小的 `<hex>.size` 记录。需要该记录是因为 Emo 的 `os` 没有 `stat`、`file` 只能整文件读取——否则 HEAD/Content-Length 就要把整个 layer 读一遍。写入时流式拷贝到 `.tmp-<pid>-<hex>` 并边写边算哈希和字节数，digest 不符则删除临时文件且什么都不留下；随后用同样的临时文件+rename 写 size 记录，最后把 blob rename 到位——rename 就是提交点，读方永远看不到半个 blob；两次 rename 之间崩溃只会留下无害的孤儿记录,下次 put 会修复。重复 put 同一 digest 是空操作（只存一份）。`read_range` 校验非负 offset/length，越界报错，EOF 处截断；`head` 对缺失返回 exists=false，对“文件在但记录缺失”返回 size=-1；`delete` 同时删两者并返回 blob 是否存在；`presign_get` 返回 "" 由上层回退流式。缺失内容统一为 `blobstore: not found: <digest>`，配 `is_not_found()` 判定。digest 校验抽到新的 `registry/digest.emo`（`registry/oci.emo` 共用），路径只由校验过的 hex 拼出——`..`、`/`、其它算法、大写十六进制都在任何文件操作之前被拒绝。`registry/main.emo` 启动时打开 fs store（创建 `<root>/sha256`），根目录是文件时以 1 退出并打印路径与原因，已手工验证 `/readyz` 200 与生成的目录结构。测试：`test/registry_blobstore.emo` 14 个（往返+重启、去重、不符残留、跨 64 KiB 的流式 put_file、未找到、Range 截断、路径穿越、delete 幂等、空 blob、记录缺失修复、接口一致性、根目录被文件占用）；`emo test` 278/278。踩坑：Emo 没有带类型的 `const`，接口一致性通过把 `LocalStore` 传给 `BlobStore` 类型的辅助函数来验证；`os.open_read` 是唯一廉价的存在性检查（没有 stat），所以存在性与大小分两个文件。
 
 #### T2.5 AWS SigV4 签名与预签名 URL
 
