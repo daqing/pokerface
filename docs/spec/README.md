@@ -29,6 +29,7 @@
 | [registry-cache.md](registry-cache.md) | ETag/If-None-Match, immutable blob caching, short tag-manifest caching, CDN behavior (M2/T2.15). | `registry/cache.emo` |
 | [registry-tags.md](registry-tags.md) | Tag listing in lexical order with n/last pagination and rel=next links (M2/T2.16). | `registry/tags.emo` |
 | [registry-metrics.md](registry-metrics.md) | slog JSON access/audit logs, SQLite-backed Prometheus counters and latency histogram, /metrics (M2/T2.18). | `registry/metrics.emo`, `registry/router.emo` |
+| [registry/deployment.md](../registry/deployment.md) | The compose stack: registry + MinIO + Caddy, the image build, the entrypoint's signal protocol, volumes and rotation (M2/T2.17). | `deploy/` |
 
 ## M1 flow
 

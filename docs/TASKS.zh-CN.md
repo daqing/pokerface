@@ -362,7 +362,7 @@ images:
 | [x] | T2.14 | 认证与 Token 服务 | T2.7 | 3-4h |
 | [x] | T2.15 | 缓存头、ETag 与 CDN 行为 | T2.8、T2.9 | 2h |
 | [x] | T2.16 | Tag 列表与分页 | T2.12 | 2h |
-| [ ] | T2.17 | 部署编排：Registry + MinIO + Caddy | T2.6、T2.14 | 3h |
+| [x] | T2.17 | 部署编排：Registry + MinIO + Caddy | T2.6、T2.14 | 3h |
 | [ ] | T2.18 | 可观测性与审计 | T2.1 | 2-3h |
 | [ ] | T2.19 | 协议冒烟与一致性测试 | T2.1-T2.18 | 3h |
 
@@ -577,6 +577,8 @@ images:
 **验收**：干净机器上 `docker compose up -d` 后三个服务健康；Registry 通过 Caddy 访问；MinIO 数据持久化；重启后数据不丢；`.env.example` 不含真实密钥。
 
 **依赖**：T2.6、T2.14 · **预估**：3h
+
+> **备注**（2026-11-19，约 2.5h）：已完成，带一个环境限制说明。`deploy/` 包含整套栈：两阶段 `Dockerfile`（阶段 1 用 Emo 工具链编译 registry，`EMO_BUILDER_IMAGE` 构建参数指向携带 `emo` 的镜像——工具链尚年轻，发布构建镜像前可自备；阶段 2 为 `debian:bookworm-slim`，装 `libsqlite3-0`——c target 链接它——与 `wget` 供健康检查，非 root 用户，镜像级 HEALTHCHECK 打 /healthz）、`deploy/registry-entrypoint.sh`（PID 1 把 SIGTERM/SIGINT 转成服务器监听的 shutdown 标记文件——Emo 无信号处理——并等待排空）、`deploy/compose.yaml`（registry + MinIO + Caddy，内部网络，元数据/对象/证书的命名卷，MinIO 健康检查门控 registry 启动、registry 门控 Caddy，取值来自 `.env` 且四个密钥用 `:?` 拒绝缺省）、`deploy/Caddyfile`（单站点反代 registry，公网域名自动 Let's Encrypt / localhost 用内部 CA，缓存头原样透传）、`.env.example`（只有占位符，附生成提示）与 `docs/registry/deployment.md`。**宿主机已验证**：entrypoint 的信号协议端到端（SIGTERM → 标记 → 服务器的 `shutting down` / `stopped` 排空行 → 干净退出）——初版过早退出，因为被 trap 的信号会打断 shell 的 `wait`，重收尸改为循环等待服务器真正退出（提前退出会取消排空）；`docker compose config` 校验栈定义；核对二进制链接面（仅 `libsqlite3`）。**限制**：完整 `docker compose up` 无法在本机运行——MinIO 与 Caddy 镜像不可达（Docker Hub 经失效代理与配置的镜像站均超时；与 T2.6 的 S3 备注同一限制）。在有 registry 访问的机器上，`cd deploy && cp ../.env.example .env && docker compose up -d` 即为验证，T2.19 的冒烟脚本会在栈起来后端到端演练。
 
 #### T2.18 可观测性与审计
 

@@ -1,0 +1,17 @@
+# Caddy terminates TLS for the registry (T2.17). The domain comes from the
+# environment; with a public DNS name Caddy obtains a Let's Encrypt
+# certificate automatically. For local development set REGISTRY_DOMAIN to
+# "localhost" — Caddy then issues its internal CA.
+
+{$REGISTRY_DOMAIN} {
+	# The distribution API is the registry service behind the internal
+	# network; MinIO is never exposed through this site.
+	reverse_proxy registry:5000
+
+	# Blob responses carry their own Cache-Control (immutable for digests,
+	# a minute for tags) — pass them through untouched so a CDN in front of
+	# Caddy honors the registry's policy.
+	header {
+		-Server
+	}
+}

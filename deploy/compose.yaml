@@ -1,0 +1,80 @@
+# The distribution stack (T2.17): the pokerface registry, MinIO for blob
+# storage, and Caddy for TLS termination in front of the API. Values come
+# from .env (copy .env.example); the registry talks to MinIO over the
+# internal network only, and Caddy is the single published entrypoint.
+#
+#   docker compose up -d          # from deploy/
+#
+# The registry image builds with the Emo toolchain (deploy/Dockerfile);
+# MinIO and Caddy use their upstream images. Volumes keep the MinIO objects
+# and the registry's SQLite metadata across restarts.
+
+services:
+  registry:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: pokerface-registry:local
+    restart: unless-stopped
+    environment:
+      POKERFACE_REGISTRY_LISTEN: "0.0.0.0:5000"
+      POKERFACE_REGISTRY_DATA_DIR: "/data"
+      POKERFACE_REGISTRY_STORE_BACKEND: "s3"
+      POKERFACE_REGISTRY_S3_ENDPOINT: "http://minio:9000"
+      POKERFACE_REGISTRY_S3_BUCKET: "${MINIO_BUCKET:-pokerface}"
+      POKERFACE_REGISTRY_S3_REGION: "${MINIO_REGION:-us-east-1}"
+      POKERFACE_REGISTRY_S3_ACCESS_KEY: "${MINIO_ROOT_USER:?set in .env}"
+      POKERFACE_REGISTRY_S3_SECRET_KEY: "${MINIO_ROOT_PASSWORD:?set in .env}"
+      POKERFACE_REGISTRY_S3_PATH_STYLE: "true"
+      POKERFACE_REGISTRY_AUTH_ENABLED: "${REGISTRY_AUTH_ENABLED:-true}"
+      POKERFACE_REGISTRY_AUTH_SIGNING_KEY: "${REGISTRY_SIGNING_KEY:?set in .env}"
+    volumes:
+      - registry-data:/data
+    depends_on:
+      minio:
+        condition: service_healthy
+    expose:
+      - "5000"
+    # The healthcheck lives in the image (wget against /healthz); compose
+    # waits for MinIO, Caddy waits for the registry.
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:?set in .env}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?set in .env}"
+    volumes:
+      - minio-data:/data
+    expose:
+      - "9000"
+      - "9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "${REGISTRY_HTTP_PORT:-80}:80"
+      - "${REGISTRY_HTTPS_PORT:-443}:443"
+    environment:
+      REGISTRY_DOMAIN: "${REGISTRY_DOMAIN:?set in .env}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      registry:
+        condition: service_healthy
+
+volumes:
+  registry-data:
+  minio-data:
+  caddy-data:
+  caddy-config:

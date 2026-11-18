@@ -362,7 +362,7 @@ Exit criteria:
 | [x] | T2.14 | Authentication and token service | T2.7 | 3-4h |
 | [x] | T2.15 | Cache headers, ETag, and CDN behavior | T2.8, T2.9 | 2h |
 | [x] | T2.16 | Tag listing and pagination | T2.12 | 2h |
-| [ ] | T2.17 | Deployment: registry + MinIO + Caddy | T2.6, T2.14 | 3h |
+| [x] | T2.17 | Deployment: registry + MinIO + Caddy | T2.6, T2.14 | 3h |
 | [x] | T2.18 | Observability and audit logging | T2.1 | 2-3h |
 | [ ] | T2.19 | Protocol smoke and conformance tests | T2.1-T2.18 | 3h |
 
@@ -577,6 +577,8 @@ Suggested tables:
 **Acceptance**: On a clean machine, `docker compose up -d` brings all three services up in a healthy state; the registry is reachable through Caddy; MinIO data persists; a restart loses no data; `.env.example` contains no real secrets.
 
 **Depends on**: T2.6, T2.14 · **Estimate**: 3h
+
+> **Notes** (2026-11-19, ~2.5h): Done, with one environment caveat. `deploy/` holds the stack: a two-stage `Dockerfile` (stage 1 compiles the registry with the Emo toolchain via the `EMO_BUILDER_IMAGE` build argument — the toolchain is young, so until a builder image is published the argument names an image of your own; stage 2 is `debian:bookworm-slim` with `libsqlite3-0` — the c target links it — plus `wget` for the healthcheck, a non-root user, and the image-level HEALTHCHECK against /healthz), `deploy/registry-entrypoint.sh` (PID 1 turns SIGTERM/SIGINT into the shutdown marker the server watches — Emo has no signal handlers — and waits for the drain), `deploy/compose.yaml` (registry + MinIO + Caddy, internal network, named volumes for metadata/objects/certificates, MinIO's healthcheck gating the registry, the registry's gating Caddy, values from `.env` with `:?` refusals for the four secrets), `deploy/Caddyfile` (one site reverse-proxying the registry, automatic Let's Encrypt for a public domain / internal CA for localhost, cache headers passing through untouched), `.env.example` (placeholders only, generation hints), and `docs/registry/deployment.md`. **Verified on the host**: the entrypoint's signal protocol end to end (SIGTERM → marker → the server's `shutting down` / `stopped` drain lines → clean exit) — the first cut exited early because a trapped signal interrupts shell `wait`, so the reap now loops until the server is really gone (leaving early cancels the drain); `docker compose config` validates the stack definition; the binary's link surface checked (`libsqlite3` only). **Caveat**: the full `docker compose up` could not run on this machine — the MinIO and Caddy images are unreachable (Docker Hub via the dead proxy and the configured mirror both time out; the same limitation as T2.6's S3 notes). On a machine with registry access, `cd deploy && cp ../.env.example .env && docker compose up -d` is the verification, and T2.19's smoke script exercises the stack end to end.
 
 #### T2.18 Observability and Audit Logging
 
