@@ -1,8 +1,8 @@
 # CLI Reference
 
-> Status: skeleton (task T1.1). `--help` and `version` work; every other
-> command reports "not implemented yet" on stderr and exits 1 until its task
-> lands. The plan lives in `docs/TASKS.md`.
+> Status: `resolve`, `pull`, and `version` are implemented; `build`, `config`,
+> and `cache` report "not implemented yet" on stderr and exit 1 until their
+> tasks land. The plan lives in `docs/TASKS.md`.
 
 ## Usage
 
@@ -14,8 +14,8 @@ pokerface [global flags] <command> [args]
 
 | Command  | Status          | Description                                                    |
 | -------- | --------------- | -------------------------------------------------------------- |
-| resolve  | not implemented | Print the resolution chain of a repository reference (T1.9)    |
-| pull     | not implemented | Fetch an image, verify it, and import it into the runtime (T1.14) |
+| resolve  | implemented     | Print the resolution chain of a repository reference (T1.9)    |
+| pull     | implemented     | Fetch an image, verify it, and import it into the runtime (T1.14) |
 | build    | not implemented | Build and push the image described by `pokerface.yaml` (T4.1)  |
 | config   | not implemented | Show the effective configuration (T1.8)                        |
 | cache    | not implemented | Inspect and manage the local cache (T1.15)                     |
@@ -30,7 +30,7 @@ Flags are parsed before the first positional argument; the value form
 | ---------------- | ---------------------------------------------------------- |
 | `--config <path>` | Configuration file path (see docs/spec/config.md)          |
 | `--verbose`       | Verbose logging (wired up in T1.16)                       |
-| `--json`          | Machine-readable output where supported (`version` today) |
+| `--json`          | Machine-readable output (`version`, `resolve`, `pull`)     |
 | `-h`, `--help`    | Show the help text and exit 0                             |
 
 ## Exit codes
@@ -110,3 +110,49 @@ The ref part of a reference resolves to a full commit SHA via
 
 All git subprocesses run with an argv array (never a shell) and enforce a
 timeout via a double-fork watchdog.
+
+### The `pull` command (T1.14)
+
+```console
+$ pokerface pull github.com/acme/app:latest
+image:    127.0.0.1:64401/acme/app:latest
+digest:   sha256:b6998b8a881e7dc925961202762d8a0ff7fc339f7d7c03ad6f24087536bc9d0e
+commit:   731d22dfb2616d011fd1508ce00e0b689f78dd5b
+platform: linux/amd64
+runtime:  docker (127.0.0.1:64401/acme/app:latest)
+```
+
+```text
+pokerface pull <repository-reference> [options]
+
+  --platform <os>/<arch>   Platform to pull (must be in the lock); default: the lock's first
+  --tag <tag>              Image tag to import (must be in the lock); default: ref name / only tag / latest
+  --keep-temp              Keep the assembled OCI layout and print its path
+  --offline                Use only the local cache (reference must be a full commit SHA)
+```
+
+The chain is `ref → commit → lock → image → manifest → blobs → OCI layout →
+runtime import`. Behavior:
+
+- a Git failure is a hard error and never uses a stale cache;
+- a manifest fetch failure falls back to the cached manifest, whose digest
+  must match the lock (a warning names the original failure);
+- blobs are content-addressed and verified; a cached blob is reused, a
+  transient download is retried per blob, and corrupted bytes never reach the
+  layout;
+- the assembled temp layout is removed after the import, success or failure;
+  `--keep-temp` keeps it and prints the path;
+- the runtime is detected in docker → podman → containerd order and imported
+  with skopeo's local transports (see `docs/spec/runtime-import.md`);
+- only the Git host and the registry host from the lock (plus its redirects)
+  are contacted — never Docker Hub.
+
+`--json` prints a stable object:
+
+```json
+{"image": "registry/acme/app:latest", "digest": "sha256:…", "commit": "…", "platform": "linux/amd64", "runtime": "docker", "runtime_ref": "…", "manifest_cached": false, "blobs_downloaded": 2, "blobs_cached": 0}
+```
+
+Exit codes: 0 success; 2 for a missing/malformed reference or an invalid
+option value (unknown tag/platform); 1 for Git, manifest, blob, layout, or
+import failures. Full behavior: `docs/spec/pull.md`.

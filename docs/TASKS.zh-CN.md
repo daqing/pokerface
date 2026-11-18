@@ -83,7 +83,7 @@
 | [x] | T1.11 | Blob 下载器：重试、校验、续传 | T1.10 | 3-4h |
 | [x] | T1.12 | OCI 镜像布局组装 | T1.10、T1.11 | 2-3h |
 | [x] | T1.13 | 运行时导入适配 | T1.12 | 3h |
-| [ ] | T1.14 | `pull` 命令串联与失败回退 | T1.9-T1.13 | 3h |
+| [x] | T1.14 | `pull` 命令串联与失败回退 | T1.9-T1.13 | 3h |
 | [ ] | T1.15 | 本地缓存与离线模式 | T1.7、T1.14 | 2-3h |
 | [ ] | T1.16 | 错误模型、退出码与日志 | T1.1 | 2h |
 | [ ] | T1.17 | M1 测试基线、E2E 脚本与规范文档 | T1.1-T1.16 | 2-3h |
@@ -288,6 +288,8 @@ images:
 **验收**：端到端拉取后 `docker run` 成功；Manifest 网络失败时能用缓存完成（缓存 digest 必须匹配）；Blob 损坏时不导入；导入失败后无临时目录残留；抓包或代理日志确认无 Docker Hub 请求。
 
 **依赖**：T1.9-T1.13 · **预估**：3h
+
+> **备注**（2026-11-18，约 3h）：完成。`src/commands/pull.emo` 串联 Git 解析 → Manifest → Blob → OCI Layout → 运行时导入，并落实 README 的失败回退。**Manifest**：锁里 `manifest_digest` 对应 `platforms` 第一个平台时直接按它拉取；其他平台用锁里的 `digest`（多平台时是 index），交给 T1.10 按平台选子 Manifest；每次拉取都校验 body 与请求 digest 一致、最终 Manifest 与锁一致。网络/5xx 失败时回退到按 `(image, reference, platform)` 缓存的 Manifest，缓存 digest 必须与锁匹配，并在 stderr 警告原始错误。**Blob**：`<cache_root>/blobs/sha256` 内容寻址缓存，每次使用都校验；T1.11 的重试、Range 续传、digest 校验照常生效；在线时会重新下载损坏的缓存条目，离线时明确报错。**鉴权**：新增 `src.blob.RegistryBlobTransport`，Bearer token 只发第一跳，307 到预签名 CDN URL 时不会带上。**清理**：临时布局（T1.12）在成功和所有失败路径都会删除；T1.13 清理归档和可能残留的 tag；`--keep-temp` 保留布局（与归档）并打印/附加路径。**离线**（`--offline`）要求完整 commit SHA，锁从镜像缓存里用纯 `git show` 读取（绝不 fetch），Manifest/Blob 只用缓存。`run_with` 把运行时 runner 作为注入点，`run` 用真实 runner。选项：`--platform`、`--tag`、`--keep-temp`、`--offline`；`--json` 输出 image/digest/commit/platform/runtime/runtime_ref/manifest_cached/blob 计数。文档：`docs/spec/pull.md`、`docs/cli.md`。测试：`test/pull_cmd.emo` 共 15 个——真实本地 httpd 注册表上的完整流水线（校验 token 的 manifest/blob、307 到拒绝 Authorization 的 CDN 端点、digest 头）、Manifest 失败回退缓存、离线冷/热缓存、缓存损坏时在线修复与离线拒绝、导入失败的有/无 `--keep-temp`、index 平台选择与 miss、tag/platform/参数/镜像拆分辅助函数，以及本地 Git 仓库 + 假运行时的完整命令；`emo test` 174/174。完整命令测试首跑失败：它只把 registry token 传给了 `pull_image` 的 deps，而 `run_with` 是从 settings 读取——现已让假 env 设置 `POKERFACE_REGISTRY_TOKEN`。**已手工端到端验证**：构建一个可运行的 linux/arm64 镜像（`ubuntu:24.04` + `/bin/echo`），用 skopeo 导出为 OCI Layout，由本地 Go 注册表 fixture（307 Blob 重定向）提供，真实 `pull.run_with` 配真实 Docker/skopeo 运行时执行——30,797,821 字节的 layer 完成下载、校验、组装并导入——随后 `docker run` 输出 `pokerface pull ok`；再用真实 CLI 带 `--offline` 和完整 commit SHA 二次拉取（注册表已停止），Git 镜像、缓存 Manifest 与缓存 Blob 全部复用并成功重新导入；所有测试镜像均已删除。踩坑：Emo 的 `httpd` fixture 无法承载 NUL 字节，所以集成测试的 layer 体是纯 ASCII（真实 gzip 层由手工 E2E 覆盖）；标准库 `http` 客户端确实能访问进程内 `httpd`；离线 Git 路径不能调 `git_cache.load_lock`（会触发 fetch），所以新增 `load_lock_offline`；`--keep-temp` 同时控制 T1.12 的布局保留与 T1.13 的归档保留。
 
 #### T1.15 本地缓存与离线模式
 

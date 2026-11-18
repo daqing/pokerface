@@ -1,0 +1,801 @@
+// T1.14 tests for the pull pipeline — run with `emo test`.
+//
+// The registry is a real in-process HTTP fixture (httpd), so manifest and
+// blob requests traverse the actual HTTP stack: Bearer-token headers on the
+// registry, a 307 to a CDN endpoint that rejects any Authorization header,
+// digest headers, and the failure cases. The runtime side is a fake runner
+// that validates the assembled layout before it "imports" it, so no Docker
+// image is created. Loader discipline: the file is not test/pull.emo and
+// cross-module constructors live inside defs.
+
+const pull_mod = src.commands.pull
+
+require "net"
+require "httpd"
+
+// ---------------------------------------------------------------------------
+// Fixture data.
+
+def temp_base_dir() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def pull_tmp(name String) String {
+  return temp_base_dir() + "pokerface-pull-test-" + os.getpid().to_string() + "-" + name
+}
+
+def sha_hex(body String) String {
+  return crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+def digest_of(body String) String {
+  return "sha256:" + sha_hex(body)
+}
+
+def config_body() String {
+  return "{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{\"type\":\"layers\",\"diff_ids\":[]}}"
+}
+
+// The httpd fixture cannot carry NUL bytes, so the integration layer is
+// ASCII-only. Real gzip layers are exercised by the manual E2E and by the
+// T1.12 layout fixtures.
+def layer_body() String {
+  return (
+    "pokerface pull integration layer. "
+    + "ASCII-only bytes for the httpd fixture. "
+    + "0123456789abcdefghijklmnopqrstuvwxyz "
+    + "0123456789abcdefghijklmnopqrstuvwxyz"
+  )
+}
+
+def manifest_body(config String, layer String) String {
+  return (
+    "{\"schemaVersion\":2,"
+    + "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+    + "\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\","
+    + "\"digest\":\"" + digest_of(config) + "\",\"size\":" + config.length().to_string() + "},"
+    + "\"layers\":[{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
+    + "\"digest\":\"" + digest_of(layer) + "\",\"size\":" + layer.length().to_string() + "}]}"
+  )
+}
+
+def index_body(manifest String) String {
+  return (
+    "{\"schemaVersion\":2,"
+    + "\"mediaType\":\"application/vnd.oci.image.index.v1+json\","
+    + "\"manifests\":[{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+    + "\"digest\":\"" + digest_of(manifest) + "\",\"size\":" + manifest.length().to_string() + ","
+    + "\"platform\":{\"os\":\"linux\",\"architecture\":\"amd64\"}}]}"
+  )
+}
+
+class RegistryData {
+  def init(config String, layer String, manifest String, index String, token String, redirect Bool, fail_marker String) {
+    self.config = config
+    self.layer = layer
+    self.manifest = manifest
+    self.index = index
+    self.token = token
+    self.redirect = redirect
+    self.fail_marker = fail_marker
+  }
+}
+
+def make_data(token String, redirect Bool, fail_marker String) RegistryData {
+  const config = config_body()
+  const layer = layer_body()
+  const manifest = manifest_body(config, layer)
+  const index = index_body(manifest)
+  return RegistryData.new(config, layer, manifest, index, token, redirect, fail_marker)
+}
+
+def manifest_digest(data RegistryData) String {
+  return digest_of(data.manifest)
+}
+
+def index_digest(data RegistryData) String {
+  return digest_of(data.index)
+}
+
+// ---------------------------------------------------------------------------
+// Local registry server.
+
+class PullFixture {
+  def init(port Int64, handle httpd.Server) {
+    self.port = port
+    self.handle = handle
+  }
+
+  def stop() {
+    self.handle.stop()
+    self.handle.wait()
+  }
+
+  def image() String {
+    return "127.0.0.1:" + self.port.to_string() + "/acme/app"
+  }
+}
+
+def start_fixture(data RegistryData) PullFixture {
+  case net.listen("127.0.0.1", 0) {
+    (R.error, why) then {
+      expect_fail("cannot listen: " + why)
+      return dead_fixture()
+    }
+    (R.ok, listener) then {
+      const port = listener.port()
+      const base = "http://127.0.0.1:" + port.to_string()
+      const server = httpd.serve(listener) -> (req httpd.Request) {
+        return fixture_handler(req, base, data)
+      }
+      return PullFixture.new(port, server)
+    }
+  }
+}
+
+def dead_fixture() PullFixture {
+  case net.listen("127.0.0.1", 0) {
+    (R.ok, listener) then {
+      const server = httpd.serve(listener) -> (req httpd.Request) {
+        return httpd.response(500, [], "dead fixture")
+      }
+      return PullFixture.new(listener.port(), server)
+    }
+    (R.error, _) then {
+      expect_fail("cannot listen even for the dead fixture")
+      return dead_fixture()
+    }
+  }
+}
+
+def authorized(auth String, data RegistryData) Bool {
+  if data.token == "" {
+    return true
+  }
+  return auth == "Bearer " + data.token
+}
+
+def fail_marker_set(path String) Bool {
+  if path == "" {
+    return false
+  }
+  case file.read(path) {
+    (R.ok, _) then { return true }
+    (R.error, _) then { return false }
+  }
+}
+
+def body_for_digest(digest String, data RegistryData) String {
+  if digest == digest_of(data.config) {
+    return data.config
+  }
+  if digest == digest_of(data.layer) {
+    return data.layer
+  }
+  return ""
+}
+
+def body_for_hex(hex String, data RegistryData) String {
+  return body_for_digest("sha256:" + hex, data)
+}
+
+def fixture_handler(req httpd.Request, base String, data RegistryData) httpd.Response {
+  const auth = req.header("Authorization")
+  if req.path.starts_with("/cdn/") {
+    // A presigned CDN URL must never see the registry's Bearer token.
+    if auth != "" {
+      return httpd.response(400, [], "cdn received an Authorization header")
+    }
+    const hex = req.path.substring(5, req.path.length() - 5)
+    const body = body_for_hex(hex, data)
+    if body == "" {
+      return httpd.response(404, [], "not found")
+    }
+    return httpd.response(200, [("Content-Type", "application/octet-stream")], body)
+  }
+  if req.path == "/v2/" {
+    if !authorized(auth, data) {
+      return httpd.response(401, [], "unauthorized")
+    }
+    return httpd.response(200, [("Content-Type", "application/json")], "{}")
+  }
+  const manifest_prefix = "/v2/acme/app/manifests/"
+  if req.path.starts_with(manifest_prefix) {
+    if !authorized(auth, data) {
+      return httpd.response(401, [], "unauthorized")
+    }
+    if fail_marker_set(data.fail_marker) {
+      return httpd.response(500, [], "manifest unavailable")
+    }
+    const reference = req.path.substring(manifest_prefix.length(), req.path.length() - manifest_prefix.length())
+    if reference == manifest_digest(data) {
+      return httpd.response(200, [
+        ("Content-Type", "application/vnd.oci.image.manifest.v1+json"),
+        ("Docker-Content-Digest", manifest_digest(data))
+      ], data.manifest)
+    }
+    if reference == index_digest(data) {
+      return httpd.response(200, [
+        ("Content-Type", "application/vnd.oci.image.index.v1+json"),
+        ("Docker-Content-Digest", index_digest(data))
+      ], data.index)
+    }
+    return httpd.response(404, [], "manifest unknown")
+  }
+  const blob_prefix = "/v2/acme/app/blobs/"
+  if req.path.starts_with(blob_prefix) {
+    if !authorized(auth, data) {
+      return httpd.response(401, [], "unauthorized")
+    }
+    const digest = req.path.substring(blob_prefix.length(), req.path.length() - blob_prefix.length())
+    const body = body_for_digest(digest, data)
+    if body == "" {
+      return httpd.response(404, [], "blob unknown")
+    }
+    if data.redirect {
+      return httpd.response(307, [("Location", base + "/cdn/" + digest.substring(7, 64))], "")
+    }
+    return httpd.response(200, [("Content-Type", "application/octet-stream")], body)
+  }
+  return httpd.response(404, [], "not found")
+}
+
+// ---------------------------------------------------------------------------
+// Fake runtime runner: detects docker + skopeo, validates the layout on the
+// skopeo copy, and records every command.
+
+class PullRuntimeRunner {
+  def init(copy_ok Bool) {
+    self.copy_ok = copy_ok
+    self.inspects = Box.new(0)
+    self.calls = Box.new(ArrayBuilder.new())
+    self.last_layout = Box.new("")
+  }
+
+  def run(argv Array[String], timeout Float64) (R, String) {
+    const command = argv_text(argv)
+    self.calls.read().push(command)
+    case command {
+      "docker --version" then { return (R.ok, "Docker version test") }
+      "podman --version" then { return (R.error, "git: 'podman' exited with code 127: ") }
+      "skopeo --version" then { return (R.ok, "skopeo version test") }
+      "ctr --version" then { return (R.error, "git: 'ctr' exited with code 127: ") }
+      _ then { }
+    }
+    if command.starts_with("docker image inspect") {
+      const count = self.inspects.read()
+      self.inspects.replace(count + 1)
+      if count == 0 {
+        return (R.error, "git: 'docker' exited with code 1: Error: No such image")
+      }
+      return (R.ok, "[]")
+    }
+    if command.starts_with("skopeo copy") {
+      const dir = oci_source_dir(argv)
+      self.last_layout.replace(dir)
+      if !self.copy_ok {
+        return (R.error, "git: 'skopeo' exited with code 1: simulated import failure")
+      }
+      case src.oci.validate(dir) {
+        (R.ok, _) then { return (R.ok, "") }
+        (R.error, why) then {
+          return (R.error, "git: 'skopeo' exited with code 1: layout invalid: " + why)
+        }
+      }
+    }
+    if command.starts_with("docker image rm") {
+      return (R.ok, "")
+    }
+    return (R.error, "git: '" + argv[0] + "' exited with code 1: fake has no response for '" + command + "'")
+  }
+
+  def calls_text() String {
+    var out = ""
+    const items = self.calls.read().to_array()
+    var i = 0
+    while i < items.length() {
+      out = out + items[i] + "\n"
+      i = i + 1
+    }
+    return out
+  }
+
+  def layout() String {
+    return self.last_layout.read()
+  }
+}
+
+def argv_text(argv Array[String]) String {
+  var out = ""
+  var i = 0
+  while i < argv.length() {
+    if i > 0 {
+      out = out + " "
+    }
+    out = out + argv[i]
+    i = i + 1
+  }
+  return out
+}
+
+// "skopeo copy oci:<dir>:<tag> <destination>" -> <dir>. Tests always use the
+// latest tag, so the suffix is unambiguous.
+def oci_source_dir(argv Array[String]) String {
+  if argv.length() < 3 {
+    return ""
+  }
+  const source = argv[2]
+  if !source.starts_with("oci:") {
+    return ""
+  }
+  const at = source.index_of(":latest")
+  if at < 0 {
+    return ""
+  }
+  return source.substring(4, at - 4)
+}
+
+// ---------------------------------------------------------------------------
+// Request helpers.
+
+def cache_for(name String) String {
+  return pull_tmp("cache-" + name)
+}
+
+def request_for(fixture PullFixture, reference String, expected String, cache String, keep Bool, offline Bool) src.commands.pull.PullRequest {
+  return src.commands.pull.PullRequest.new(fixture.image(), "latest", "linux/amd64", reference, expected, cache, keep, offline)
+}
+
+def deps_for(token String, runner PullRuntimeRunner) src.commands.pull.PullDeps {
+  return src.commands.pull.PullDeps.new("", token, runner, false)
+}
+
+def expect_contains(text String, needle String) {
+  if text.index_of(needle) < 0 {
+    expect_fail("expected '" + needle + "' in: " + text)
+  }
+}
+
+def expect_dir_missing(path String) {
+  case os.list_dir(path) {
+    (R.ok, _) then { expect_fail("expected directory " + path + " to be absent") }
+    (R.error, _) then { expect_true(true) }
+  }
+}
+
+def expect_dir_exists(path String) {
+  case os.list_dir(path) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("expected directory " + path + ": " + why) }
+  }
+}
+
+def expect_file_exists(path String) {
+  case file.read(path) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("expected " + path + ": " + why) }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end pipeline against the local registry.
+
+def test_pull_pipeline_downloads_verifies_assembles_and_imports() {
+  const data = make_data("tok-123", true, "")
+  const fixture = start_fixture(data)
+  const cache = cache_for("pipeline")
+  const runner = PullRuntimeRunner.new(true)
+  const req = request_for(fixture, manifest_digest(data), manifest_digest(data), cache, false, false)
+  case pull_mod.pull_image(deps_for("tok-123", runner), req) {
+    (R.error, why) then { expect_fail("pull failed: " + why) }
+    (R.ok, outcome) then {
+      expect_equal("docker", outcome.runtime)
+      expect_equal(manifest_digest(data), outcome.manifest_digest)
+      expect_equal(fixture.image() + ":latest", outcome.runtime_ref)
+      expect_true(!outcome.from_cache)
+      expect_equal(2, outcome.blobs_downloaded)
+      expect_equal(0, outcome.blobs_cached)
+      expect_dir_missing(outcome.layout_dir)
+      expect_equal(outcome.layout_dir, runner.layout())
+    }
+  }
+  const calls = runner.calls_text()
+  expect_contains(calls, "skopeo copy oci:" + runner.layout() + ":latest docker-daemon:" + fixture.image() + ":latest")
+  expect_file_exists(cache + "/blobs/sha256/" + digest_of(data.config).substring(7, 64))
+  expect_file_exists(cache + "/blobs/sha256/" + digest_of(data.layer).substring(7, 64))
+  fixture.stop()
+}
+
+def test_manifest_failure_falls_back_to_cache() {
+  const marker = pull_tmp("manifest-fail-marker")
+  const data = make_data("tok-123", true, marker)
+  const fixture = start_fixture(data)
+  const cache = cache_for("fallback")
+  // Warm the cache with a healthy registry (the marker does not exist yet).
+  const warm = PullRuntimeRunner.new(true)
+  const req = request_for(fixture, manifest_digest(data), manifest_digest(data), cache, false, false)
+  case pull_mod.pull_image(deps_for("tok-123", warm), req) {
+    (R.error, why) then { expect_fail("warm pull failed: " + why) }
+    (R.ok, _) then { }
+  }
+  // Now the registry fails manifest requests while still serving blobs.
+  const (R.ok, _) = file.write(marker, "fail manifests")
+  const runner2 = PullRuntimeRunner.new(true)
+  case pull_mod.pull_image(deps_for("tok-123", runner2), req) {
+    (R.error, why) then { expect_fail("cached pull failed: " + why) }
+    (R.ok, outcome) then {
+      expect_true(outcome.from_cache)
+      expect_equal(0, outcome.blobs_downloaded)
+      expect_equal(2, outcome.blobs_cached)
+      expect_equal(manifest_digest(data), outcome.manifest_digest)
+    }
+  }
+  fixture.stop()
+}
+
+def test_offline_pull_uses_only_cache() {
+  const data = make_data("tok-123", true, "")
+  const fixture = start_fixture(data)
+  const cache = cache_for("offline")
+  const warm = PullRuntimeRunner.new(true)
+  const req = request_for(fixture, manifest_digest(data), manifest_digest(data), cache, false, false)
+  case pull_mod.pull_image(deps_for("tok-123", warm), req) {
+    (R.error, why) then { expect_fail("warm pull failed: " + why) }
+    (R.ok, _) then { }
+  }
+  fixture.stop()
+  const offline_runner = PullRuntimeRunner.new(true)
+  const offline_req = request_for(fixture, manifest_digest(data), manifest_digest(data), cache, false, true)
+  case pull_mod.pull_image(deps_for("tok-123", offline_runner), offline_req) {
+    (R.error, why) then { expect_fail("offline pull failed: " + why) }
+    (R.ok, outcome) then {
+      expect_true(outcome.from_cache)
+      expect_equal(2, outcome.blobs_cached)
+    }
+  }
+}
+
+def test_offline_without_cache_is_a_clear_error() {
+  const data = make_data("tok-123", true, "")
+  const fixture = start_fixture(data)
+  const cache = cache_for("offline-empty")
+  const runner = PullRuntimeRunner.new(true)
+  const req = request_for(fixture, manifest_digest(data), manifest_digest(data), cache, false, true)
+  case pull_mod.pull_image(deps_for("tok-123", runner), req) {
+    (R.ok, _) then { expect_fail("expected an offline cache miss") }
+    (R.error, why) then {
+      expect_contains(why, "offline")
+      expect_contains(why, "cached manifest")
+    }
+  }
+  fixture.stop()
+}
+
+def test_corrupted_cached_blob_is_redownloaded_online() {
+  const data = make_data("tok-123", true, "")
+  const fixture = start_fixture(data)
+  const cache = cache_for("corrupt-online")
+  const warm = PullRuntimeRunner.new(true)
+  const req = request_for(fixture, manifest_digest(data), manifest_digest(data), cache, false, false)
+  case pull_mod.pull_image(deps_for("tok-123", warm), req) {
+    (R.error, why) then { expect_fail("warm pull failed: " + why) }
+    (R.ok, _) then { }
+  }
+  const layer_path = cache + "/blobs/sha256/" + digest_of(data.layer).substring(7, 64)
+  const (R.ok, _) = file.write(layer_path, "X" + data.layer.substring(1, data.layer.length() - 1))
+  const runner = PullRuntimeRunner.new(true)
+  case pull_mod.pull_image(deps_for("tok-123", runner), req) {
+    (R.error, why) then { expect_fail("repair pull failed: " + why) }
+    (R.ok, outcome) then {
+      expect_equal(1, outcome.blobs_downloaded)
+      expect_equal(1, outcome.blobs_cached)
+    }
+  }
+  case file.read(layer_path) {
+    (R.ok, text) then { expect_equal(data.layer, text) }
+    (R.error, why) then { expect_fail("cannot read the repaired layer: " + why) }
+  }
+  fixture.stop()
+}
+
+def test_corrupted_cached_blob_fails_offline() {
+  const data = make_data("tok-123", true, "")
+  const fixture = start_fixture(data)
+  const cache = cache_for("corrupt-offline")
+  const warm = PullRuntimeRunner.new(true)
+  const req = request_for(fixture, manifest_digest(data), manifest_digest(data), cache, false, false)
+  case pull_mod.pull_image(deps_for("tok-123", warm), req) {
+    (R.error, why) then { expect_fail("warm pull failed: " + why) }
+    (R.ok, _) then { }
+  }
+  const layer_path = cache + "/blobs/sha256/" + digest_of(data.layer).substring(7, 64)
+  const (R.ok, _) = file.write(layer_path, "Y" + data.layer.substring(1, data.layer.length() - 1))
+  fixture.stop()
+  const runner = PullRuntimeRunner.new(true)
+  const offline_req = request_for(fixture, manifest_digest(data), manifest_digest(data), cache, false, true)
+  case pull_mod.pull_image(deps_for("tok-123", runner), offline_req) {
+    (R.ok, _) then { expect_fail("expected a corrupted-cache error") }
+    (R.error, why) then {
+      expect_contains(why, "offline")
+      expect_contains(why, digest_of(data.layer))
+    }
+  }
+}
+
+def test_import_failure_leaves_no_layout() {
+  const data = make_data("tok-123", true, "")
+  const fixture = start_fixture(data)
+  const cache = cache_for("import-fail")
+  const runner = PullRuntimeRunner.new(false)
+  const req = request_for(fixture, manifest_digest(data), manifest_digest(data), cache, false, false)
+  case pull_mod.pull_image(deps_for("tok-123", runner), req) {
+    (R.ok, _) then { expect_fail("expected an import failure") }
+    (R.error, why) then {
+      expect_contains(why, "import into docker failed")
+      expect_contains(why, "simulated import failure")
+      expect_true(why.index_of("kept layout") < 0)
+    }
+  }
+  expect_true(runner.layout() != "")
+  expect_dir_missing(runner.layout())
+  fixture.stop()
+}
+
+def test_import_failure_keeps_layout_when_requested() {
+  const data = make_data("tok-123", true, "")
+  const fixture = start_fixture(data)
+  const cache = cache_for("import-keep")
+  const runner = PullRuntimeRunner.new(false)
+  const req = request_for(fixture, manifest_digest(data), manifest_digest(data), cache, true, false)
+  case pull_mod.pull_image(deps_for("tok-123", runner), req) {
+    (R.ok, _) then { expect_fail("expected an import failure") }
+    (R.error, why) then {
+      expect_contains(why, "kept layout")
+      expect_contains(why, runner.layout())
+    }
+  }
+  expect_dir_exists(runner.layout())
+  const temp = src.oci.TempLayout.new(runner.layout(), false)
+  const (R.ok, _) = temp.cleanup()
+  expect_dir_missing(runner.layout())
+  fixture.stop()
+}
+
+def test_index_selects_the_platform_manifest() {
+  const data = make_data("tok-123", true, "")
+  const fixture = start_fixture(data)
+  const cache = cache_for("index")
+  const runner = PullRuntimeRunner.new(true)
+  const req = request_for(fixture, index_digest(data), manifest_digest(data), cache, false, false)
+  case pull_mod.pull_image(deps_for("tok-123", runner), req) {
+    (R.error, why) then { expect_fail("index pull failed: " + why) }
+    (R.ok, outcome) then {
+      expect_equal(manifest_digest(data), outcome.manifest_digest)
+      expect_equal("application/vnd.oci.image.manifest.v1+json", outcome.media_type)
+    }
+  }
+  fixture.stop()
+}
+
+def test_index_platform_miss_is_clear() {
+  const data = make_data("tok-123", true, "")
+  const fixture = start_fixture(data)
+  const cache = cache_for("index-miss")
+  const runner = PullRuntimeRunner.new(true)
+  const req = src.commands.pull.PullRequest.new(fixture.image(), "latest", "linux/arm64", index_digest(data), manifest_digest(data), cache, false, false)
+  case pull_mod.pull_image(deps_for("tok-123", runner), req) {
+    (R.ok, _) then { expect_fail("expected a platform miss") }
+    (R.error, why) then {
+      expect_contains(why, "no linux/arm64 manifest")
+      expect_contains(why, "linux/amd64")
+    }
+  }
+  fixture.stop()
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers.
+
+def test_choose_tag() {
+  const tags = ["latest", "v1.2.0"]
+  case pull_mod.choose_tag(tags, "", "v1.2.0") {
+    (R.ok, tag) then { expect_equal("v1.2.0", tag) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case pull_mod.choose_tag(tags, "v1.2.0", "latest") {
+    (R.ok, tag) then { expect_equal("v1.2.0", tag) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case pull_mod.choose_tag(tags, "", "main") {
+    (R.ok, tag) then { expect_equal("latest", tag) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case pull_mod.choose_tag(["v1.2.0"], "", "main") {
+    (R.ok, tag) then { expect_equal("v1.2.0", tag) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case pull_mod.choose_tag(["v1", "v2"], "", "main") {
+    (R.ok, _) then { expect_fail("expected an ambiguous-tag error") }
+    (R.error, why) then { expect_contains(why, "pass --tag") }
+  }
+  case pull_mod.choose_tag(tags, "nope", "main") {
+    (R.ok, _) then { expect_fail("expected an unknown-tag error") }
+    (R.error, why) then { expect_contains(why, "not in the lock") }
+  }
+}
+
+def test_choose_platform() {
+  case pull_mod.choose_platform(["linux/amd64", "linux/arm64"], "") {
+    (R.ok, p) then { expect_equal("linux/amd64", p) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case pull_mod.choose_platform(["linux/amd64", "linux/arm64"], "linux/arm64") {
+    (R.ok, p) then { expect_equal("linux/arm64", p) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case pull_mod.choose_platform(["linux/amd64"], "linux/arm64") {
+    (R.ok, _) then { expect_fail("expected a platform miss") }
+    (R.error, why) then { expect_contains(why, "not in the lock") }
+  }
+  case pull_mod.choose_platform(["linux/amd64"], "bogus") {
+    (R.ok, _) then { expect_fail("expected an invalid platform") }
+    (R.error, why) then { expect_contains(why, "invalid platform") }
+  }
+}
+
+def test_parse_args() {
+  case pull_mod.parse_args(["repo:main", "--platform", "linux/arm64", "--tag", "v1", "--keep-temp", "--offline"]) {
+    (R.ok, opts) then {
+      expect_equal("repo:main", opts.reference)
+      expect_equal("linux/arm64", opts.platform)
+      expect_equal("v1", opts.tag)
+      expect_true(opts.keep_temp)
+      expect_true(opts.offline)
+    }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case pull_mod.parse_args(["--platform=linux/arm64", "--tag=v2", "repo:main"]) {
+    (R.ok, opts) then {
+      expect_equal("linux/arm64", opts.platform)
+      expect_equal("v2", opts.tag)
+      expect_true(!opts.keep_temp)
+      expect_true(!opts.offline)
+    }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case pull_mod.parse_args([]) {
+    (R.ok, _) then { expect_fail("expected a missing-reference error") }
+    (R.error, why) then { expect_contains(why, "repository reference") }
+  }
+  case pull_mod.parse_args(["one", "two"]) {
+    (R.ok, _) then { expect_fail("expected a too-many-references error") }
+    (R.error, why) then { expect_contains(why, "exactly one") }
+  }
+  case pull_mod.parse_args(["repo:main", "--bogus"]) {
+    (R.ok, _) then { expect_fail("expected an unknown-option error") }
+    (R.error, why) then { expect_contains(why, "unknown option") }
+  }
+  case pull_mod.parse_args(["repo:main", "--tag"]) {
+    (R.ok, _) then { expect_fail("expected a missing-value error") }
+    (R.error, why) then { expect_contains(why, "--tag expects a value") }
+  }
+}
+
+def test_split_image() {
+  case pull_mod.split_image("registry.example.com/acme/app", "") {
+    (R.ok, pair) then {
+      const (base, repo) = pair
+      expect_equal("https://registry.example.com", base)
+      expect_equal("acme/app", repo)
+    }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case pull_mod.split_image("127.0.0.1:5000/acme/app", "") {
+    (R.ok, pair) then {
+      const (base, repo) = pair
+      expect_equal("http://127.0.0.1:5000", base)
+      expect_equal("acme/app", repo)
+    }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case pull_mod.split_image("registry.example.com/acme/app", "http://localhost:8080/") {
+    (R.ok, pair) then {
+      const (base, repo) = pair
+      expect_equal("http://localhost:8080", base)
+      expect_equal("acme/app", repo)
+    }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case pull_mod.split_image("no-slash", "") {
+    (R.ok, _) then { expect_fail("expected a malformed-image error") }
+    (R.error, why) then { expect_contains(why, "must be <registry-host>/<repository>") }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Full command: local Git repository + local registry + fake runtime.
+
+class PullFakeEnv {
+  def init(values Map[String, String]) {
+    self.values = values
+  }
+
+  def getenv(name String) (R, String) {
+    if self.values.has(name) {
+      return (R.ok, self.values.get(name))
+    }
+    return (R.error, "os: getenv " + name + ": is not set")
+  }
+}
+
+def git_ok(argv Array[String]) {
+  case src.git.RealRunner.new().run(argv, 30.0) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("git " + argv_text(argv) + " failed: " + why) }
+  }
+}
+
+def head_of(repo String) String {
+  case src.git.RealRunner.new().run(["git", "-C", repo, "rev-parse", "HEAD"], 30.0) {
+    (R.ok, out) then { return out.trim() }
+    (R.error, why) then {
+      expect_fail("cannot read HEAD: " + why)
+      return "0000000000000000000000000000000000000000"
+    }
+  }
+}
+
+def lock_text(image String, commit String, digest String) String {
+  return (
+    "version: 1\n"
+    + "commit: \"" + commit + "\"\n"
+    + "source: github.com/acme/app\n"
+    + "images:\n"
+    + "  - image: " + image + "\n"
+    + "    tags: [latest]\n"
+    + "    digest: " + digest + "\n"
+    + "    manifest_digest: " + digest + "\n"
+    + "    platforms: [linux/amd64]\n"
+  )
+}
+
+def test_pull_command_end_to_end_with_git_metadata() {
+  const data = make_data("tok-123", true, "")
+  const fixture = start_fixture(data)
+  const repo = pull_tmp("git-repo")
+  const cache = cache_for("command")
+  case os.mkdir(repo) {
+    (R.ok, _) then { }
+    (R.error, why) then { expect_fail("cannot create repo dir: " + why) }
+  }
+  git_ok(["git", "init", "-b", "main", repo])
+  const (R.ok, _) = file.write(repo + "/README.md", "fixture\n")
+  git_ok(["git", "-C", repo, "add", "."])
+  git_ok(["git", "-C", repo, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "init"])
+  const source_commit = head_of(repo)
+  const (R.ok, _) = file.write(repo + "/pokerface.lock.yaml", lock_text(fixture.image(), source_commit, manifest_digest(data)))
+  git_ok(["git", "-C", repo, "add", "."])
+  git_ok(["git", "-C", repo, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "lock"])
+
+  const env = PullFakeEnv.new(Map.new(("POKERFACE_CACHE_DIR", cache), ("POKERFACE_REGISTRY_TOKEN", "tok-123")))
+  const flags = src.common.Flags.new("", false, false)
+  const opts = src.commands.pull.PullOptions.new(repo + ":main", "", "", false, false)
+  const runner = PullRuntimeRunner.new(true)
+  const code = pull_mod.run_with(flags, opts, env, runner)
+  expect_equal(0, code)
+  expect_true(runner.layout() != "")
+  expect_contains(runner.calls_text(), "skopeo copy oci:" + runner.layout() + ":latest docker-daemon:" + fixture.image() + ":latest")
+  fixture.stop()
+}

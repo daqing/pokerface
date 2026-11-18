@@ -54,10 +54,17 @@ def test_missing_config_value_exits_two() {
 }
 
 def test_unimplemented_commands_report_not_implemented() {
-  expect_equal(cli.exit_failure, cli.route(["pokerface", "pull"]))
   expect_equal(cli.exit_failure, cli.route(["pokerface", "build"]))
   expect_equal(cli.exit_failure, cli.route(["pokerface", "config"]))
   expect_equal(cli.exit_failure, cli.route(["pokerface", "cache"]))
+}
+
+def test_pull_without_args_is_usage() {
+  expect_equal(cli.exit_usage, cli.route(["pokerface", "pull"]))
+}
+
+def test_pull_unknown_option_is_usage() {
+  expect_equal(cli.exit_usage, cli.route(["pokerface", "pull", "--wat"]))
 }
 
 def test_resolve_without_args_is_usage() {

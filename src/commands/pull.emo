@@ -1,0 +1,868 @@
+// T1.14: the pull command — resolve a repository reference through Git
+// metadata, fetch the manifest and blobs, assemble an OCI layout, and import
+// it into the local runtime. Failure policy from the README:
+//
+//   Git failure        hard error (no stale fallback; T1.9's rule)
+//   manifest failure   fall back to the cached manifest, digest verified
+//   blob failure       retried per blob by T1.11, then verified; a cache hit
+//                      skips the transfer entirely
+//   import failure     the temp layout (and T1.13's archive) is removed
+//
+// Manifests are cached per (image, reference, platform) and blobs in a
+// content-addressed cache, which is what --offline reads. T1.15 grows TTL,
+// size limits, eviction, and cache commands. Spec: docs/spec/pull.md.
+
+require "os"
+require "file"
+require "json"
+require "crypto"
+
+const pull_default_platform = "linux/amd64"
+const pull_manifest_timeout = 30.0
+const pull_import_timeout = 600.0
+
+class PullOptions {
+  def init(reference String, platform String, tag String, keep_temp Bool, offline Bool) {
+    self.reference = reference
+    self.platform = platform
+    self.tag = tag
+    self.keep_temp = keep_temp
+    self.offline = offline
+  }
+}
+
+class PullDeps {
+  def init(registry_url String, registry_token String, runtime_runner src.git.CommandRunner, verbose Bool) {
+    self.registry_url = registry_url
+    self.registry_token = registry_token
+    self.runtime_runner = runtime_runner
+    self.verbose = verbose
+  }
+}
+
+class PullRequest {
+  def init(image String, tag String, platform String, reference_digest String, expected_manifest_digest String, cache_root String, keep_temp Bool, offline Bool) {
+    self.image = image
+    self.tag = tag
+    self.platform = platform
+    self.reference_digest = reference_digest
+    self.expected_manifest_digest = expected_manifest_digest
+    self.cache_root = cache_root
+    self.keep_temp = keep_temp
+    self.offline = offline
+  }
+}
+
+class PullOutcome {
+  def init(image String, tag String, platform String, manifest_digest String, media_type String, layout_dir String, layout_kept Bool, runtime String, runtime_ref String, from_cache Bool, blobs_downloaded Int64, blobs_cached Int64) {
+    self.image = image
+    self.tag = tag
+    self.platform = platform
+    self.manifest_digest = manifest_digest
+    self.media_type = media_type
+    self.layout_dir = layout_dir
+    self.layout_kept = layout_kept
+    self.runtime = runtime
+    self.runtime_ref = runtime_ref
+    self.from_cache = from_cache
+    self.blobs_downloaded = blobs_downloaded
+    self.blobs_cached = blobs_cached
+  }
+}
+
+class ManifestResult {
+  def init(body String, media_type String, digest String, from_cache Bool, reference_kind String) {
+    self.body = body
+    self.media_type = media_type
+    self.digest = digest
+    self.from_cache = from_cache
+    self.reference_kind = reference_kind
+  }
+}
+
+class BlobOutcome {
+  def init(sources Array[src.oci.BlobSource], downloaded Int64, cached Int64) {
+    self.sources = sources
+    self.downloaded = downloaded
+    self.cached = cached
+  }
+}
+
+class CachedMeta {
+  def init(digest String, media_type String, platform String, reference String, kind String) {
+    self.digest = digest
+    self.media_type = media_type
+    self.platform = platform
+    self.reference = reference
+    self.kind = kind
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Command entry point and options.
+
+def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) Int64 {
+  case parse_args(rest) {
+    (R.error, why) then {
+      src.common.eprint("pokerface: pull: " + why + "\n")
+      return src.common.exit_usage
+    }
+    (R.ok, opts) then { return run_with(flags, opts, env, src.git.RealRunner.new()) }
+  }
+}
+
+// The runtime runner is the one injectable piece of process execution: tests
+// drive the whole command through a fake that records the import commands.
+def run_with(flags src.common.Flags, opts PullOptions, env src.settings.EnvSource, runtime_runner src.git.CommandRunner) Int64 {
+  case src.ref.parse(opts.reference) {
+    (R.error, why) then {
+      src.common.eprint("pokerface: pull: " + why + "\n")
+      return src.common.exit_usage
+    }
+    (R.ok, parsed) then {
+      case src.settings.load(src.git.RealRunner.new(), env, flags.config) {
+        (R.error, why) then {
+          src.common.eprint("pokerface: pull: " + why + "\n")
+          return src.common.exit_failure
+        }
+        (R.ok, settings) then {
+          print_warnings(settings.warnings)
+          if flags.verbose {
+            src.common.eprint(src.settings.summary(settings) + "\n")
+          }
+          case src.commands.resolve.resolution_with_settings(flags, parsed, settings, opts.offline) {
+            (R.error, why) then {
+              src.common.eprint("pokerface: pull: " + why + "\n")
+              return src.common.exit_failure
+            }
+            (R.ok, resolved) then {
+              case choose_tag(resolved.tags, opts.tag, parsed.ref) {
+                (R.error, why) then {
+                  src.common.eprint("pokerface: pull: " + why + "\n")
+                  return src.common.exit_usage
+                }
+                (R.ok, tag) then {
+                  case choose_platform(resolved.platforms, opts.platform) {
+                    (R.error, why) then {
+                      src.common.eprint("pokerface: pull: " + why + "\n")
+                      return src.common.exit_usage
+                    }
+                    (R.ok, platform) then {
+                      const cache_root = src.commands.resolve.cache_root_of(settings)
+                      if cache_root == "" {
+                        src.common.eprint("pokerface: pull: no cache directory is available (set POKERFACE_CACHE_DIR or HOME)\n")
+                        return src.common.exit_failure
+                      }
+                      const reference_digest = referenced_digest(resolved, platform)
+                      const expected_manifest_digest = expected_digest(resolved, reference_digest)
+                      const deps = PullDeps.new(settings.registry_url, settings.registry_token, runtime_runner, flags.verbose)
+                      const req = PullRequest.new(resolved.image, tag, platform, reference_digest, expected_manifest_digest, cache_root, opts.keep_temp, opts.offline)
+                      if flags.verbose {
+                        src.common.eprint("pull: " + resolved.display_ref + " -> commit " + resolved.commit + ", " + resolved.image + ":" + tag + " (" + platform + ")\n")
+                      }
+                      case pull_image(deps, req) {
+                        (R.error, why) then {
+                          src.common.eprint("pokerface: pull: " + why + "\n")
+                          return src.common.exit_failure
+                        }
+                        (R.ok, outcome) then {
+                          print_outcome(outcome, resolved.commit, flags)
+                          return src.common.exit_ok
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+def print_warnings(warnings Array[String]) {
+  var i = 0
+  while i < warnings.length() {
+    src.common.eprint("warning: " + warnings[i] + "\n")
+    i = i + 1
+  }
+}
+
+// The lock's manifest_digest pins the manifest for the platform it was
+// selected for (the first entry of platforms). For any other requested
+// platform the lock's digest — an index when multi-platform — must be used so
+// the index can select the child.
+def referenced_digest(resolved src.commands.resolve.ResolveResult, platform String) String {
+  if resolved.manifest_digest != "" && platform_is_pinned(resolved, platform) {
+    return resolved.manifest_digest
+  }
+  return resolved.digest
+}
+
+def expected_digest(resolved src.commands.resolve.ResolveResult, reference_digest String) String {
+  if resolved.manifest_digest != "" && reference_digest == resolved.manifest_digest {
+    return resolved.manifest_digest
+  }
+  return ""
+}
+
+def platform_is_pinned(resolved src.commands.resolve.ResolveResult, platform String) Bool {
+  if resolved.platforms.length() == 0 {
+    return true
+  }
+  return resolved.platforms[0] == platform
+}
+
+def parse_args(rest Array[String]) (R, PullOptions) {
+  var reference = ""
+  var platform = ""
+  var tag = ""
+  var keep_temp = false
+  var offline = false
+  var i = 0
+  while i < rest.length() {
+    const arg = rest[i]
+    case arg {
+      "--platform" then {
+        if i + 1 >= rest.length() {
+          return (R.error, "--platform expects a value")
+        }
+        i = i + 1
+        platform = rest[i]
+        if platform == "" {
+          return (R.error, "--platform expects a non-empty value")
+        }
+      }
+      "--tag" then {
+        if i + 1 >= rest.length() {
+          return (R.error, "--tag expects a value")
+        }
+        i = i + 1
+        tag = rest[i]
+        if tag == "" {
+          return (R.error, "--tag expects a non-empty value")
+        }
+      }
+      "--keep-temp" then { keep_temp = true }
+      "--offline" then { offline = true }
+      _ when arg.starts_with("--platform=") then {
+        platform = arg.substring(11, arg.length() - 11)
+        if platform == "" {
+          return (R.error, "--platform expects a non-empty value")
+        }
+      }
+      _ when arg.starts_with("--tag=") then {
+        tag = arg.substring(6, arg.length() - 6)
+        if tag == "" {
+          return (R.error, "--tag expects a non-empty value")
+        }
+      }
+      _ when arg.starts_with("-") then {
+        return (R.error, "unknown option " + arg)
+      }
+      _ then {
+        if reference != "" {
+          return (R.error, "takes exactly one repository reference, got more")
+        }
+        reference = arg
+      }
+    }
+    i = i + 1
+  }
+  if reference == "" {
+    return (R.error, "expects a repository reference argument")
+  }
+  return (R.ok, PullOptions.new(reference, platform, tag, keep_temp, offline))
+}
+
+// ---------------------------------------------------------------------------
+// Tag and platform selection from the lock.
+
+def choose_tag(tags Array[String], requested String, ref_name String) (R, String) {
+  if tags.length() == 0 {
+    return (R.error, "the lock entry lists no tags")
+  }
+  if requested != "" {
+    if in_array(tags, requested) {
+      return (R.ok, requested)
+    }
+    return (R.error, "tag '" + requested + "' is not in the lock (available: " + join_list(tags) + ")")
+  }
+  if in_array(tags, ref_name) {
+    return (R.ok, ref_name)
+  }
+  if tags.length() == 1 {
+    return (R.ok, tags[0])
+  }
+  if in_array(tags, "latest") {
+    return (R.ok, "latest")
+  }
+  return (R.error, "the lock lists several tags (" + join_list(tags) + "); pass --tag")
+}
+
+def choose_platform(platforms Array[String], requested String) (R, String) {
+  if requested != "" {
+    case src.config.check_platform(requested) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, checked) then {
+        if in_array(platforms, checked) {
+          return (R.ok, checked)
+        }
+        return (R.error, "platform '" + checked + "' is not in the lock (available: " + join_list(platforms) + ")")
+      }
+    }
+  }
+  if platforms.length() == 0 {
+    return (R.ok, pull_default_platform)
+  }
+  return (R.ok, platforms[0])
+}
+
+def in_array(items Array[String], wanted String) Bool {
+  var i = 0
+  while i < items.length() {
+    if items[i] == wanted {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+def join_list(items Array[String]) String {
+  var out = ""
+  var i = 0
+  while i < items.length() {
+    if i > 0 {
+      out = out + ", "
+    }
+    out = out + items[i]
+    i = i + 1
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Image target: registry base and repository path.
+
+// The image name in the lock is <registry-host>/<repository>. An explicit
+// registry URL (settings/env) overrides the host for self-hosted or test
+// registries; loopback hosts default to http, everything else to https.
+def split_image(image String, override String) (R, (String, String)) {
+  const slash = image.index_of("/")
+  if slash <= 0 || slash >= image.length() - 1 {
+    return (R.error, "image '" + image + "' must be <registry-host>/<repository>")
+  }
+  const host = image.substring(0, slash)
+  const repo = image.substring(slash + 1, image.length() - slash - 1)
+  if override != "" {
+    return (R.ok, (strip_trailing_slash(override), repo))
+  }
+  if is_loopback(host) {
+    return (R.ok, ("http://" + host, repo))
+  }
+  return (R.ok, ("https://" + host, repo))
+}
+
+def is_loopback(host String) Bool {
+  return host == "localhost" || host.starts_with("localhost:") || host == "127.0.0.1" || host.starts_with("127.0.0.1:")
+}
+
+def strip_trailing_slash(url String) String {
+  if url.length() > 0 && url.substring(url.length() - 1, 1) == "/" {
+    return url.substring(0, url.length() - 1)
+  }
+  return url
+}
+
+// ---------------------------------------------------------------------------
+// The pipeline.
+
+// Assembles into a fresh temp layout and imports it. The temp layout is
+// removed on success and failure unless keep_temp; on failure the kept path
+// is appended to the error so the caller can point at it.
+def pull_image(deps PullDeps, req PullRequest) (R, PullOutcome) {
+  case validate_request(req) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case ensure_cache_dirs(req.cache_root) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case src.oci.new_temp_layout(req.keep_temp) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, temp) then {
+      case pull_into(deps, req, temp.dir) {
+        (R.error, why) then {
+          const (_, _) = temp.cleanup()
+          if req.keep_temp {
+            return (R.error, why + " (kept layout: " + temp.dir + ")")
+          }
+          return (R.error, why)
+        }
+        (R.ok, outcome) then {
+          const (_, _) = temp.cleanup()
+          return (R.ok, outcome)
+        }
+      }
+    }
+  }
+}
+
+def validate_request(req PullRequest) (R, Bool) {
+  if req.image == "" {
+    return (R.error, "pull: image name is empty")
+  }
+  if req.tag == "" {
+    return (R.error, "pull: tag is empty")
+  }
+  if src.blob.digest_hex(req.reference_digest) == "" {
+    return (R.error, "pull: reference digest '" + req.reference_digest + "' is not a sha256 digest")
+  }
+  case src.config.check_platform(req.platform) {
+    (R.error, why) then { return (R.error, "pull: " + why) }
+    (R.ok, _) then { return (R.ok, true) }
+  }
+}
+
+def pull_into(deps PullDeps, req PullRequest, layout_dir String) (R, PullOutcome) {
+  case split_image(req.image, deps.registry_url) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, target) then {
+      const (base, repo) = target
+      const client = src.registry.Client.new(base, deps.registry_token, src.registry.HttpTransport.new(), pull_manifest_timeout)
+      const key = manifest_cache_key(req.image, req.reference_digest, req.platform)
+      case fetch_manifest_with_cache(client, repo, req, key, deps.verbose) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, manifest) then {
+          if deps.verbose {
+            var source = "registry"
+            if manifest.from_cache {
+              source = "cache"
+            }
+            src.common.eprint("pull: manifest " + manifest.digest + " from " + source + "\n")
+          }
+          case ensure_blobs(client, base, repo, manifest.body, req.cache_root, req.offline, deps.verbose) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, blobs) then {
+              if deps.verbose {
+                src.common.eprint("pull: blobs " + blobs.downloaded.to_string() + " downloaded, " + blobs.cached.to_string() + " cached\n")
+              }
+              const spec = src.oci.LayoutSpec.new(manifest.media_type, manifest.body, manifest.digest, req.tag, blobs.sources)
+              case src.oci.assemble(layout_dir, spec) {
+                (R.error, why) then { return (R.error, why) }
+                (R.ok, layout) then {
+                  if deps.verbose {
+                    src.common.eprint("pull: layout " + layout.manifest_digest + " ready at " + layout_dir + "\n")
+                  }
+                  const import_req = src.runtime.ImportRequest.new(req.image, req.tag, layout_dir, req.keep_temp)
+                  case src.runtime.prepare(deps.runtime_runner, "", import_req) {
+                    (R.error, why) then { return (R.error, why) }
+                    (R.ok, plan) then {
+                      case src.runtime.execute(deps.runtime_runner, plan, pull_import_timeout) {
+                        (R.error, why) then { return (R.error, why) }
+                        (R.ok, imported) then {
+                          return (R.ok, PullOutcome.new(
+                            req.image,
+                            req.tag,
+                            req.platform,
+                            manifest.digest,
+                            manifest.media_type,
+                            layout_dir,
+                            req.keep_temp,
+                            imported.runtime,
+                            imported.ref,
+                            manifest.from_cache,
+                            blobs.downloaded,
+                            blobs.cached
+                          ))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Manifest stage and its cache.
+
+def fetch_manifest_with_cache(client src.registry.Client, repo String, req PullRequest, key String, verbose Bool) (R, ManifestResult) {
+  if req.offline {
+    case read_manifest_cache(req.cache_root, key, req.reference_digest, req.expected_manifest_digest, req.platform) {
+      (R.ok, cached) then { return (R.ok, cached) }
+      (R.error, why) then {
+        return (R.error, "offline: no usable cached manifest for " + req.image + " (" + why + ")")
+      }
+    }
+  }
+  case fetch_final_manifest(client, repo, req.reference_digest, req.expected_manifest_digest, req.platform) {
+    (R.ok, fresh) then {
+      write_manifest_cache(req.cache_root, key, fresh, req.reference_digest, req.platform)
+      return (R.ok, fresh)
+    }
+    (R.error, why) then {
+      case read_manifest_cache(req.cache_root, key, req.reference_digest, req.expected_manifest_digest, req.platform) {
+        (R.ok, cached) then {
+          src.common.eprint("pokerface: warning: manifest fetch failed (" + why + "); using cached manifest " + cached.digest + "\n")
+          return (R.ok, cached)
+        }
+        (R.error, cache_why) then {
+          return (R.error, why + "; no usable cached manifest: " + cache_why)
+        }
+      }
+    }
+  }
+}
+
+// Fetches reference_digest, verifying it; an index is resolved by platform
+// and the child manifest is fetched by its digest. expected (the lock's
+// manifest_digest) is enforced when present.
+def fetch_final_manifest(client src.registry.Client, repo String, reference String, expected String, platform String) (R, ManifestResult) {
+  case client.fetch_manifest(repo, reference) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, first) then {
+      if first.digest != reference {
+        return (R.error, "registry returned " + first.digest + " for " + reference + " — refusing a mismatched manifest")
+      }
+      if src.oci.is_index_type(first.media_type) {
+        case split_platform(platform) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, pair) then {
+            const (platform_os, platform_arch) = pair
+            case client.select_platform(first.body, platform_os, platform_arch) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, child_digest) then {
+                case client.fetch_manifest(repo, child_digest) {
+                  (R.error, why) then { return (R.error, why) }
+                  (R.ok, child) then {
+                    if child.digest != child_digest {
+                      return (R.error, "registry returned " + child.digest + " for selected manifest " + child_digest)
+                    }
+                    if !src.oci.is_manifest_type(child.media_type) {
+                      return (R.error, "selected manifest has unsupported media type '" + child.media_type + "'")
+                    }
+                    case check_expected_digest(child.digest, expected) {
+                      (R.error, why) then { return (R.error, why) }
+                      (R.ok, _) then {
+                        return (R.ok, ManifestResult.new(child.body, child.media_type, child.digest, false, "index"))
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      if src.oci.is_manifest_type(first.media_type) {
+        case check_expected_digest(first.digest, expected) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, _) then {
+            return (R.ok, ManifestResult.new(first.body, first.media_type, first.digest, false, "manifest"))
+          }
+        }
+      }
+      return (R.error, "unsupported manifest media type '" + first.media_type + "'")
+    }
+  }
+}
+
+def check_expected_digest(actual String, expected String) (R, Bool) {
+  if expected != "" && actual != expected {
+    return (R.error, "manifest digest mismatch — the lock pins " + expected + ", the registry served " + actual)
+  }
+  return (R.ok, true)
+}
+
+def split_platform(platform String) (R, (String, String)) {
+  const parts = platform.split("/")
+  if parts.length() != 2 {
+    return (R.error, "invalid platform '" + platform + "' (expected <os>/<arch>)")
+  }
+  return (R.ok, (parts[0], parts[1]))
+}
+
+def manifest_cache_key(image String, reference String, platform String) String {
+  return crypto.hex_encode(crypto.sha2.sha256((image + "@" + reference + "#" + platform).to_bytes()))
+}
+
+// Cache writes are best effort: a read-only cache never fails a pull.
+def write_manifest_cache(cache_root String, key String, result ManifestResult, reference String, platform String) {
+  const dir = cache_root + "/manifests"
+  const body_path = dir + "/" + key + ".json"
+  const meta_path = dir + "/" + key + ".meta"
+  case write_atomic(body_path, result.body) {
+    (R.error, _) then { }
+    (R.ok, _) then {
+      const meta = json.object([
+        ("digest", json.string(result.digest)),
+        ("media_type", json.string(result.media_type)),
+        ("platform", json.string(platform)),
+        ("reference", json.string(reference)),
+        ("reference_kind", json.string(result.reference_kind))
+      ])
+      const meta_text = json.encode(meta) + "\n"
+      case write_atomic(meta_path, meta_text) {
+        (R.error, _) then { }
+        (R.ok, _) then { }
+      }
+    }
+  }
+}
+
+def write_atomic(path String, body String) (R, Bool) {
+  const part = path + ".part"
+  case file.write(part, body) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then {
+      case os.rename(part, path) {
+        (R.error, why) then {
+          os.unlink(part)
+          return (R.error, why)
+        }
+        (R.ok, _) then { return (R.ok, true) }
+      }
+    }
+  }
+}
+
+def read_manifest_cache(cache_root String, key String, reference String, expected String, platform String) (R, ManifestResult) {
+  const dir = cache_root + "/manifests"
+  const meta_path = dir + "/" + key + ".meta"
+  case file.read(meta_path) {
+    (R.error, why) then { return (R.error, "no cached manifest metadata (" + why + ")") }
+    (R.ok, meta_text) then {
+      case parse_cached_meta(meta_text) {
+        (R.error, why) then { return (R.error, "cached manifest metadata is invalid: " + why) }
+        (R.ok, meta) then {
+          if meta.reference != reference {
+            return (R.error, "cached manifest is for reference " + meta.reference + ", not " + reference)
+          }
+          if meta.platform != platform {
+            return (R.error, "cached manifest is for platform " + meta.platform + ", not " + platform)
+          }
+          if expected != "" && meta.digest != expected {
+            return (R.error, "cached manifest digest " + meta.digest + " does not match the lock's " + expected)
+          }
+          if meta.kind == "manifest" && meta.digest != reference {
+            return (R.error, "cached manifest digest " + meta.digest + " does not match its reference " + reference)
+          }
+          if !src.oci.is_manifest_type(meta.media_type) {
+            return (R.error, "cached media type '" + meta.media_type + "' is not an image manifest")
+          }
+          const body_path = dir + "/" + key + ".json"
+          case file.read(body_path) {
+            (R.error, why) then { return (R.error, "cached manifest body is missing (" + why + ")") }
+            (R.ok, body) then {
+              const actual = "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+              if actual != meta.digest {
+                return (R.error, "cached manifest is corrupted (metadata says " + meta.digest + ", body hashes to " + actual + ")")
+              }
+              return (R.ok, ManifestResult.new(body, meta.media_type, meta.digest, true, meta.kind))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+def parse_cached_meta(text String) (R, CachedMeta) {
+  case json.decode(text) {
+    (R.error, why) then { return (R.error, "invalid JSON — " + why) }
+    (R.ok, doc) then {
+      case src.oci.member_string(doc, "digest") {
+        (R.error, why) then { return (R.error, "digest: " + why) }
+        (R.ok, digest) then {
+          case src.oci.member_string(doc, "media_type") {
+            (R.error, why) then { return (R.error, "media_type: " + why) }
+            (R.ok, media_type) then {
+              case src.oci.member_string(doc, "platform") {
+                (R.error, why) then { return (R.error, "platform: " + why) }
+                (R.ok, cached_platform) then {
+                  case src.oci.member_string(doc, "reference") {
+                    (R.error, why) then { return (R.error, "reference: " + why) }
+                    (R.ok, reference) then {
+                      case src.oci.member_string(doc, "reference_kind") {
+                        (R.error, why) then { return (R.error, "reference_kind: " + why) }
+                        (R.ok, kind) then {
+                          return (R.ok, CachedMeta.new(digest, media_type, cached_platform, reference, kind))
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Blob stage and its content-addressed cache.
+
+def ensure_blobs(client src.registry.Client, base String, repo String, manifest_body String, cache_root String, offline Bool, verbose Bool) (R, BlobOutcome) {
+  case src.oci.parse_manifest(manifest_body) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, manifest) then {
+      var all = [manifest.config]
+      var i = 0
+      while i < manifest.layers.length() {
+        all = all.append(manifest.layers[i])
+        i = i + 1
+      }
+      if !offline && client.token() == "" {
+        // A manifest served from cache carries no token; ask the registry
+        // once so a private blob endpoint can be reached. A failure here is
+        // ignored — cached blobs still let the pull finish.
+        const (_, _) = client.probe()
+      }
+      const transport = src.blob.RegistryBlobTransport.new(client.token())
+      const dir = cache_root + "/blobs/sha256"
+      var sources = []
+      var downloaded = 0
+      var cached = 0
+      var index = 0
+      while index < all.length() {
+        case ensure_one_blob(transport, base, repo, all[index], dir, offline, verbose) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, one) then {
+            const (source, was_downloaded) = one
+            sources = sources.append(source)
+            if was_downloaded {
+              downloaded = downloaded + 1
+            } else {
+              cached = cached + 1
+            }
+          }
+        }
+        index = index + 1
+      }
+      return (R.ok, BlobOutcome.new(sources, downloaded, cached))
+    }
+  }
+}
+
+def ensure_one_blob(transport src.blob.BlobTransport, base String, repo String, descriptor src.oci.Descriptor, dir String, offline Bool, verbose Bool) (R, (src.oci.BlobSource, Bool)) {
+  const hex = src.blob.digest_hex(descriptor.digest)
+  if hex == "" {
+    return (R.error, "pull: manifest references a non-sha256 blob digest '" + descriptor.digest + "'")
+  }
+  const path = dir + "/" + hex
+  if blob_ok(path, descriptor.digest, descriptor.size) {
+    return (R.ok, (src.oci.BlobSource.new(descriptor.digest, descriptor.size, path), false))
+  }
+  if offline {
+    return (R.error, "offline: blob " + descriptor.digest + " is not cached or is corrupted (" + path + ")")
+  }
+  if verbose {
+    src.common.eprint("pull: downloading " + descriptor.digest + " (" + descriptor.size.to_string() + " bytes)\n")
+  }
+  const url = base + "/v2/" + repo + "/blobs/" + descriptor.digest
+  case src.blob.download_blob(transport, url, descriptor.digest, descriptor.size, path, verbose) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then {
+      return (R.ok, (src.oci.BlobSource.new(descriptor.digest, descriptor.size, path), true))
+    }
+  }
+}
+
+def blob_ok(path String, digest String, size Int64) Bool {
+  case src.oci.hash_file(path) {
+    (R.ok, info) then {
+      const (actual, actual_size) = info
+      return actual == digest && actual_size == size
+    }
+    (R.error, _) then { return false }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cache directories and output.
+
+def ensure_cache_dirs(root String) (R, Bool) {
+  case ensure_dir(root) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case ensure_dir(root + "/manifests") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case ensure_dir(root + "/blobs") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { }
+  }
+  case ensure_dir(root + "/blobs/sha256") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, _) then { return (R.ok, true) }
+  }
+}
+
+def ensure_dir(path String) (R, Bool) {
+  case os.mkdir(path) {
+    (R.ok, _) then { return (R.ok, true) }
+    (R.error, _) then {
+      case os.list_dir(path) {
+        (R.ok, _) then { return (R.ok, true) }
+        (R.error, why) then { return (R.error, "pull: cannot create directory " + path + ": " + why) }
+      }
+    }
+  }
+}
+
+def print_outcome(outcome PullOutcome, commit String, flags src.common.Flags) {
+  if flags.json {
+    println(outcome_json(outcome, commit))
+  } else {
+    println("image:    " + outcome.image + ":" + outcome.tag)
+    println("digest:   " + outcome.manifest_digest)
+    println("commit:   " + commit)
+    println("platform: " + outcome.platform)
+    println("runtime:  " + outcome.runtime + " (" + outcome.runtime_ref + ")")
+    if outcome.from_cache {
+      println("manifest: cached")
+    }
+    if outcome.layout_kept {
+      println("layout:   " + outcome.layout_dir)
+    }
+  }
+}
+
+def outcome_json(outcome PullOutcome, commit String) String {
+  var out = "{"
+  out = out + "\"image\": \"" + outcome.image + ":" + outcome.tag + "\", "
+  out = out + "\"digest\": \"" + outcome.manifest_digest + "\", "
+  out = out + "\"commit\": \"" + commit + "\", "
+  out = out + "\"platform\": \"" + outcome.platform + "\", "
+  out = out + "\"runtime\": \"" + outcome.runtime + "\", "
+  out = out + "\"runtime_ref\": \"" + outcome.runtime_ref + "\", "
+  out = out + "\"manifest_cached\": " + bool_text(outcome.from_cache) + ", "
+  out = out + "\"blobs_downloaded\": " + outcome.blobs_downloaded.to_string() + ", "
+  out = out + "\"blobs_cached\": " + outcome.blobs_cached.to_string()
+  if outcome.layout_kept {
+    out = out + ", \"layout\": \"" + outcome.layout_dir + "\""
+  }
+  out = out + "}"
+  return out
+}
+
+def bool_text(value Bool) String {
+  if value {
+    return "true"
+  }
+  return "false"
+}

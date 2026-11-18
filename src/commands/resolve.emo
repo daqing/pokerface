@@ -3,6 +3,9 @@
 // ref -> commit -> image -> digest. Git failures never fall back to a stale
 // cache: read_lock's fast path serves the same commit without a fetch, and a
 // fetch failure is a hard error.
+//
+// T1.14 splits the chain into resolution_with_settings, so the pull command
+// reuses it without printing and can ask for an offline-only read.
 
 require "os"
 
@@ -38,45 +41,20 @@ def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) 
       return src.common.exit_usage
     }
     (R.ok, parsed) then {
-      const runner = src.git.RealRunner.new()
-      const wanted = wanted_for(parsed.ref)
-      case src.git.resolve(runner, parsed.git_url, wanted, resolve_timeout(flags)) {
+      case src.settings.load(src.git.RealRunner.new(), env, flags.config) {
         (R.error, why) then {
           src.common.eprint("pokerface: resolve: " + why + "\n")
           return src.common.exit_failure
         }
-        (R.ok, commit) then {
-          case load_doc(flags, env, parsed, commit, wanted) {
+        (R.ok, settings) then {
+          case resolution_with_settings(flags, parsed, settings, false) {
             (R.error, why) then {
               src.common.eprint("pokerface: resolve: " + why + "\n")
               return src.common.exit_failure
             }
-            (R.ok, doc) then {
-              case pick_image(doc, flags) {
-                (R.error, why) then {
-                  src.common.eprint("pokerface: resolve: " + why + "\n")
-                  return src.common.exit_failure
-                }
-                (R.ok, entry) then {
-                  var display = parsed.host + "/" + parsed.owner + "/" + parsed.repo + ":" + parsed.ref
-                  if parsed.host == parsed.git_url {
-                    // Local path form: git_url is the path itself; show it
-                    // verbatim instead of re-assembling host/owner/repo.
-                    display = parsed.git_url + ":" + parsed.ref
-                  }
-                  const result = ResolveResult.new(
-                    display,
-                    commit,
-                    entry.image,
-                    digest_for(entry),
-                    entry.manifest_digest,
-                    entry.tags,
-                    entry.platforms
-                  )
-                  print_result(result, flags)
-                  return src.common.exit_ok
-                }
-              }
+            (R.ok, result) then {
+              print_result(result, flags)
+              return src.common.exit_ok
             }
           }
         }
@@ -85,10 +63,31 @@ def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) 
   }
 }
 
-// The ref part goes through the same resolver the pull side will use:
-// latest/HEAD/names/SHAs/refs all have defined meanings there.
-def wanted_for(ref_part String) String {
-  return ref_part
+// The chain without any output: ref -> commit -> lock -> image -> digests.
+// Offline accepts only a full commit SHA and reads the lock from the mirror
+// cache with a plain `git show` (never a fetch).
+def resolution_with_settings(flags src.common.Flags, parsed src.ref.Reference, settings src.settings.AppSettings, offline Bool) (R, ResolveResult) {
+  const wanted = parsed.ref
+  if offline {
+    if wanted.length() != 40 || !src.git.all_hex(wanted) {
+      return (R.error, "offline: the reference must be a full 40-character commit SHA when offline")
+    }
+  }
+  const runner = src.git.RealRunner.new()
+  case src.git.resolve(runner, parsed.git_url, wanted, resolve_timeout(flags)) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, commit) then {
+      case load_doc_with_settings(flags, parsed, commit, settings, offline) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, doc) then {
+          case pick_image(doc, flags) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, entry) then { return (R.ok, result_of(parsed, commit, entry)) }
+          }
+        }
+      }
+    }
+  }
 }
 
 def resolve_timeout(flags src.common.Flags) Float64 {
@@ -98,17 +97,39 @@ def resolve_timeout(flags src.common.Flags) Float64 {
 // Read the lock through the mirror cache at the resolved commit. The cache
 // root comes from settings (POKERFACE_CACHE_DIR or the XDG default); the ref
 // hint is the user's ref, so the fetch touches only what the request needs.
-def load_doc(flags src.common.Flags, env src.settings.EnvSource, parsed src.ref.Reference, commit String, wanted String) (R, src.lockfile.LockDoc) {
-  var cache_root = src.git_cache.default_cache_root()
-  case src.settings.load(src.git.RealRunner.new(), env, flags.config) {
-    (R.ok, s) then {
-      if s.cache_dir != "" {
-        cache_root = s.cache_dir
+def load_doc_with_settings(flags src.common.Flags, parsed src.ref.Reference, commit String, settings src.settings.AppSettings, offline Bool) (R, src.lockfile.LockDoc) {
+  const cache_root = cache_root_of(settings)
+  if offline {
+    return load_lock_offline(src.git.RealRunner.new(), parsed.git_url, commit, cache_root, resolve_timeout(flags))
+  }
+  return src.git_cache.load_lock(src.git.RealRunner.new(), parsed.git_url, commit, parsed.ref, cache_root, resolve_timeout(flags))
+}
+
+// The cache root shared by the Git mirror, manifests, and blobs (T1.15 owns
+// its lifecycle). "" means no HOME/XDG value was available.
+def cache_root_of(settings src.settings.AppSettings) String {
+  if settings.cache_dir != "" {
+    return settings.cache_dir
+  }
+  return src.git_cache.default_cache_root()
+}
+
+def load_lock_offline(runner src.git.CommandRunner, git_url String, commit String, cache_root String, timeout Float64) (R, src.lockfile.LockDoc) {
+  if cache_root == "" {
+    return (R.error, "offline: no cache directory is available (set POKERFACE_CACHE_DIR or HOME)")
+  }
+  const mirror = cache_root + "/git/" + src.git_cache.cache_key(git_url) + "/mirror.git"
+  case src.git_cache.show_lock(runner, mirror, commit, timeout) {
+    (R.error, why) then {
+      return (R.error, "offline: no cached metadata for " + git_url + " at " + commit + " (" + why + ")")
+    }
+    (R.ok, text) then {
+      case src.lockfile.load(text) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, doc) then { return (R.ok, doc) }
       }
     }
-    (R.error, why) then { return (R.error, why) }
   }
-  return src.git_cache.load_lock(src.git.RealRunner.new(), parsed.git_url, commit, wanted, cache_root, resolve_timeout(flags))
 }
 
 // Pick the lock entry for the image the reference names, or the single entry
@@ -118,6 +139,24 @@ def pick_image(doc src.lockfile.LockDoc, flags src.common.Flags) (R, src.lockfil
     return (R.ok, doc.images[0])
   }
   return (R.error, "the lock at this commit lists " + doc.images.length().to_string() + " images; pass --image (not yet implemented) or commit a single-image lock")
+}
+
+def result_of(parsed src.ref.Reference, commit String, entry src.lockfile.LockImage) ResolveResult {
+  var display = parsed.host + "/" + parsed.owner + "/" + parsed.repo + ":" + parsed.ref
+  if parsed.host == parsed.git_url {
+    // Local path form: git_url is the path itself; show it verbatim instead
+    // of re-assembling host/owner/repo.
+    display = parsed.git_url + ":" + parsed.ref
+  }
+  return ResolveResult.new(
+    display,
+    commit,
+    entry.image,
+    digest_for(entry),
+    entry.manifest_digest,
+    entry.tags,
+    entry.platforms
+  )
 }
 
 // manifest_digest when a platform is selected and the entry carries one;

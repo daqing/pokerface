@@ -51,11 +51,24 @@ class HttpBlobTransport {
   }
 
   def open(url String, range_start Int64, timeout Float64) (R, BlobOpen) {
-    return open_blob_url(url, range_start, timeout, 0)
+    return open_blob_url(url, range_start, timeout, 0, "")
   }
 }
 
-def open_blob_url(url String, range_start Int64, timeout Float64, hops Int64) (R, BlobOpen) {
+// Registry blob GET needs the Bearer token the manifest client obtained. The
+// token rides on the first request only: a 307 then points at a presigned
+// CDN URL, which must never receive it.
+class RegistryBlobTransport {
+  def init(token String) {
+    self.token = token
+  }
+
+  def open(url String, range_start Int64, timeout Float64) (R, BlobOpen) {
+    return open_blob_url(url, range_start, timeout, 0, self.token)
+  }
+}
+
+def open_blob_url(url String, range_start Int64, timeout Float64, hops Int64, token String) (R, BlobOpen) {
   if hops > blob_max_redirects {
     return (R.error, "blob: more than " + blob_max_redirects.to_string() + " redirects from " + url)
   }
@@ -81,6 +94,9 @@ def open_blob_url(url String, range_start Int64, timeout Float64, hops Int64) (R
           if range_start > 0 {
             request = request + "Range: bytes=" + range_start.to_string() + "-\r\n"
           }
+          if hops == 0 && token != "" {
+            request = request + "Authorization: Bearer " + token + "\r\n"
+          }
           request = request + "\r\n"
           case conn.write(request) {
             (R.error, why) then {
@@ -101,7 +117,7 @@ def open_blob_url(url String, range_start Int64, timeout Float64, hops Int64) (R
                     if location == "" {
                       return (R.error, "blob: redirect status " + status.to_string() + " without a Location header from " + host)
                     }
-                    return open_blob_url(location, range_start, timeout, hops + 1)
+                    return open_blob_url(location, range_start, timeout, hops + 1, token)
                   }
                   if status != 200 && status != 206 {
                     const (_, _) = conn.close()

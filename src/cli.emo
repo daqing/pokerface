@@ -34,7 +34,7 @@ def help_text() String {
     + "  --json            Machine-readable output where supported\n"
     + "  -h, --help        Show this help\n"
     + "\n"
-    + "Most commands are not implemented yet; see docs/TASKS.md for the plan.\n"
+    + "build, config, and cache are not implemented yet; see docs/TASKS.md for the plan.\n"
   )
 }
 
@@ -89,8 +89,15 @@ def route(argv Array[String]) Int64 {
         config = arg.substring(9, arg.length() - 9)
       }
       _ when arg.starts_with("-") then {
-        eprint("pokerface: unknown option " + arg + "; run `pokerface --help` for usage\n")
-        return exit_usage
+        // Global flags are handled above. After `pull`, an unrecognized
+        // option belongs to the command and is parsed (and rejected) there;
+        // other commands have no command-specific options yet.
+        if command == "pull" {
+          rest = rest.append(arg)
+        } else {
+          eprint("pokerface: unknown option " + arg + "; run `pokerface --help` for usage\n")
+          return exit_usage
+        }
       }
       _ when command == "" then { command = arg }
       _ then { rest = rest.append(arg) }
@@ -112,7 +119,7 @@ def route(argv Array[String]) Int64 {
   case command {
     "version" then { return run_version(flags) }
     "resolve" then { return src.commands.resolve.run(flags, rest, src.settings.RealEnv.new()) }
-    "pull" then { return not_implemented(command, flags) }
+    "pull" then { return src.commands.pull.run(flags, rest, src.settings.RealEnv.new()) }
     "build" then { return not_implemented(command, flags) }
     "config" then { return not_implemented(command, flags) }
     "cache" then { return not_implemented(command, flags) }
