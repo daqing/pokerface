@@ -10,6 +10,7 @@
 // two connections side by side. Exit 0 when every check passes.
 
 require "os"
+require "crypto"
 
 class Report {
   def init() {
@@ -89,6 +90,7 @@ def main() Int64 {
   check_manifests(report, db)
   check_tags(report, db)
   check_blobs(report, db)
+  check_manifest_store(report, db, path)
   check_uploads(report, db)
   check_cascades(report, db)
   db.close()
@@ -177,6 +179,40 @@ def check_blobs(report Report, db registry.db.Database) {
   report.check(db.blob_exists(repo, blob_digest), "blob_exists sees the row")
   report.number(db.blob_size(repo, index_digest), -1, "a missing blob answers -1")
   report.number(db.list_blob_digests(repo).length(), 1, "one blob is listed")
+}
+
+// The T2.8 lookup wrapper against a real database: tag and digest reads
+// return the stored bytes, an unknown tag or repository is absent.
+def check_manifest_store(report Report, db registry.db.Database, path String) {
+  const repo = db.ensure_repository("store/check")
+  const body = "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\"}"
+  const digest = "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+  const media_type = "application/vnd.oci.image.manifest.v1+json"
+  report.check(db.put_manifest(repo, digest, media_type, body.to_bytes().length(), body),
+    "put_manifest stores a hashed body")
+  db.put_tag(repo, "latest", digest)
+  const store = registry.manifests.DbManifests.new(path)
+  case store.lookup("store/check", "latest") {
+    (R.ok, payload) then {
+      report.check(payload.found, "the manifest store resolves a tag")
+      report.check(payload.digest == digest, "the tag resolves to the stored digest")
+      report.check(payload.media_type == media_type, "the media type round-trips from the store")
+      report.check(payload.body == body, "the body round-trips from the store")
+    }
+    (R.error, why) then { report.check(false, "tag lookup failed: " + why) }
+  }
+  case store.lookup("store/check", digest) {
+    (R.ok, payload) then { report.check(payload.found, "the manifest store resolves a digest") }
+    (R.error, why) then { report.check(false, "digest lookup failed: " + why) }
+  }
+  case store.lookup("store/check", "missing") {
+    (R.ok, payload) then { report.check(!payload.found, "an unknown tag is absent") }
+    (R.error, why) then { report.check(false, "unknown-tag lookup failed: " + why) }
+  }
+  case store.lookup("nope/nope", "latest") {
+    (R.ok, payload) then { report.check(!payload.found, "an unknown repository is absent") }
+    (R.error, why) then { report.check(false, "unknown-repository lookup failed: " + why) }
+  }
 }
 
 def check_uploads(report Report, db registry.db.Database) {

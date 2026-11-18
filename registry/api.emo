@@ -1,8 +1,8 @@
 // T2.7: the OCI distribution API's response shape — the error JSON
 // ({"errors":[{"code","message","detail"?}]}), the registry API version
-// header, and a request id on every response. The router here owns /v2/, the
-// health endpoints, and the catch-all so a client always gets a parseable OCI
-// error rather than plain text.
+// header, and a request id on every response. registry/router.emo does the
+// dispatching; every handler it calls builds its responses with these
+// helpers, so a client always gets a parseable OCI error, never plain text.
 //
 // A request id is taken from the client's X-Request-Id when it is safe
 // (alphanumerics, '.', '_', '-', at most 64 characters) and generated
@@ -36,6 +36,7 @@ const code_unauthorized = "UNAUTHORIZED"
 const code_denied = "DENIED"
 const code_unsupported = "UNSUPPORTED"
 const code_too_many_requests = "TOOMANYREQUESTS"
+const code_unknown = "UNKNOWN"
 
 // The error envelope; `detail` is omitted when empty.
 def error_body(code String, message String, detail String) String {
@@ -63,6 +64,10 @@ def bad_request(code String, message String, detail String) httpd.Response {
 
 // A method mismatch answers 405 with the Allow header, per the distribution
 // spec, and an UNSUPPORTED error body.
+def server_error(message String, detail String) httpd.Response {
+  return error_response(500, code_unknown, message, detail)
+}
+
 def method_not_allowed(allow String) httpd.Response {
   return httpd.response(405, [
     ("Allow", allow),
@@ -122,24 +127,4 @@ def decorate(response httpd.Response, id String) httpd.Response {
     i = i + 1
   }
   return httpd.response(response.status, headers, response.body)
-}
-
-// ---------------------------------------------------------------------------
-// Routing.
-
-def handle(req httpd.Request, config registry.config.RegistryConfig, db registry.health.DbHealth, blob registry.blobstore.BlobHealth) httpd.Response {
-  return decorate(route(req, config, db, blob), request_id(req))
-}
-
-def route(req httpd.Request, config registry.config.RegistryConfig, db registry.health.DbHealth, blob registry.blobstore.BlobHealth) httpd.Response {
-  if req.path == "/v2" || req.path == "/v2/" {
-    if req.method != "GET" {
-      return method_not_allowed("GET")
-    }
-    return httpd.response(200, [("Content-Type", "application/json; charset=utf-8")], "{}")
-  }
-  if req.path == "/healthz" || req.path == "/readyz" {
-    return registry.health.handle_health(req, config, db, blob)
-  }
-  return not_found(code_name_unknown, "unknown route", req.method + " " + req.path)
 }

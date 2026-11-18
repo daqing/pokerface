@@ -353,7 +353,7 @@ Exit criteria:
 | [x] | T2.5 | AWS SigV4 signing and presigned URLs | T2.1 | 3h |
 | [x] | T2.6 | S3 / MinIO BlobStore adapter | T2.4, T2.5 | 3h |
 | [x] | T2.7 | `/v2/` base protocol and error format | T2.1, T2.2 | 1-2h |
-| [ ] | T2.8 | Manifest GET / HEAD and tag / digest resolution | T2.2, T2.3, T2.7 | 3h |
+| [x] | T2.8 | Manifest GET / HEAD and tag / digest resolution | T2.2, T2.3, T2.7 | 3h |
 | [ ] | T2.9 | Blob GET and 307 presigned redirect | T2.4, T2.6, T2.8 | 2-3h |
 | [ ] | T2.10 | Blob upload: POST / PUT | T2.4, T2.7 | 3h |
 | [ ] | T2.11 | Chunked upload and resumable transfers: PATCH / GET / DELETE | T2.10 | 3h |
@@ -469,6 +469,8 @@ Suggested tables:
 **Acceptance**: Fetch by tag and digest both work; missing content returns 404 `MANIFEST_UNKNOWN`; HEAD returns no body; digest mismatches are rejected; multi-arch indexes are returned intact.
 
 **Depends on**: T2.2, T2.3, T2.7 · **Estimate**: 3h
+
+> **Notes** (2026-11-18, ~2.5h): Done. `registry/manifests.emo` serves `GET|HEAD /v2/<name>/manifests/<reference>`: the path splits on `/manifests/` so repository names may contain slashes, a digest-shaped reference is used directly and a tag resolves through the tags table, and a miss answers 404 `MANIFEST_UNKNOWN` with `<repo>:<reference>` as the detail. A `sha256:` reference that is not a valid digest answers 400 `DIGEST_INVALID`. Every read re-hashes the stored bytes and answers 500 `UNKNOWN` (with both digests) when they contradict the row — the registry never serves bytes that disagree with their name. `Accept` is parsed (comma list, parameters stripped, case-insensitive, `*/*`) and a mismatch is a 404 rather than serving a type the client cannot use. Responses carry `Content-Type`, `Docker-Content-Digest`, and an explicit `Content-Length`; HEAD returns the headers with no body (httpd strips it). Storage access is a `ManifestStore` interface: the handler tests use a fake, `DbManifests` is the SQLite implementation opening a short-lived connection per request (one process per connection, so no shared handle). The router moved out of `api.emo` into `registry/router.emo` with a `Service` carrying config/db/blob/manifests — `api.emo` now only holds the envelope, ids, and decoration, which avoids an api↔manifests module cycle. Tests: 13 handler tests in `test/registry_manifests.emo` (tag/digest reads, HEAD, 404s, 500s, digest mismatch, Accept variants, index intact, 400, 405, path shapes, router decoration) plus 5 checks in the compiled `db_selftest` for `DbManifests`; `emo test` 338/338, db selftest 70/70. Manually verified over the wire against a seeded SQLite file: tag and digest GET return the exact bytes with the digest header, HEAD has no body and the right length, a missing tag is the OCI 404, an Accept mismatch is a 404 with the stored type in the detail, and POST is a 405 with `Allow: GET, HEAD`. Gotchas: no `String.upper` (the Accept case-insensitive test uses a mixed-case literal), and the manifest route must be checked before the bare `/v2/` probe and the catch-all.
 
 #### T2.9 Blob GET and 307 Presigned Redirect
 

@@ -1,0 +1,271 @@
+// T2.8 tests for the manifest route — run with `emo test`.
+//
+// The store is a fake, so the handler's routing, Accept handling, digest
+// verification, and HEAD behavior run in the interpreter; DbManifests (the
+// SQLite implementation) is exercised by the compiled db selftest.
+
+const manifests = registry.manifests
+const api = registry.api
+
+require "httpd"
+require "json"
+require "crypto"
+
+const index_media_type = "application/vnd.oci.image.index.v1+json"
+const manifest_media_type = "application/vnd.oci.image.manifest.v1+json"
+
+def sha(body String) String {
+  return "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+def sample_body() String {
+  return "{\"schemaVersion\":2,\"mediaType\":\"" + manifest_media_type + "\"}"
+}
+
+def sample_payload(media_type String, body String) registry.manifests.ManifestPayload {
+  return registry.manifests.ManifestPayload.new(true, sha(body), media_type, body)
+}
+
+class FakeManifests {
+  def init(payload registry.manifests.ManifestPayload) {
+    self.payload = payload
+    self.seen = Box.new("")
+  }
+
+  def lookup(repository String, reference String) (R, registry.manifests.ManifestPayload) {
+    self.seen.replace(repository + "|" + reference)
+    return (R.ok, self.payload)
+  }
+
+  def seen_text() String {
+    return self.seen.read()
+  }
+}
+
+class FailingManifests {
+  def init() {
+  }
+
+  def lookup(repository String, reference String) (R, registry.manifests.ManifestPayload) {
+    return (R.error, "database is down")
+  }
+}
+
+def make_request(method String, path String) httpd.Request {
+  return make_request_with(method, path, [])
+}
+
+def make_request_with(method String, path String, headers Array[(String, String)]) httpd.Request {
+  return httpd.Request.new(
+    method: method,
+    target: path,
+    path: path,
+    query: Map.new(),
+    proto: "HTTP/1.1",
+    headers: headers,
+    body: "",
+    params: Map.new()
+  )
+}
+
+def header_value(headers Array[(String, String)], name String) String {
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == name.lower() {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+def error_field(body String, field String) String {
+  case json.decode(body) {
+    (R.error, _) then { return "" }
+    (R.ok, doc) then {
+      return scan_error(doc, field)
+    }
+  }
+}
+
+def scan_error(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == "errors" {
+        if value.is(json.JsonArray) {
+          const items = value.items()
+          if items.length() > 0 {
+            return scan_member(items[0], field)
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+def scan_member(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == field {
+        if value.is(json.JsonString) {
+          return value.as_string()
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+def test_get_by_tag_returns_the_bytes_and_headers() {
+  const body = sample_body()
+  const store = FakeManifests.new(sample_payload(manifest_media_type, body))
+  const response = manifests.handle(make_request("GET", "/v2/acme/team/app/manifests/latest"), store)
+  expect_equal(200, response.status)
+  expect_equal(body, response.body)
+  expect_equal(manifest_media_type, header_value(response.headers, "content-type"))
+  expect_equal(sha(body), header_value(response.headers, "docker-content-digest"))
+  expect_equal(body.to_bytes().length(), header_value(response.headers, "content-length").to_int64())
+  expect_equal("acme/team/app|latest", store.seen_text())
+}
+
+def test_get_by_digest_uses_the_digest_reference() {
+  const body = sample_body()
+  const store = FakeManifests.new(sample_payload(manifest_media_type, body))
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/" + sha(body)), store)
+  expect_equal(200, response.status)
+  expect_equal("acme/app|" + sha(body), store.seen_text())
+}
+
+def test_head_has_no_body_but_names_the_length() {
+  const body = sample_body()
+  const store = FakeManifests.new(sample_payload(manifest_media_type, body))
+  const response = manifests.handle(make_request("HEAD", "/v2/acme/app/manifests/latest"), store)
+  expect_equal(200, response.status)
+  expect_equal("", response.body)
+  expect_equal(body.to_bytes().length(), header_value(response.headers, "content-length").to_int64())
+  expect_equal(sha(body), header_value(response.headers, "docker-content-digest"))
+}
+
+def test_missing_manifests_are_oci_404s() {
+  const store = FakeManifests.new(registry.manifests.absent_payload())
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/latest"), store)
+  expect_equal(404, response.status)
+  expect_equal(api.code_manifest_unknown, error_field(response.body, "code"))
+  expect_equal("manifest unknown", error_field(response.body, "message"))
+  expect_true(error_field(response.body, "detail").index_of("acme/app:latest") >= 0)
+}
+
+def test_lookup_failures_are_500s() {
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/latest"), FailingManifests.new())
+  expect_equal(500, response.status)
+  expect_equal(api.code_unknown, error_field(response.body, "code"))
+  expect_true(error_field(response.body, "detail").index_of("database is down") >= 0)
+}
+
+def test_a_digest_mismatch_is_refused() {
+  const body = sample_body()
+  const wrong = registry.manifests.ManifestPayload.new(true, sha("something else"), manifest_media_type, body)
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/latest"), FakeManifests.new(wrong))
+  expect_equal(500, response.status)
+  expect_true(error_field(response.body, "detail").index_of("hashes to") >= 0)
+}
+
+def test_accept_is_honored() {
+  const body = sample_body()
+  const payload = sample_payload(manifest_media_type, body)
+  const path = "/v2/acme/app/manifests/latest"
+  const listed = make_request_with("GET", path, [("Accept", manifest_media_type + ", */*")])
+  expect_equal(200, manifests.handle(listed, FakeManifests.new(payload)).status)
+  const with_params = make_request_with("GET", path, [("Accept", "text/plain;q=0.9, " + manifest_media_type + ";q=1")])
+  expect_equal(200, manifests.handle(with_params, FakeManifests.new(payload)).status)
+  const star = make_request_with("GET", path, [("Accept", "*/*")])
+  expect_equal(200, manifests.handle(star, FakeManifests.new(payload)).status)
+  const wrong = make_request_with("GET", path, [("Accept", "application/vnd.docker.distribution.manifest.v2+json")])
+  const refused = manifests.handle(wrong, FakeManifests.new(payload))
+  expect_equal(404, refused.status)
+  expect_equal(api.code_manifest_unknown, error_field(refused.body, "code"))
+  const mixed = make_request_with("GET", path, [("Accept", "Application/Vnd.Oci.Image.Manifest.V1+Json")])
+  expect_equal(200, manifests.handle(mixed, FakeManifests.new(payload)).status)
+}
+
+def test_an_index_is_returned_intact() {
+  const body = "{\"schemaVersion\":2,\"mediaType\":\"" + index_media_type + "\",\"manifests\":[{\"digest\":\"" + sha("x") + "\",\"size\":1}]}"
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/latest"), FakeManifests.new(sample_payload(index_media_type, body)))
+  expect_equal(200, response.status)
+  expect_equal(body, response.body)
+  expect_equal(index_media_type, header_value(response.headers, "content-type"))
+}
+
+def test_invalid_digests_are_400s() {
+  const response = manifests.handle(make_request("GET", "/v2/acme/app/manifests/sha256:abc"), FakeManifests.new(registry.manifests.absent_payload()))
+  expect_equal(400, response.status)
+  expect_equal(api.code_digest_invalid, error_field(response.body, "code"))
+}
+
+def test_unsupported_methods_are_405s() {
+  const response = manifests.handle(make_request("POST", "/v2/acme/app/manifests/latest"), FakeManifests.new(registry.manifests.absent_payload()))
+  expect_equal(405, response.status)
+  expect_equal("GET, HEAD", header_value(response.headers, "allow"))
+  expect_equal(api.code_unsupported, error_field(response.body, "code"))
+}
+
+def test_bad_path_shapes_are_404s() {
+  const store = FakeManifests.new(registry.manifests.absent_payload())
+  expect_equal(404, manifests.handle(make_request("GET", "/v2/acme/app/manifests/"), store).status)
+  expect_equal(404, manifests.handle(make_request("GET", "/v2//manifests/latest"), store).status)
+  expect_equal(404, manifests.handle(make_request("GET", "/v2/acme/app/manifests/tag/extra"), store).status)
+  expect_true(!manifests.is_route("/v2/acme/app/tags/list"))
+  expect_true(manifests.is_route("/v2/acme/app/manifests/latest"))
+}
+
+def test_the_router_dispatches_manifest_routes() {
+  const body = sample_body()
+  const store = FakeManifests.new(sample_payload(manifest_media_type, body))
+  const config = registry.config.RegistryConfig.new(
+    registry.config.RegistryListen.new("127.0.0.1", 5000),
+    "/tmp/pf-manifests-router",
+    "/tmp/pf-manifests-router/registry.db",
+    registry.config.RegistryStore.new("fs", "/tmp/pf-manifests-router/blobs", registry.config.default_s3()),
+    registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
+    "/tmp/pf-manifests-router/shutdown",
+    "<test>"
+  )
+  const service = registry.router.Service.new(config, ManifestFakeDb.new(), ManifestFakeBlob.new(), store)
+  const response = registry.router.handle(make_request("GET", "/v2/acme/app/manifests/latest"), service)
+  expect_equal(200, response.status)
+  expect_equal(body, response.body)
+  expect_equal("registry/2.0", header_value(response.headers, "docker-distribution-api-version"))
+  expect_true(header_value(response.headers, "x-request-id") != "")
+}
+
+class ManifestFakeDb {
+  def init() {
+  }
+
+  def ping() Bool {
+    return true
+  }
+
+  def path() String {
+    return "/tmp/fake.db"
+  }
+}
+
+class ManifestFakeBlob {
+  def init() {
+  }
+
+  def probe() (R, String) {
+    return (R.ok, "fs:/tmp/fake")
+  }
+}

@@ -20,7 +20,8 @@
 | [registry-blobstore.md](registry-blobstore.md) | Blob abstraction, local filesystem backend, atomic writes, range reads, presign fallback (M2/T2.4). | `registry/blobstore.emo` |
 | [registry-sigv4.md](registry-sigv4.md) | AWS SigV4 header signing and presigned URLs, encoding rules, official vectors (M2/T2.5). | `registry/sigv4.emo` |
 | [registry-s3.md](registry-s3.md) | S3/MinIO backend, addressing, signed requests, retries, presigning, startup bucket check (M2/T2.6). | `registry/s3_blobstore.emo` |
-| [registry-api.md](registry-api.md) | `/v2/` probe, OCI error envelope and codes, request ids, routing (M2/T2.7). | `registry/api.emo` |
+| [registry-api.md](registry-api.md) | `/v2/` probe, OCI error envelope and codes, request ids, routing (M2/T2.7). | `registry/api.emo`, `registry/router.emo` |
+| [registry-manifests.md](registry-manifests.md) | Manifest GET/HEAD by tag or digest, Accept, integrity, 404s (M2/T2.8). | `registry/manifests.emo` |
 
 ## M1 flow
 

@@ -104,8 +104,10 @@ def serve(config registry.config.RegistryConfig, blob registry.blobstore.BlobHea
     (R.ok, listener) then {
       const port = listener.port()
       const db_health = registry.db.Health.new(config.db_path)
+      const manifests = registry.manifests.DbManifests.new(config.db_path)
+      const service = registry.router.Service.new(config, db_health, blob, manifests)
       const handler = -> (req httpd.Request) {
-        return registry.api.handle(req, config, db_health, blob)
+        return registry.router.handle(req, service)
       }
       const server = httpd.serve_with(listener, handler, server_options(config))
       // Raw writes: supervisors/scripts poll these readiness lines.

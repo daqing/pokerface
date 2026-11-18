@@ -353,7 +353,7 @@ images:
 | [x] | T2.5 | AWS SigV4 签名与预签名 URL | T2.1 | 3h |
 | [x] | T2.6 | S3 / MinIO BlobStore 适配 | T2.4、T2.5 | 3h |
 | [x] | T2.7 | `/v2/` 基础协议与错误格式 | T2.1、T2.2 | 1-2h |
-| [ ] | T2.8 | Manifest GET / HEAD 与 tag / digest 解析 | T2.2、T2.3、T2.7 | 3h |
+| [x] | T2.8 | Manifest GET / HEAD 与 tag / digest 解析 | T2.2、T2.3、T2.7 | 3h |
 | [ ] | T2.9 | Blob GET 与 307 预签名重定向 | T2.4、T2.6、T2.8 | 2-3h |
 | [ ] | T2.10 | Blob 上传：POST / PUT | T2.4、T2.7 | 3h |
 | [ ] | T2.11 | 分块上传与断点续传：PATCH / GET / DELETE | T2.10 | 3h |
@@ -469,6 +469,8 @@ images:
 **验收**：按 tag 与 digest 均可取；不存在返回 404 `MANIFEST_UNKNOWN`；HEAD 不返回 body；digest 不匹配时拒绝；多架构 Index 可正常返回。
 
 **依赖**：T2.2、T2.3、T2.7 · **预估**：3h
+
+> **备注**（2026-11-18，约 2.5h）：已完成。`registry/manifests.emo` 提供 `GET|HEAD /v2/<name>/manifests/<reference>`：路径按 `/manifests/` 切分，所以仓库名可以带斜杠；digest 形式的 reference 直接使用，tag 经 tags 表解析，找不到返回 404 `MANIFEST_UNKNOWN`，detail 为 `<repo>:<reference>`。`sha256:` 开头但不是合法 digest 的 reference 返回 400 `DIGEST_INVALID`。每次读取都会重新计算存储字节的哈希，与行内 digest 不符时返回 500 `UNKNOWN`（两侧 digest 都写进 detail）——registry 绝不返回与名字矛盾的字节。`Accept` 会解析（逗号分隔、去掉参数、大小写不敏感、`*/*`），不匹配时返回 404 而不是返回客户端无法使用的类型。响应带 `Content-Type`、`Docker-Content-Digest` 和显式 `Content-Length`；HEAD 只有头没有 body（httpd 会去掉 body）。存储访问是 `ManifestStore` 接口：handler 测试用 fake，`DbManifests` 是 SQLite 实现，每次请求开一个短连接（一连接一进程，不能共享句柄）。路由器从 `api.emo` 移到 `registry/router.emo`，用 `Service` 携带 config/db/blob/manifests——`api.emo` 只保留信封、id 和装饰，避免 api↔manifests 模块环。测试：`test/registry_manifests.emo` 13 个 handler 测试（tag/digest 读取、HEAD、404、500、digest 不符、Accept 各种形态、index 原样返回、400、405、路径形状、路由器装饰），加上编译版 `db_selftest` 中 5 项 `DbManifests` 检查；`emo test` 338/338，db selftest 70/70。已通过真实 HTTP 对预置 SQLite 数据验证：tag/digest GET 返回精确字节与 digest 头，HEAD 无 body 且长度正确，缺失 tag 是 OCI 404，Accept 不匹配的 404 detail 带存储类型，POST 是 405 且 `Allow: GET, HEAD`。踩坑：没有 `String.upper`（Accept 大小写测试用混合大小写字面量）；manifest 路由必须排在裸 `/v2/` 探测与兜底之前。
 
 #### T2.9 Blob GET 与 307 预签名重定向
 

@@ -1,0 +1,199 @@
+// T2.8: `GET|HEAD /v2/<name>/manifests/<reference>` — the raw manifest bytes
+// back, by tag or by digest, with Docker-Content-Digest, Content-Type, and
+// Content-Length; 404 MANIFEST_UNKNOWN when the repository, tag, or digest is
+// not there.
+//
+// `<name>` may contain slashes, so the route is split on "/manifests/": the
+// repository is everything between "/v2/" and that marker, the reference the
+// single segment after it. A tag resolves through the tags table; a digest is
+// answered directly. The stored bytes are verified against the digest on
+// every read — a mismatch is the server's own corruption, not a client error,
+// so it answers 500 UNKNOWN rather than serving bytes that contradict their
+// name.
+//
+// The lookup is an interface (ManifestStore), so the handler runs in the
+// interpreter against a fake; DbManifests is the SQLite implementation, which
+// opens a short-lived connection per request (httpd runs one process per
+// connection, so a shared handle would be forked into every request).
+// Spec: docs/spec/registry-manifests.md.
+
+require "httpd"
+require "json"
+require "crypto"
+
+const route_prefix = "/v2/"
+const route_marker = "/manifests/"
+
+class ManifestPayload {
+  def init(found Bool, digest String, media_type String, body String) {
+    self.found = found
+    self.digest = digest
+    self.media_type = media_type
+    self.body = body
+  }
+}
+
+def absent_payload() ManifestPayload {
+  return ManifestPayload.new(false, "", "", "")
+}
+
+interface ManifestStore {
+  def lookup(repository String, reference String) (R, ManifestPayload)
+}
+
+// SQLite-backed lookup. The database is opened and closed per request.
+class DbManifests {
+  def init(db_path String) {
+    self.db_path = db_path
+  }
+
+  def lookup(repository String, reference String) (R, ManifestPayload) {
+    const db = registry.db.connect(self.db_path)
+    var repository_id = db.repository_id(repository)
+    if repository_id == 0 {
+      db.close()
+      return (R.ok, absent_payload())
+    }
+    var digest = reference
+    if registry.digest.hex(reference) == "" {
+      digest = db.tag_digest(repository_id, reference)
+      if digest == "" {
+        db.close()
+        return (R.ok, absent_payload())
+      }
+    }
+    const body = db.manifest_body(repository_id, digest)
+    if body == "" {
+      db.close()
+      return (R.ok, absent_payload())
+    }
+    const media_type = db.manifest_media_type(repository_id, digest)
+    db.close()
+    return (R.ok, ManifestPayload.new(true, digest, media_type, body))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Routing.
+
+def is_route(path String) Bool {
+  if !path.starts_with(route_prefix) {
+    return false
+  }
+  return path.index_of(route_marker) >= 0
+}
+
+// "/v2/acme/app/manifests/latest" → ("acme/app", "latest"); ("", "") when
+// the shape is wrong.
+def split(path String) (String, String) {
+  if !path.starts_with(route_prefix) {
+    return ("", "")
+  }
+  const rest = path.substring(route_prefix.length(), path.length() - route_prefix.length())
+  const at = rest.index_of(route_marker)
+  if at <= 0 {
+    return ("", "")
+  }
+  const repository = rest.substring(0, at)
+  const reference = rest.substring(at + route_marker.length(), rest.length() - at - route_marker.length())
+  if reference == "" || reference.index_of("/") >= 0 {
+    return ("", "")
+  }
+  return (repository, reference)
+}
+
+def handle(req httpd.Request, store ManifestStore) httpd.Response {
+  if req.method != "GET" && req.method != "HEAD" {
+    return registry.api.method_not_allowed("GET, HEAD")
+  }
+  const parts = split(req.path)
+  const repository = parts[0]
+  const reference = parts[1]
+  if repository == "" || reference == "" {
+    return registry.api.not_found(registry.api.code_manifest_unknown, "manifest unknown", req.path)
+  }
+  if reference.starts_with("sha256:") && registry.digest.hex(reference) == "" {
+    return registry.api.bad_request(registry.api.code_digest_invalid, "invalid digest", reference)
+  }
+  case store.lookup(repository, reference) {
+    (R.error, why) then {
+      return registry.api.server_error("manifest lookup failed", why)
+    }
+    (R.ok, payload) then {
+      if !payload.found {
+        return registry.api.not_found(registry.api.code_manifest_unknown, "manifest unknown", repository + ":" + reference)
+      }
+      const actual = "sha256:" + crypto.hex_encode(crypto.sha2.sha256(payload.body.to_bytes()))
+      if actual != payload.digest {
+        return registry.api.server_error("stored manifest does not match its digest", payload.digest + " hashes to " + actual)
+      }
+      if !accepts(req.header("accept"), payload.media_type) {
+        return registry.api.not_found(registry.api.code_manifest_unknown, "manifest unknown",
+          payload.media_type + " is not in the Accept header")
+      }
+      return manifest_response(payload, req.method == "HEAD")
+    }
+  }
+}
+
+def manifest_response(payload ManifestPayload, head Bool) httpd.Response {
+  const size = payload.body.to_bytes().length()
+  const headers = [
+    ("Content-Type", payload.media_type),
+    ("Docker-Content-Digest", payload.digest),
+    ("Content-Length", size.to_string())
+  ]
+  if head {
+    return httpd.response(200, headers, "")
+  }
+  return httpd.response(200, headers, payload.body)
+}
+
+// An empty Accept accepts anything; otherwise any listed type (parameters
+// stripped) or */* matches. Media types compare case-insensitively.
+def accepts(accept String, media_type String) Bool {
+  if accept == "" {
+    return true
+  }
+  const wanted = media_type.lower()
+  var i = 0
+  var start = 0
+  while i <= accept.length() {
+    if i == accept.length() || accept.substring(i, 1) == "," {
+      const item = trim_parameters(accept.substring(start, i - start)).lower()
+      if item == wanted || item == "*/*" {
+        return true
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return false
+}
+
+def trim_parameters(item String) String {
+  var text = item
+  const semi = text.index_of(";")
+  if semi >= 0 {
+    text = text.substring(0, semi)
+  }
+  var start = 0
+  var end = text.length()
+  while start < end {
+    const c = text.substring(start, 1)
+    if c == " " || c == "\t" {
+      start = start + 1
+    } else {
+      break
+    }
+  }
+  while end > start {
+    const c = text.substring(end - 1, 1)
+    if c == " " || c == "\t" {
+      end = end - 1
+    } else {
+      break
+    }
+  }
+  return text.substring(start, end - start)
+}

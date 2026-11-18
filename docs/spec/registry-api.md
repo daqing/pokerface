@@ -69,11 +69,15 @@ Every response carries `X-Request-Id`, on success and errors alike:
 
 ## Routing
 
-`registry/api.emo`'s `handle` owns the dispatch:
+`registry/router.emo` owns the dispatch, with a `Service` (config, database
+probe, blob store, manifest lookup) carrying what the routes need:
 
-1. `/v2` or `/v2/` → 200 `{}` (GET) or 405.
-2. `/healthz`, `/readyz` → `registry.health.handle_health`.
-3. everything else → 404 `NAME_UNKNOWN` with `detail: "<METHOD> <path>"`.
+1. `/v2/<name>/manifests/<reference>` → `registry.manifests.handle`
+   ([registry-manifests.md](registry-manifests.md)).
+2. `/v2` or `/v2/` → 200 `{}` (GET) or 405.
+3. `/healthz`, `/readyz` → `registry.health.handle_health`.
+4. everything else → 404 `NAME_UNKNOWN` with `detail: "<METHOD> <path>"`.
 
-Later protocol tasks add their routes ahead of the catch-all; the error
-helpers, request id, and version header stay as they are.
+`registry/api.emo` holds the shared pieces (error envelope, codes, request
+id, decoration); `router.handle` decorates whatever a route answered. Later
+protocol tasks add their routes ahead of the catch-all.
