@@ -358,7 +358,7 @@ Exit criteria:
 | [x] | T2.10 | Blob upload: POST / PUT | T2.4, T2.7 | 3h |
 | [x] | T2.11 | Chunked upload and resumable transfers: PATCH / GET / DELETE | T2.10 | 3h |
 | [x] | T2.12 | Manifest PUT and tag updates | T2.3, T2.10, T2.11 | 2-3h |
-| [ ] | T2.13 | Resolve / metadata API | T2.8, T2.12 | 2h |
+| [x] | T2.13 | Resolve / metadata API | T2.8, T2.12 | 2h |
 | [x] | T2.14 | Authentication and token service | T2.7 | 3-4h |
 | [ ] | T2.15 | Cache headers, ETag, and CDN behavior | T2.8, T2.9 | 2h |
 | [ ] | T2.16 | Tag listing and pagination | T2.12 | 2h |
@@ -529,6 +529,8 @@ Suggested tables:
 **Acceptance**: Existing tags return full information; missing tags return 404; unauthorized requests return 401/403; storage credentials are never exposed; `pokerface` can use it as a read-only fallback when Git metadata is missing.
 
 **Depends on**: T2.8, T2.12 · **Estimate**: 2h
+
+> **Notes** (2026-11-19, ~2h): Done. `registry/resolve.emo` serves `GET /api/v1/resolve?repository=<name>&tag=<tag>`: missing/empty parameters are 400, a name failing the OCI grammar is 400 `NAME_INVALID`, an unknown tag is 404 `MANIFEST_UNKNOWN` with `<repo>:<tag>`; success answers one JSON document — repository, tag, digest, media type, `platforms` (from an index's own entries, or an image manifest's **config blob** via the blob store; `variant` when set), and `revision` from the document's `org.opencontainers.image.revision` annotation (omitted when absent). No credential or store setting ever appears in a response. Auth rides the router: with auth enabled the endpoint needs `repository:<name>:pull` for the queried name (the scope is computed from the query, answered with the standard 401 challenge) — anonymous, wrong-repository, and pull-less tokens all fail; without auth it is open. The response always decorates with the API version and request id. Tests: 14 in `test/registry_resolve.emo` (full document, absent revision, index platforms with variants, 400/404/500 paths, GET-only, router dispatch without auth, the auth-enabled challenge/pass legs); `emo test` 460/460. Manually verified over the wire: a skopeo-pushed tag resolves with the amd64/linux platform, a missing tag is 404, missing parameters are 400. Gotchas: indexed-element narrowing (`items[0].is(...)` then `items[0].entries()`) does not typecheck — bind the element to a local first; a `var` holding a narrowed `JsonArray` keeps the `Json` type, so narrow again at the read site.
 
 #### T2.14 Authentication and Token Service
 

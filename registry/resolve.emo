@@ -1,0 +1,129 @@
+// T2.13: the read-only resolve/metadata API — `GET
+// /api/v1/resolve?repository=<name>&tag=<tag>` answers the digest, media
+// type, platforms, and the optional commit annotation
+// (`org.opencontainers.image.revision`) without any storage credential. The
+// pokerface CLI uses it as a fallback when Git metadata is missing.
+//
+// Authentication rides the router's gate: the route needs
+// `repository:<name>:pull`, computed from the query — an anonymous or
+// wrongly-scoped request answers 401 with the same challenge as /v2/
+// (registry/auth.emo). Lookups reuse the T2.8 manifest store; platforms come
+// from an index's own entries or, for an image manifest, from its config
+// blob; the revision comes from the document's `annotations`.
+// Spec: docs/spec/registry-resolve.md.
+
+require "httpd"
+require "json"
+
+const route_path = "/api/v1/resolve"
+const revision_annotation = "org.opencontainers.image.revision"
+
+def is_route(path String) Bool {
+  return path == route_path
+}
+
+def handle(req httpd.Request, store registry.manifests.ManifestStore, blobs registry.blobstore.BlobStore) httpd.Response {
+  if req.method != "GET" {
+    return registry.api.method_not_allowed("GET")
+  }
+  if !req.query.has("repository") || !req.query.has("tag") {
+    return registry.api.bad_request(registry.api.code_name_unknown, "the repository and tag query parameters are required", req.path)
+  }
+  const repository = req.query.get("repository")
+  const tag = req.query.get("tag")
+  if !registry.uploads.valid_name(repository) {
+    return registry.api.bad_request(registry.api.code_name_invalid, "invalid repository name", repository)
+  }
+  case store.lookup(repository, tag) {
+    (R.error, why) then { return registry.api.server_error("manifest lookup failed", why) }
+    (R.ok, payload) then {
+      if !payload.found {
+        return registry.api.not_found(registry.api.code_manifest_unknown, "manifest unknown", repository + ":" + tag)
+      }
+      case describe(repository, tag, payload, blobs) {
+        (R.error, why) then { return registry.api.server_error("metadata assembly failed", why) }
+        (R.ok, body) then {
+          return httpd.response(200, [("Content-Type", "application/json; charset=utf-8")], body)
+        }
+      }
+    }
+  }
+}
+
+// The metadata document: digest, media type, platforms, and the revision
+// annotation when the manifest (or index) carries it.
+def describe(repository String, tag String, payload registry.manifests.ManifestPayload, blobs registry.blobstore.BlobStore) (R, String) {
+  case registry.oci.parse_document(payload.body, payload.media_type) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, doc) then {
+      var platforms = []
+      var revision = ""
+      if doc.is_index() {
+        const entries = doc.index.manifests
+        var i = 0
+        while i < entries.length() {
+          const platform = entries[i].platform
+          var entry = []
+          entry = entry.append(("architecture", json.string(platform.architecture)))
+          entry = entry.append(("os", json.string(platform.os)))
+          if platform.variant != "" {
+            entry = entry.append(("variant", json.string(platform.variant)))
+          }
+          platforms = platforms.append(json.object(entry))
+          i = i + 1
+        }
+        revision = find_annotation(doc.index.annotations, revision_annotation)
+      } else {
+        case config_platform(blobs, doc.manifest.config.digest) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, entry) then { platforms = platforms.append(entry) }
+        }
+        revision = find_annotation(doc.manifest.annotations, revision_annotation)
+      }
+      var fields = [
+        ("repository", json.string(repository)),
+        ("tag", json.string(tag)),
+        ("digest", json.string(payload.digest)),
+        ("media_type", json.string(payload.media_type)),
+        ("platforms", json.array(platforms))
+      ]
+      if revision != "" {
+        fields = fields.append(("revision", json.string(revision)))
+      }
+      return (R.ok, json.encode(json.object(fields)))
+    }
+  }
+}
+
+// An image manifest's platform lives in its config blob.
+def config_platform(blobs registry.blobstore.BlobStore, config_digest String) (R, json.Json) {
+  case blobs.get(config_digest) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, body) then {
+      case registry.oci.parse_config(body) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, config) then {
+          var entry = []
+          entry = entry.append(("architecture", json.string(config.architecture)))
+          entry = entry.append(("os", json.string(config.os)))
+          if config.variant != "" {
+            entry = entry.append(("variant", json.string(config.variant)))
+          }
+          return (R.ok, json.object(entry))
+        }
+      }
+    }
+  }
+}
+
+def find_annotation(annotations Array[(String, String)], name String) String {
+  var i = 0
+  while i < annotations.length() {
+    const (key, value) = annotations[i]
+    if key == name {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}

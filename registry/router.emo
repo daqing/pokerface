@@ -31,6 +31,9 @@ def route(req httpd.Request, service Service) httpd.Response {
   if req.path == "/token" {
     return registry.auth.handle_token(req, service.config.auth, registry.db.now_seconds())
   }
+  if registry.resolve.is_route(req.path) {
+    return resolve_route(req, service)
+  }
   if service.config.auth.enabled {
     const access = registry.auth.required_access(req.path, req.method)
     const (kind, repository, action) = access
@@ -68,4 +71,29 @@ def route(req httpd.Request, service Service) httpd.Response {
     return registry.health.handle_health(req, service.config, service.db, service.blob)
   }
   return registry.api.not_found(registry.api.code_name_unknown, "unknown route", req.method + " " + req.path)
+}
+
+// The resolve API authenticates against the repository in its query: pull
+// scope on that name, the same challenge as /v2/.
+def resolve_route(req httpd.Request, service Service) httpd.Response {
+  if service.config.auth.enabled {
+    if req.query.has("repository") {
+      const repository = req.query.get("repository")
+      case registry.auth.check_token(req, service.config.auth, "repository", repository, "pull", registry.db.now_seconds()) {
+        (R.error, why) then {
+          return registry.auth.unauthorized(service.config.auth,
+            "repository:" + repository + ":pull", registry.auth.error_class(why), why)
+        }
+        (R.ok, _) then { }
+      }
+    } else {
+      case registry.auth.check_token(req, service.config.auth, "probe", "", "", registry.db.now_seconds()) {
+        (R.error, why) then {
+          return registry.auth.unauthorized(service.config.auth, "", registry.auth.error_class(why), why)
+        }
+        (R.ok, _) then { }
+      }
+    }
+  }
+  return registry.resolve.handle(req, service.manifests, service.blob_store)
 }

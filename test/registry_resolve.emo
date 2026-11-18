@@ -1,0 +1,540 @@
+// T2.13 tests for the resolve/metadata API — run with `emo test`.
+//
+// The manifest store and the blob store are fakes; the auth-enabled router
+// legs pin the 401 challenge for anonymous and wrong-scope requests.
+
+const resolve = registry.resolve
+const api = registry.api
+
+require "httpd"
+require "json"
+require "crypto"
+
+const oci_manifest_type = "application/vnd.oci.image.manifest.v1+json"
+const oci_index_type = "application/vnd.oci.image.index.v1+json"
+const config_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+class FakeManifestStore {
+  def init(payload registry.manifests.ManifestPayload, failure String) {
+    self.payload = Box.new(payload)
+    self.failure = Box.new(failure)
+  }
+
+  def lookup(repository String, reference String) (R, registry.manifests.ManifestPayload) {
+    const why = self.failure.read()
+    if why != "" {
+      return (R.error, why)
+    }
+    return (R.ok, self.payload.read())
+  }
+}
+
+class FakeBlobStore {
+  def init(config_body String) {
+    self.config_body = Box.new(config_body)
+  }
+
+  def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put")
+  }
+
+  def put_file(digest String, source String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put_file")
+  }
+
+  def get(digest String) (R, String) {
+    if digest == config_digest {
+      return (R.ok, self.config_body.read())
+    }
+    return (R.error, registry.blobstore.not_found(digest))
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    return (R.error, "fake: range")
+  }
+
+  def head(digest String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, -1, false))
+  }
+
+  def delete(digest String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def presign_get(digest String, ttl_seconds Int64) String {
+    return ""
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers.
+
+def digest_of(body String) String {
+  return "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+def manifest_with_revision(revision String) String {
+  var body = "{\"schemaVersion\":2,\"mediaType\":\"" + oci_manifest_type
+    + "\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\""
+    + config_digest + "\",\"size\":40},\"layers\":[]"
+  if revision != "" {
+    body = body + ",\"annotations\":{\"org.opencontainers.image.revision\":\"" + revision + "\"}"
+  }
+  return body + "}"
+}
+
+const config_body = "{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{\"type\":\"layers\",\"diff_ids\":[]}}"
+
+def manifest_payload(body String) registry.manifests.ManifestPayload {
+  return registry.manifests.ManifestPayload.new(true, digest_of(body), oci_manifest_type, body)
+}
+
+def index_payload() registry.manifests.ManifestPayload {
+  const body = "{\"schemaVersion\":2,\"mediaType\":\"" + oci_index_type
+    + "\",\"manifests\":[{\"mediaType\":\"" + oci_manifest_type + "\",\"digest\":\""
+    + config_digest + "\",\"size\":10,\"platform\":{\"architecture\":\"arm64\",\"os\":\"linux\",\"variant\":\"v8\"}}],"
+    + "\"annotations\":{\"org.opencontainers.image.revision\":\"abc123\"}}"
+  return registry.manifests.ManifestPayload.new(true, digest_of(body), oci_index_type, body)
+}
+
+def resolve_request(query Map[String, String]) httpd.Request {
+  return httpd.Request.new(
+    method: "GET",
+    target: "/api/v1/resolve",
+    path: "/api/v1/resolve",
+    query: query,
+    proto: "HTTP/1.1",
+    headers: [],
+    body: "",
+    params: Map.new()
+  )
+}
+
+def tag_query(repository String, tag String) Map[String, String] {
+  const query = Map.new()
+  query.set("repository", repository)
+  query.set("tag", tag)
+  return query
+}
+
+def field_of(body String, name String) String {
+  case json.decode(body) {
+    (R.error, _) then { return "" }
+    (R.ok, doc) then {
+      if doc.is(json.JsonObject) {
+        const entries = doc.entries()
+        var i = 0
+        while i < entries.length() {
+          const (key, value) = entries[i]
+          if key == name {
+            if value.is(json.JsonString) {
+              return value.as_string()
+            }
+          }
+          i = i + 1
+        }
+      }
+      return ""
+    }
+  }
+}
+
+def error_field(body String, field String) String {
+  case json.decode(body) {
+    (R.error, _) then { return "" }
+    (R.ok, doc) then { return scan_errors(doc, field) }
+  }
+}
+
+def scan_errors(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == "errors" {
+        if value.is(json.JsonArray) {
+          const items = value.items()
+          if items.length() > 0 {
+            return scan_member(items[0], field)
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+def scan_member(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == field {
+        if value.is(json.JsonString) {
+          return value.as_string()
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+def header_value(headers Array[(String, String)], name String) String {
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == name.lower() {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+// ---------------------------------------------------------------------------
+// Happy paths.
+
+def test_resolve_returns_the_full_metadata() {
+  const body = manifest_with_revision("0123abcd")
+  const response = resolve.handle(resolve_request(tag_query("acme/app", "v1")), FakeManifestStore.new(manifest_payload(body), ""), FakeBlobStore.new(config_body))
+  expect_equal(200, response.status)
+  expect_equal("application/json; charset=utf-8", header_value(response.headers, "content-type"))
+  expect_equal("acme/app", field_of(response.body, "repository"))
+  expect_equal("v1", field_of(response.body, "tag"))
+  expect_equal(digest_of(body), field_of(response.body, "digest"))
+  expect_equal(oci_manifest_type, field_of(response.body, "media_type"))
+  expect_equal("0123abcd", field_of(response.body, "revision"))
+  // The single platform comes from the config blob.
+  case json.decode(response.body) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, doc) then {
+      if doc.is(json.JsonObject) {
+        const entries = doc.entries()
+        var platforms = json.array([])
+        var i = 0
+        while i < entries.length() {
+          const (key, value) = entries[i]
+          if key == "platforms" {
+            if value.is(json.JsonArray) {
+              const arr = value
+              platforms = arr
+            }
+          }
+          i = i + 1
+        }
+        if platforms.is(json.JsonArray) {
+          const arr = platforms
+          const items = arr.items()
+          expect_equal(1, items.length())
+          const item0 = items[0]
+          if item0.is(json.JsonObject) {
+            const fields = item0.entries()
+            var j = 0
+            while j < fields.length() {
+              const (key, value) = fields[j]
+              if key == "architecture" {
+                expect_equal("amd64", value.as_string())
+              }
+              if key == "os" {
+                expect_equal("linux", value.as_string())
+              }
+              j = j + 1
+            }
+          }
+        }
+      } else {
+        expect_fail("the metadata is not an object")
+      }
+    }
+  }
+}
+
+def test_resolve_omits_an_absent_revision() {
+  const body = manifest_with_revision("")
+  const response = resolve.handle(resolve_request(tag_query("acme/app", "v1")), FakeManifestStore.new(manifest_payload(body), ""), FakeBlobStore.new(config_body))
+  expect_equal(200, response.status)
+  expect_true(response.body.index_of("revision") < 0)
+}
+
+def test_resolve_an_index_reports_its_platforms() {
+  const response = resolve.handle(resolve_request(tag_query("acme/app", "latest")), FakeManifestStore.new(index_payload(), ""), FakeBlobStore.new(config_body))
+  expect_equal(200, response.status)
+  expect_equal("abc123", field_of(response.body, "revision"))
+  case json.decode(response.body) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, doc) then {
+      if doc.is(json.JsonObject) {
+        const entries = doc.entries()
+        var i = 0
+        var found_variant = false
+        while i < entries.length() {
+          const (key, value) = entries[i]
+          if key == "platforms" {
+            if value.is(json.JsonArray) {
+              const arr = value
+              const items = arr.items()
+              expect_equal(1, items.length())
+              const idx0 = items[0]
+              if idx0.is(json.JsonObject) {
+                const fields = idx0.entries()
+                var j = 0
+                while j < fields.length() {
+                  const (key2, value2) = fields[j]
+                  if key2 == "variant" && value2.is(json.JsonString) {
+                    expect_equal("v8", value2.as_string())
+                    found_variant = true
+                  }
+                  j = j + 1
+                }
+              }
+            }
+          }
+          i = i + 1
+        }
+        expect_true(found_variant)
+      } else {
+        expect_fail("the metadata is not an object")
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Failure paths.
+
+def test_resolve_missing_tag_is_a_404() {
+  const absent = registry.manifests.absent_payload()
+  const response = resolve.handle(resolve_request(tag_query("acme/app", "nope")), FakeManifestStore.new(absent, ""), FakeBlobStore.new(config_body))
+  expect_equal(404, response.status)
+  expect_equal(api.code_manifest_unknown, error_field(response.body, "code"))
+  expect_true(error_field(response.body, "detail").index_of("acme/app:nope") >= 0)
+}
+
+def test_resolve_missing_parameters_are_a_400() {
+  const response = resolve.handle(resolve_request(Map.new()), FakeManifestStore.new(registry.manifests.absent_payload(), ""), FakeBlobStore.new(config_body))
+  expect_equal(400, response.status)
+  const partial_query = Map.new()
+  partial_query.set("repository", "acme/app")
+  const partial = resolve.handle(resolve_request(partial_query), FakeManifestStore.new(registry.manifests.absent_payload(), ""), FakeBlobStore.new(config_body))
+  expect_equal(400, partial.status)
+}
+
+def test_resolve_invalid_repository_name_is_a_400() {
+  const response = resolve.handle(resolve_request(tag_query("ACME/app", "v1")), FakeManifestStore.new(registry.manifests.absent_payload(), ""), FakeBlobStore.new(config_body))
+  expect_equal(400, response.status)
+  expect_equal(api.code_name_invalid, error_field(response.body, "code"))
+}
+
+def test_resolve_store_failure_is_a_500() {
+  const response = resolve.handle(resolve_request(tag_query("acme/app", "v1")), FakeManifestStore.new(registry.manifests.absent_payload(), "database is down"), FakeBlobStore.new(config_body))
+  expect_equal(500, response.status)
+  expect_true(error_field(response.body, "detail").index_of("database is down") >= 0)
+}
+
+def test_resolve_serves_get_only() {
+  const post = httpd.Request.new(
+    method: "POST",
+    target: "/api/v1/resolve",
+    path: "/api/v1/resolve",
+    query: tag_query("acme/app", "v1"),
+    proto: "HTTP/1.1",
+    headers: [],
+    body: "",
+    params: Map.new()
+  )
+  const response = resolve.handle(post, FakeManifestStore.new(registry.manifests.absent_payload(), ""), FakeBlobStore.new(config_body))
+  expect_equal(405, response.status)
+  expect_equal("GET", header_value(response.headers, "allow"))
+}
+
+// ---------------------------------------------------------------------------
+// The router: dispatch and authentication.
+
+class ResFakeDb {
+  def init() {
+  }
+
+  def ping() Bool {
+    return true
+  }
+
+  def path() String {
+    return "/tmp/fake.db"
+  }
+}
+
+class ResFakeHealth {
+  def init() {
+  }
+
+  def probe() (R, String) {
+    return (R.ok, "fs:/tmp/fake")
+  }
+}
+
+class ResFakeLinks {
+  def init() {
+  }
+
+  def linked(repository String, digest String) (R, registry.blobs.BlobLink) {
+    return (R.ok, registry.blobs.absent_link())
+  }
+}
+
+class ResFakeManifests {
+  def init(payload registry.manifests.ManifestPayload) {
+    self.payload = Box.new(payload)
+  }
+
+  def lookup(repository String, reference String) (R, registry.manifests.ManifestPayload) {
+    return (R.ok, self.payload.read())
+  }
+}
+
+class ResFakeWriter {
+  def init() {
+  }
+
+  def put(repository String, media_type String, body String) (R, String) {
+    return (R.ok, "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+  }
+
+  def tag(repository String, tag String, digest String) (R, Bool) {
+    return (R.ok, true)
+  }
+}
+
+class ResFakeUploads {
+  def init() {
+  }
+
+  def start(repository String) (R, String) {
+    return (R.ok, "sess-1")
+  }
+
+  def lookup(id String) (R, registry.uploads.UploadSession) {
+    return (R.ok, registry.uploads.absent_session())
+  }
+
+  def append(id String, body String, start Int64, ranged Bool) (R, Int64) {
+    return (R.error, "fake: append")
+  }
+
+  def complete(id String, digest String, size Int64) (R, Bool) {
+    return (R.ok, true)
+  }
+
+  def cancel(id String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def part_path(id String) (R, String) {
+    return (R.ok, "/tmp/fake-part")
+  }
+}
+
+class ResFakeStore {
+  def init() {
+  }
+
+  def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, 0, true))
+  }
+
+  def put_file(digest String, source String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put_file")
+  }
+
+  def get(digest String) (R, String) {
+    if digest == config_digest {
+      return (R.ok, config_body)
+    }
+    return (R.error, registry.blobstore.not_found(digest))
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    return (R.error, "fake: range")
+  }
+
+  def head(digest String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, -1, false))
+  }
+
+  def delete(digest String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def presign_get(digest String, ttl_seconds Int64) String {
+    return ""
+  }
+}
+
+def res_config(auth_enabled Bool) registry.config.RegistryConfig {
+  return registry.config.RegistryConfig.new(
+    registry.config.RegistryListen.new("127.0.0.1", 5000),
+    "/tmp/pf-resolve-router",
+    "/tmp/pf-resolve-router/registry.db",
+    registry.config.RegistryStore.new("fs", "/tmp/pf-resolve-router/blobs", registry.config.default_s3()),
+    registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
+    "/tmp/pf-resolve-router/shutdown",
+    "<test>",
+    registry.config.RegistryAuth.new(auth_enabled, "http://127.0.0.1:5000/token", "pokerface-registry", "pokerface-registry", 3600,
+      [registry.config.AuthUser.new("alice", "wonderland")], "resolve-test-key")
+  )
+}
+
+def res_service(auth_enabled Bool) registry.router.Service {
+  const body = manifest_with_revision("0123abcd")
+  return registry.router.Service.new(res_config(auth_enabled), ResFakeDb.new(), ResFakeHealth.new(), ResFakeStore.new(), ResFakeLinks.new(), ResFakeManifests.new(manifest_payload(body)), ResFakeUploads.new(), ResFakeWriter.new())
+}
+
+def bearer_request(query Map[String, String], token String) httpd.Request {
+  var headers = []
+  if token != "" {
+    headers = headers.append(("Authorization", "Bearer " + token))
+  }
+  return httpd.Request.new(
+    method: "GET",
+    target: "/api/v1/resolve",
+    path: "/api/v1/resolve",
+    query: query,
+    proto: "HTTP/1.1",
+    headers: headers,
+    body: "",
+    params: Map.new()
+  )
+}
+
+def res_token(scope String) String {
+  const settings = registry.config.RegistryAuth.new(true, "http://127.0.0.1:5000/token", "pokerface-registry", "pokerface-registry", 3600,
+    [registry.config.AuthUser.new("alice", "wonderland")], "resolve-test-key")
+  case registry.auth.mint_token(settings, "alice", [scope], registry.db.now_seconds()) {
+    (R.ok, token) then { return token }
+    (R.error, why) then { expect_fail(why) }
+  }
+  return ""
+}
+
+def test_the_router_dispatches_resolve_without_auth() {
+  const service = res_service(false)
+  const response = registry.router.handle(resolve_request(tag_query("acme/app", "v1")), service)
+  expect_equal(200, response.status)
+  expect_equal("0123abcd", field_of(response.body, "revision"))
+  expect_equal("registry/2.0", header_value(response.headers, "docker-distribution-api-version"))
+}
+
+def test_the_router_challenges_resolve_with_auth_enabled() {
+  const service = res_service(true)
+  const anonymous = registry.router.handle(bearer_request(tag_query("acme/app", "v1"), ""), service)
+  expect_equal(401, anonymous.status)
+  expect_true(header_value(anonymous.headers, "www-authenticate").index_of("scope=\"repository:acme/app:pull\"") >= 0)
+  const wrong_scope = registry.router.handle(bearer_request(tag_query("acme/app", "v1"), res_token("repository:other/app:pull")), service)
+  expect_equal(401, wrong_scope.status)
+  const ok = registry.router.handle(bearer_request(tag_query("acme/app", "v1"), res_token("repository:acme/app:pull")), service)
+  expect_equal(200, ok.status)
+  expect_equal("0123abcd", field_of(ok.body, "revision"))
+}

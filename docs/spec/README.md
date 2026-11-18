@@ -25,6 +25,7 @@
 | [registry-blobs.md](registry-blobs.md) | Blob GET/HEAD, 307 presigned redirects, link checks (M2/T2.9). | `registry/blobs.emo` |
 | [registry-uploads.md](registry-uploads.md) | Blob upload: POST session, monolithic PUT with digest verification, session expiry, name grammar (M2/T2.10). | `registry/uploads.emo` |
 | [registry-auth.md](registry-auth.md) | Bearer tokens (HS256 JWT), scopes, the /token exchange, WWW-Authenticate challenges, auth config (M2/T2.14). | `registry/auth.emo`, `registry/config.emo` |
+| [registry-resolve.md](registry-resolve.md) | The /api/v1/resolve metadata endpoint: digest, media type, platforms, revision annotation, pull-scope auth (M2/T2.13). | `registry/resolve.emo` |
 
 ## M1 flow
 

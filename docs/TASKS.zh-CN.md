@@ -358,7 +358,7 @@ images:
 | [x] | T2.10 | Blob 上传：POST / PUT | T2.4、T2.7 | 3h |
 | [x] | T2.11 | 分块上传与断点续传：PATCH / GET / DELETE | T2.10 | 3h |
 | [x] | T2.12 | Manifest PUT 与 tag 更新 | T2.3、T2.10、T2.11 | 2-3h |
-| [ ] | T2.13 | 解析 / 元数据 API | T2.8、T2.12 | 2h |
+| [x] | T2.13 | 解析 / 元数据 API | T2.8、T2.12 | 2h |
 | [x] | T2.14 | 认证与 Token 服务 | T2.7 | 3-4h |
 | [ ] | T2.15 | 缓存头、ETag 与 CDN 行为 | T2.8、T2.9 | 2h |
 | [ ] | T2.16 | Tag 列表与分页 | T2.12 | 2h |
@@ -529,6 +529,8 @@ images:
 **验收**：tag 存在时返回完整信息；不存在返回 404；无权限返回 401/403；不泄露存储凭据；`pokerface` 可用它作为 Git 元数据缺失时的只读兜底。
 
 **依赖**：T2.8、T2.12 · **预估**：2h
+
+> **备注**（2026-11-19，约 2h）：已完成。`registry/resolve.emo` 提供 `GET /api/v1/resolve?repository=<name>&tag=<tag>`：参数缺失/为空返回 400，名称不合 OCI 语法返回 400 `NAME_INVALID`，未知 tag 返回 404 `MANIFEST_UNKNOWN`（detail 为 `<repo>:<tag>`）；成功返回一份 JSON 文档——repository、tag、digest、media type、`platforms`（index 取自带条目，image manifest 读其 **config blob** 经 blob store；有 variant 则带上）、以及文档 `org.opencontainers.image.revision` 注解中的 `revision`（缺失时省略）。响应从不出现任何凭据或存储配置。认证走路由器：开启认证时该端点需要针对所查名称的 `repository:<name>:pull`（scope 由查询参数计算，401 挑战与 /v2/ 一致）——匿名、跨库、无 pull 的 token 都会失败；未开启认证时公开。响应统一带 API 版本与请求 id。测试：`test/registry_resolve.emo` 14 例（完整文档、缺 revision、index 平台含 variant、400/404/500、仅 GET、无认证路由分发、开启认证的挑战/通过分支）；`emo test` 460/460。实测：skopeo 推送的 tag 解析出 amd64/linux 平台，缺失 tag 404，缺参 400。踩坑：索引元素收窄（`items[0].is(...)` 后 `items[0].entries()`）不通过类型检查——先把元素绑定到局部变量；持有收窄后 `JsonArray` 的 `var` 变量仍是 `Json` 类型，读侧需要再次收窄。
 
 #### T2.14 认证与 Token 服务
 
