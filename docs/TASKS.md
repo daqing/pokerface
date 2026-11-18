@@ -82,7 +82,7 @@ Exit criteria:
 | [x] | T1.10 | Registry authentication and manifest client | T1.5, T1.8 | 3h |
 | [x] | T1.11 | Blob downloader: retries, verification, resume | T1.10 | 3-4h |
 | [x] | T1.12 | Assemble an OCI image layout | T1.10, T1.11 | 2-3h |
-| [ ] | T1.13 | Runtime import adapter | T1.12 | 3h |
+| [x] | T1.13 | Runtime import adapter | T1.12 | 3h |
 | [ ] | T1.14 | Wire up the `pull` command and failure fallbacks | T1.9-T1.13 | 3h |
 | [ ] | T1.15 | Local cache and offline mode | T1.7, T1.14 | 2-3h |
 | [ ] | T1.16 | Error model, exit codes, and logging | T1.1 | 2h |
@@ -276,6 +276,8 @@ images:
 **Acceptance**: The Docker + skopeo path works; the podman path works; Docker without skopeo produces a clear installation hint; failed imports leave no partial image; temp files are cleaned up.
 
 **Depends on**: T1.12 · **Estimate**: 3h
+
+> **Notes** (2026-11-18, ~2.5h): Done. `src/runtime.emo` splits detection, planning, and execution so commands are constructible and testable without a runtime: `detect` probes `docker/podman/skopeo/ctr --version`; `select_runtime` honors an explicit choice (`ctr` as an alias for containerd) or prefers docker > podman > containerd; `plan` emits exact argv. Docker uses `skopeo copy oci:<dir>:<tag> docker-daemon:<image>:<tag>`, podman `containers-storage:<image>:<tag>`, and containerd creates `<layout>.oci-archive.tar` with skopeo then `ctr images import --base-name <image> <archive>` (a full ref cannot ride in the archive's `ref.name`: skopeo splits `oci-archive:path:tag` at the last colon). Every path requires skopeo and fails planning with a brew/apt/dnf installation hint when it is absent. `execute` records whether the tag pre-existed, runs the steps, verifies with `docker/podman image inspect` or an exact-line `ctr images ls --quiet` scan, and on failure removes the archive and — only when the tag did not exist before — the partially imported tag, so a pre-existing image is never touched. Errors are mapped from runner output (exit 127, daemon unreachable, permission denied) with the shared runner's `git:` prefix stripped. Tests: 20 in `test/runtime_import.emo` (detection, all three plans, auto/explicit selection, no-runtime/unknown/not-installed, the skopeo hint, bad requests, Docker success and failure paths including verification failure and pre-existing image preservation, permission/127 mapping, containerd archive cleanup on success/failure, keep, and prepare). **Manually verified end to end** with the real Docker daemon (29.9.3) and skopeo 1.25.2: the fixture layout imported as `pokerface-t113-check:latest`, `docker image inspect` succeeded, and the test image was removed afterwards. Podman and `ctr` are not installed on this machine, so those two paths are covered by command-construction/error-mapping tests only. Docs: `docs/spec/runtime-import.md` (support matrix). Gotchas: the runner's error text is `git: '<tool>' exited …` even for non-git tools; FakeRunner route tables are ordered, so a repeated probe (inspect before/after import) is expressed as the same prefix with `times` counts; no `stat` in `os`, so archive existence in tests is read through `file.read`.
 
 #### T1.14 Wire Up the `pull` Command and Failure Fallbacks
 

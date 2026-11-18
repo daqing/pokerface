@@ -82,7 +82,7 @@
 | [x] | T1.10 | Registry 认证与 Manifest 客户端 | T1.5、T1.8 | 3h |
 | [x] | T1.11 | Blob 下载器：重试、校验、续传 | T1.10 | 3-4h |
 | [x] | T1.12 | OCI 镜像布局组装 | T1.10、T1.11 | 2-3h |
-| [ ] | T1.13 | 运行时导入适配 | T1.12 | 3h |
+| [x] | T1.13 | 运行时导入适配 | T1.12 | 3h |
 | [ ] | T1.14 | `pull` 命令串联与失败回退 | T1.9-T1.13 | 3h |
 | [ ] | T1.15 | 本地缓存与离线模式 | T1.7、T1.14 | 2-3h |
 | [ ] | T1.16 | 错误模型、退出码与日志 | T1.1 | 2h |
@@ -276,6 +276,8 @@ images:
 **验收**：Docker + skopeo 路径可用；podman 路径可用；只有 Docker 没有 skopeo 时给出明确安装提示；导入失败不留下半成品镜像；临时文件清理。
 
 **依赖**：T1.12 · **预估**：3h
+
+> **备注**（2026-11-18，约 2.5h）：完成。`src/runtime.emo` 把检测、规划、执行拆开，命令无需真实运行时也能构造和测试：`detect` 用 `docker/podman/skopeo/ctr --version` 探测；`select_runtime` 尊重显式选择（`ctr` 作为 containerd 别名），自动模式按 docker > podman > containerd；`plan` 产出精确 argv。Docker 走 `skopeo copy oci:<dir>:<tag> docker-daemon:<image>:<tag>`，podman 走 `containers-storage:<image>:<tag>`，containerd 先用 skopeo 生成 `<layout>.oci-archive.tar` 再执行 `ctr images import --base-name <image> <archive>`（完整引用不能写进归档的 `ref.name`：skopeo 按最后一个冒号切分 `oci-archive:path:tag`）。所有路径都依赖 skopeo，缺失时在规划阶段就给出 brew/apt/dnf 安装提示。`execute` 先记录目标 tag 是否已存在，执行导入后用 `docker/podman image inspect` 或 `ctr images ls --quiet` 精确行匹配校验；失败时删除归档，并且**仅当 tag 原本不存在**时才删除可能残留的 tag，已有镜像绝不受影响。错误按 runner 输出映射（退出码 127、daemon 不可达、权限不足），并剥掉共享 runner 的 `git:` 前缀。测试：`test/runtime_import.emo` 共 20 个（检测、三种规划、自动/显式选择、无运行时/未知运行时/未安装、skopeo 提示、非法请求、Docker 成功与失败路径含校验失败和保留已有镜像、权限与 127 映射、containerd 归档成功/失败清理、keep、prepare）。**已用真实 Docker daemon（29.9.3）与 skopeo 1.25.2 手工端到端验证**：fixture 布局成功导入为 `pokerface-t113-check:latest`，`docker image inspect` 通过，随后删除了测试镜像。本机未安装 podman 与 `ctr`，这两条路径仅由命令构造/错误映射测试覆盖。文档：`docs/spec/runtime-import.md`（支持矩阵）。踩坑：共享 runner 即使运行非 git 工具也会返回 `git: '<tool>' exited …`；FakeRunner 路由表是有序的，同一前缀的重复探测（导入前后 inspect）用 `times` 次数表达；`os` 没有 `stat`，测试里用 `file.read` 判断归档是否存在。
 
 #### T1.14 `pull` 命令串联与失败回退
 

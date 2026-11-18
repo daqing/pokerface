@@ -1,0 +1,467 @@
+// T1.13 tests for the runtime import adapter — run with `emo test`.
+//
+// Execution never touches a real runtime here: FakeRunner answers from an
+// ordered response table (each route is consumed `times` times), records
+// every argv, and returns RealRunner-shaped errors so the mapping is
+// exercised. The Docker end-to-end check belongs to T1.14/T1.17.
+
+const runtime_mod = src.runtime
+
+class FakeResponse {
+  def init(prefix String, ok Bool, output String, times Int64) {
+    self.prefix = prefix
+    self.ok = ok
+    self.output = output
+    self.left = Box.new(times)
+  }
+}
+
+class FakeRunner {
+  def init(responses Array[FakeResponse]) {
+    self.responses = responses
+    self.calls = Box.new(ArrayBuilder.new())
+  }
+
+  def run(argv Array[String], timeout Float64) (R, String) {
+    const command = argv_text(argv)
+    self.calls.read().push(command)
+    var i = 0
+    while i < self.responses.length() {
+      const response = self.responses[i]
+      if response.left.read() > 0 && command.starts_with(response.prefix) {
+        response.left.replace(response.left.read() - 1)
+        if response.ok {
+          return (R.ok, response.output)
+        }
+        return (R.error, response.output)
+      }
+      i = i + 1
+    }
+    return (R.error, "git: '" + argv[0] + "' exited with code 1: fake has no response for '" + command + "'")
+  }
+
+  def calls_text() String {
+    var out = ""
+    const arr = self.calls.read().to_array()
+    var i = 0
+    while i < arr.length() {
+      out = out + arr[i] + "\n"
+      i = i + 1
+    }
+    return out
+  }
+
+  def call_count() Int64 {
+    return self.calls.read().to_array().length()
+  }
+}
+
+def response(prefix String, ok Bool, output String, times Int64) FakeResponse {
+  return FakeResponse.new(prefix, ok, output, times)
+}
+
+def ok_response(prefix String, output String) FakeResponse {
+  return FakeResponse.new(prefix, true, output, 1)
+}
+
+def err_response(prefix String, output String) FakeResponse {
+  return FakeResponse.new(prefix, false, output, 1)
+}
+
+def argv_text(argv Array[String]) String {
+  var out = ""
+  var i = 0
+  while i < argv.length() {
+    if i > 0 {
+      out = out + " "
+    }
+    out = out + argv[i]
+    i = i + 1
+  }
+  return out
+}
+
+def expect_contains(text String, needle String) {
+  if text.index_of(needle) < 0 {
+    expect_fail("expected '" + needle + "' in: " + text)
+  }
+}
+
+def temp_base_dir() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def runtime_tmp(name String) String {
+  return temp_base_dir() + "pokerface-runtime-test-" + os.getpid().to_string() + "-" + name
+}
+
+def make_dir(path String) {
+  case os.mkdir(path) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("cannot create " + path + ": " + why) }
+  }
+}
+
+def exists(path String) Bool {
+  case file.read(path) {
+    (R.ok, _) then { return true }
+    (R.error, _) then { return false }
+  }
+}
+
+def all_tools() src.runtime.Tools {
+  return src.runtime.Tools.new(true, true, true, true)
+}
+
+def request(image String, tag String, layout String, keep Bool) src.runtime.ImportRequest {
+  return src.runtime.ImportRequest.new(image, tag, layout, keep)
+}
+
+// ---------------------------------------------------------------------------
+// Detection and planning.
+
+def test_detect_reports_each_tool() {
+  const runner = FakeRunner.new([
+    ok_response("docker --version", "Docker version 29.9.3"),
+    err_response("podman --version", "git: 'podman' exited with code 127: "),
+    ok_response("skopeo --version", "skopeo version 1.25.2"),
+    err_response("ctr --version", "git: 'ctr' exited with code 127: ")
+  ])
+  const tools = runtime_mod.detect(runner)
+  expect_true(tools.docker)
+  expect_true(!tools.podman)
+  expect_true(tools.skopeo)
+  expect_true(!tools.ctr)
+  expect_equal(4, runner.call_count())
+}
+
+def test_docker_plan_uses_docker_daemon_transport() {
+  case runtime_mod.plan(all_tools(), "docker", request("registry.example.com/acme/app", "latest", "/tmp/oci-layout", false)) {
+    (R.ok, plan) then {
+      expect_equal("docker", plan.runtime)
+      expect_equal("docker", plan.tool)
+      expect_equal("registry.example.com/acme/app:latest", plan.ref)
+      expect_equal(1, plan.import_steps.length())
+      expect_equal("skopeo", plan.import_steps[0].tool)
+      expect_equal("skopeo copy oci:/tmp/oci-layout:latest docker-daemon:registry.example.com/acme/app:latest", argv_text(plan.import_steps[0].argv))
+      expect_equal("docker image inspect registry.example.com/acme/app:latest", argv_text(plan.inspect_argv))
+      expect_true(!plan.inspect_lines)
+      expect_equal("docker image rm registry.example.com/acme/app:latest", argv_text(plan.remove_argv))
+      expect_equal("", plan.archive_path)
+    }
+    (R.error, why) then { expect_fail("docker plan failed: " + why) }
+  }
+}
+
+def test_podman_plan_uses_containers_storage() {
+  case runtime_mod.plan(all_tools(), "podman", request("registry.example.com/acme/app", "v1.2.0", "/tmp/oci-layout", false)) {
+    (R.ok, plan) then {
+      expect_equal("podman", plan.runtime)
+      expect_equal("skopeo", plan.import_steps[0].tool)
+      expect_equal("skopeo copy oci:/tmp/oci-layout:v1.2.0 containers-storage:registry.example.com/acme/app:v1.2.0", argv_text(plan.import_steps[0].argv))
+      expect_equal("podman image inspect registry.example.com/acme/app:v1.2.0", argv_text(plan.inspect_argv))
+      expect_equal("podman image rm registry.example.com/acme/app:v1.2.0", argv_text(plan.remove_argv))
+    }
+    (R.error, why) then { expect_fail("podman plan failed: " + why) }
+  }
+}
+
+def test_containerd_plan_builds_archive_then_imports() {
+  case runtime_mod.plan(all_tools(), "containerd", request("registry.example.com/acme/app", "latest", "/tmp/oci-layout", false)) {
+    (R.ok, plan) then {
+      expect_equal("containerd", plan.runtime)
+      expect_equal("ctr", plan.tool)
+      expect_equal(2, plan.import_steps.length())
+      expect_equal("skopeo", plan.import_steps[0].tool)
+      expect_equal("skopeo copy oci:/tmp/oci-layout:latest oci-archive:/tmp/oci-layout.oci-archive.tar:latest", argv_text(plan.import_steps[0].argv))
+      expect_equal("ctr", plan.import_steps[1].tool)
+      expect_equal("ctr images import --base-name registry.example.com/acme/app /tmp/oci-layout.oci-archive.tar", argv_text(plan.import_steps[1].argv))
+      expect_equal("ctr images ls --quiet", argv_text(plan.inspect_argv))
+      expect_true(plan.inspect_lines)
+      expect_equal("/tmp/oci-layout.oci-archive.tar", plan.archive_path)
+    }
+    (R.error, why) then { expect_fail("containerd plan failed: " + why) }
+  }
+}
+
+def test_auto_selection_prefers_docker_then_podman_then_ctr() {
+  case runtime_mod.plan(src.runtime.Tools.new(true, true, true, true), "", request("app", "latest", "/l", false)) {
+    (R.ok, plan) then { expect_equal("docker", plan.runtime) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case runtime_mod.plan(src.runtime.Tools.new(false, true, true, true), "", request("app", "latest", "/l", false)) {
+    (R.ok, plan) then { expect_equal("podman", plan.runtime) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case runtime_mod.plan(src.runtime.Tools.new(false, false, true, true), "", request("app", "latest", "/l", false)) {
+    (R.ok, plan) then { expect_equal("containerd", plan.runtime) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case runtime_mod.plan(src.runtime.Tools.new(false, true, true, true), "ctr", request("app", "latest", "/l", false)) {
+    (R.ok, plan) then { expect_equal("containerd", plan.runtime) }
+    (R.error, why) then { expect_fail(why) }
+  }
+}
+
+def test_no_runtime_is_a_clear_error() {
+  case runtime_mod.plan(src.runtime.Tools.new(false, false, true, false), "", request("app", "latest", "/l", false)) {
+    (R.ok, _) then { expect_fail("expected a no-runtime error") }
+    (R.error, why) then {
+      expect_contains(why, "no container runtime found")
+      expect_contains(why, "docker")
+      expect_contains(why, "podman")
+    }
+  }
+}
+
+def test_requested_runtime_must_be_installed() {
+  case runtime_mod.plan(src.runtime.Tools.new(false, true, true, false), "docker", request("app", "latest", "/l", false)) {
+    (R.ok, _) then { expect_fail("expected a not-installed error") }
+    (R.error, why) then {
+      expect_contains(why, "requested runtime 'docker' is not installed")
+    }
+  }
+}
+
+def test_unknown_runtime_is_rejected() {
+  case runtime_mod.plan(all_tools(), "lxc", request("app", "latest", "/l", false)) {
+    (R.ok, _) then { expect_fail("expected an unknown-runtime error") }
+    (R.error, why) then {
+      expect_contains(why, "unknown runtime 'lxc'")
+      expect_contains(why, "docker, podman, containerd")
+    }
+  }
+}
+
+def test_docker_without_skopeo_hints_the_install() {
+  case runtime_mod.plan(src.runtime.Tools.new(true, false, false, false), "docker", request("app", "latest", "/l", false)) {
+    (R.ok, _) then { expect_fail("expected a skopeo hint") }
+    (R.error, why) then {
+      expect_contains(why, "requires skopeo")
+      expect_contains(why, "brew install skopeo")
+      expect_contains(why, "apt-get install skopeo")
+    }
+  }
+}
+
+def test_plan_rejects_bad_requests() {
+  case runtime_mod.plan(all_tools(), "docker", request("", "latest", "/l", false)) {
+    (R.ok, _) then { expect_fail("expected an empty-image error") }
+    (R.error, why) then { expect_contains(why, "image name is empty") }
+  }
+  case runtime_mod.plan(all_tools(), "docker", request("app", "", "/l", false)) {
+    (R.ok, _) then { expect_fail("expected an empty-tag error") }
+    (R.error, why) then { expect_contains(why, "tag is empty") }
+  }
+  case runtime_mod.plan(all_tools(), "docker", request("app", "bad:tag", "/l", false)) {
+    (R.ok, _) then { expect_fail("expected an invalid-tag error") }
+    (R.error, why) then { expect_contains(why, "not a valid OCI tag") }
+  }
+  case runtime_mod.plan(all_tools(), "docker", request("app", "latest", "", false)) {
+    (R.ok, _) then { expect_fail("expected an empty-layout error") }
+    (R.error, why) then { expect_contains(why, "layout directory is empty") }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Execution.
+
+def docker_plan(keep Bool) src.runtime.ImportPlan {
+  case runtime_mod.plan(all_tools(), "docker", request("registry.example.com/acme/app", "latest", "/tmp/oci-layout", keep)) {
+    (R.ok, plan) then { return plan }
+    (R.error, why) then {
+      expect_fail("docker plan failed: " + why)
+      return runtime_mod.plan_for("docker", request("app", "latest", "/tmp/oci-layout", keep))
+    }
+  }
+}
+
+def test_docker_import_success_verifies_and_needs_no_cleanup() {
+  const runner = FakeRunner.new([
+    err_response("docker image inspect", "git: 'docker' exited with code 1: Error: No such image"),
+    ok_response("skopeo copy", ""),
+    ok_response("docker image inspect", "[]")
+  ])
+  case runtime_mod.execute(runner, docker_plan(false), 30.0) {
+    (R.error, why) then { expect_fail("import failed: " + why) }
+    (R.ok, result) then {
+      expect_equal("docker", result.runtime)
+      expect_equal("registry.example.com/acme/app:latest", result.ref)
+    }
+  }
+  const calls = runner.calls_text()
+  expect_contains(calls, "skopeo copy oci:/tmp/oci-layout:latest docker-daemon:registry.example.com/acme/app:latest")
+  expect_equal(3, runner.call_count())
+  expect_true(calls.index_of("image rm") < 0)
+}
+
+def test_import_failure_maps_daemon_error_and_removes_partial_tag() {
+  const runner = FakeRunner.new([
+    err_response("docker image inspect", "git: 'docker' exited with code 1: Error: No such image"),
+    err_response("skopeo copy", "git: 'skopeo' exited with code 1: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"),
+    ok_response("docker image rm", "")
+  ])
+  case runtime_mod.execute(runner, docker_plan(false), 30.0) {
+    (R.ok, _) then { expect_fail("expected an import failure") }
+    (R.error, why) then {
+      expect_contains(why, "cannot reach the container runtime")
+      expect_contains(why, "start Docker, Podman, or containerd")
+    }
+  }
+  const calls = runner.calls_text()
+  expect_contains(calls, "docker image rm registry.example.com/acme/app:latest")
+}
+
+def test_failed_import_keeps_a_preexisting_image() {
+  const runner = FakeRunner.new([
+    ok_response("docker image inspect", "[]"),
+    err_response("skopeo copy", "git: 'skopeo' exited with code 1: unexpected EOF")
+  ])
+  case runtime_mod.execute(runner, docker_plan(false), 30.0) {
+    (R.ok, _) then { expect_fail("expected an import failure") }
+    (R.error, why) then { expect_contains(why, "import into docker failed") }
+  }
+  const calls = runner.calls_text()
+  expect_true(calls.index_of("image rm") < 0)
+  expect_equal(2, runner.call_count())
+}
+
+def test_success_without_tag_verification_is_a_failure() {
+  const runner = FakeRunner.new([
+    err_response("docker image inspect", "git: 'docker' exited with code 1: Error: No such image"),
+    ok_response("skopeo copy", ""),
+    err_response("docker image inspect", "git: 'docker' exited with code 1: Error: No such image"),
+    ok_response("docker image rm", "")
+  ])
+  case runtime_mod.execute(runner, docker_plan(false), 30.0) {
+    (R.ok, _) then { expect_fail("expected a verification failure") }
+    (R.error, why) then {
+      expect_contains(why, "reported success but")
+      expect_contains(why, "is not present after import")
+    }
+  }
+  expect_contains(runner.calls_text(), "docker image rm registry.example.com/acme/app:latest")
+}
+
+def test_permission_error_is_mapped() {
+  const runner = FakeRunner.new([
+    err_response("docker image inspect", "git: 'docker' exited with code 1: Error: No such image"),
+    err_response("skopeo copy", "git: 'skopeo' exited with code 1: permission denied while trying to connect to the Docker daemon socket"),
+    ok_response("docker image rm", "")
+  ])
+  case runtime_mod.execute(runner, docker_plan(false), 30.0) {
+    (R.ok, _) then { expect_fail("expected a permission failure") }
+    (R.error, why) then {
+      expect_contains(why, "permission denied")
+      expect_contains(why, "runtime socket")
+      expect_true(why.index_of("git: ") < 0)
+    }
+  }
+}
+
+def test_missing_tool_is_mapped_to_install_hint() {
+  const runner = FakeRunner.new([
+    err_response("docker image inspect", "git: 'docker' exited with code 1: Error: No such image"),
+    err_response("skopeo copy", "git: 'skopeo' exited with code 127: "),
+    ok_response("docker image rm", "")
+  ])
+  case runtime_mod.execute(runner, docker_plan(false), 30.0) {
+    (R.ok, _) then { expect_fail("expected a missing-tool failure") }
+    (R.error, why) then {
+      expect_contains(why, "'skopeo' is not installed or not on PATH")
+    }
+  }
+}
+
+def containerd_plan(keep Bool) src.runtime.ImportPlan {
+  case runtime_mod.plan(all_tools(), "containerd", request("registry.example.com/acme/app", "latest", runtime_tmp("containerd-layout"), keep)) {
+    (R.ok, plan) then { return plan }
+    (R.error, why) then {
+      expect_fail("containerd plan failed: " + why)
+      return runtime_mod.plan_for("containerd", request("app", "latest", runtime_tmp("containerd-fallback"), keep))
+    }
+  }
+}
+
+def test_containerd_import_removes_the_temp_archive() {
+  make_dir(runtime_tmp("containerd-layout"))
+  const plan = containerd_plan(false)
+  const (R.ok, _) = file.write(plan.archive_path, "dummy archive")
+  const runner = FakeRunner.new([
+    ok_response("ctr images ls --quiet", ""),
+    ok_response("skopeo copy", ""),
+    ok_response("ctr images import", ""),
+    ok_response("ctr images ls --quiet", "registry.example.com/acme/app:latest\nother:latest\n")
+  ])
+  case runtime_mod.execute(runner, plan, 30.0) {
+    (R.error, why) then { expect_fail("containerd import failed: " + why) }
+    (R.ok, result) then { expect_equal("containerd", result.runtime) }
+  }
+  expect_true(!exists(plan.archive_path))
+  const calls = runner.calls_text()
+  expect_contains(calls, "ctr images import --base-name registry.example.com/acme/app " + plan.archive_path)
+}
+
+def test_containerd_failure_removes_archive_and_partial_tag() {
+  make_dir(runtime_tmp("containerd-layout-fail"))
+  const plan = containerd_plan(false)
+  const (R.ok, _) = file.write(plan.archive_path, "dummy archive")
+  const runner = FakeRunner.new([
+    ok_response("ctr images ls --quiet", ""),
+    ok_response("skopeo copy", ""),
+    err_response("ctr images import", "git: 'ctr' exited with code 1: failed to import"),
+    ok_response("ctr images rm", "")
+  ])
+  case runtime_mod.execute(runner, plan, 30.0) {
+    (R.ok, _) then { expect_fail("expected a containerd import failure") }
+    (R.error, why) then { expect_contains(why, "import into containerd failed") }
+  }
+  expect_true(!exists(plan.archive_path))
+  expect_contains(runner.calls_text(), "ctr images rm registry.example.com/acme/app:latest")
+}
+
+def test_kept_archive_survives_a_successful_import() {
+  make_dir(runtime_tmp("containerd-layout-keep"))
+  const plan = containerd_plan(true)
+  const (R.ok, _) = file.write(plan.archive_path, "dummy archive")
+  const runner = FakeRunner.new([
+    ok_response("ctr images ls --quiet", ""),
+    ok_response("skopeo copy", ""),
+    ok_response("ctr images import", ""),
+    ok_response("ctr images ls --quiet", "registry.example.com/acme/app:latest\n")
+  ])
+  case runtime_mod.execute(runner, plan, 30.0) {
+    (R.error, why) then { expect_fail("containerd import failed: " + why) }
+    (R.ok, result) then { expect_equal(plan.archive_path, result.archive_path) }
+  }
+  expect_true(exists(plan.archive_path))
+  os.unlink(plan.archive_path)
+}
+
+def test_prepare_detects_then_plans() {
+  const runner = FakeRunner.new([
+    ok_response("docker --version", "Docker version 29.9.3"),
+    err_response("podman --version", "git: 'podman' exited with code 127: "),
+    ok_response("skopeo --version", "skopeo version 1.25.2"),
+    err_response("ctr --version", "git: 'ctr' exited with code 127: ")
+  ])
+  case runtime_mod.prepare(runner, "", request("registry.example.com/acme/app", "latest", "/tmp/oci-layout", false)) {
+    (R.ok, plan) then {
+      expect_equal("docker", plan.runtime)
+      expect_equal(4, runner.call_count())
+    }
+    (R.error, why) then { expect_fail("prepare failed: " + why) }
+  }
+}

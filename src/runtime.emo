@@ -1,0 +1,338 @@
+// T1.13: import an assembled OCI image layout into a local container
+// runtime. Every path goes through skopeo's local transports:
+//
+//   docker      skopeo copy oci:<dir>:<tag> docker-daemon:<image>:<tag>
+//   podman      skopeo copy oci:<dir>:<tag> containers-storage:<image>:<tag>
+//   containerd  skopeo copy oci:<dir>:<tag> oci-archive:<dir>.tar:<tag>
+//               ctr images import --base-name <image> <dir>.tar
+//
+// Tool detection and selection are separate from execution (both take the
+// injectable CommandRunner), so command construction and error mapping are
+// testable offline. An import is verified after the fact; a failure removes
+// a tag that did not exist before the import and the temp archive, so a
+// failed run leaves neither a partial image nor temp files behind. Support
+// matrix: docs/spec/runtime-import.md.
+
+require "os"
+
+const runtime_default_timeout = 600.0
+const runtime_probe_timeout = 10.0
+
+const runtime_docker = "docker"
+const runtime_podman = "podman"
+const runtime_containerd = "containerd"
+
+const runtime_archive_suffix = ".oci-archive.tar"
+
+class Tools {
+  def init(docker Bool, podman Bool, skopeo Bool, ctr Bool) {
+    self.docker = docker
+    self.podman = podman
+    self.skopeo = skopeo
+    self.ctr = ctr
+  }
+}
+
+// One command in the import sequence, labelled with the tool that runs it so
+// a failure can be mapped against the right binary.
+class ImportStep {
+  def init(tool String, argv Array[String]) {
+    self.tool = tool
+    self.argv = argv
+  }
+}
+
+class ImportRequest {
+  def init(image String, tag String, layout_dir String, keep_archive Bool) {
+    self.image = image
+    self.tag = tag
+    self.layout_dir = layout_dir
+    self.keep_archive = keep_archive
+  }
+}
+
+class ImportPlan {
+  def init(runtime String, tool String, ref String, import_steps Array[ImportStep], inspect_argv Array[String], inspect_lines Bool, remove_argv Array[String], archive_path String, keep_archive Bool) {
+    self.runtime = runtime
+    self.tool = tool
+    self.ref = ref
+    self.import_steps = import_steps
+    self.inspect_argv = inspect_argv
+    self.inspect_lines = inspect_lines
+    self.remove_argv = remove_argv
+    self.archive_path = archive_path
+    self.keep_archive = keep_archive
+  }
+}
+
+class ImportResult {
+  def init(runtime String, ref String, archive_path String) {
+    self.runtime = runtime
+    self.ref = ref
+    self.archive_path = archive_path
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Detection.
+
+// Probes each tool with --version. A missing binary exits 127 through the
+// execvp path; any probe failure counts as unavailable.
+def detect(runner src.git.CommandRunner) Tools {
+  return Tools.new(
+    tool_available(runner, "docker"),
+    tool_available(runner, "podman"),
+    tool_available(runner, "skopeo"),
+    tool_available(runner, "ctr")
+  )
+}
+
+def tool_available(runner src.git.CommandRunner, tool String) Bool {
+  case runner.run([tool, "--version"], runtime_probe_timeout) {
+    (R.ok, _) then { return true }
+    (R.error, _) then { return false }
+  }
+}
+
+// "" selects docker, then podman, then containerd. An explicit name must be
+// installed; "ctr" is accepted as an alias for containerd.
+def select_runtime(tools Tools, requested String) (R, String) {
+  const want = requested.trim().lower()
+  if want != "" {
+    var name = want
+    if want == "ctr" {
+      name = runtime_containerd
+    }
+    case name {
+      "docker" then { return require_available(tools.docker, name) }
+      "podman" then { return require_available(tools.podman, name) }
+      "containerd" then { return require_available(tools.ctr, name) }
+      _ then {
+        return (R.error, "runtime: unknown runtime '" + requested + "' (supported: docker, podman, containerd)")
+      }
+    }
+  }
+  if tools.docker {
+    return (R.ok, runtime_docker)
+  }
+  if tools.podman {
+    return (R.ok, runtime_podman)
+  }
+  if tools.ctr {
+    return (R.ok, runtime_containerd)
+  }
+  return (R.error, "runtime: no container runtime found (checked docker, podman, ctr); install Docker, Podman, or containerd and retry")
+}
+
+def require_available(available Bool, name String) (R, String) {
+  if available {
+    return (R.ok, name)
+  }
+  return (R.error, "runtime: requested runtime '" + name + "' is not installed")
+}
+
+// ---------------------------------------------------------------------------
+// Planning: turn a request into the exact commands, without running them.
+
+def plan(tools Tools, requested String, req ImportRequest) (R, ImportPlan) {
+  if req.image == "" {
+    return (R.error, "runtime: image name is empty")
+  }
+  if req.tag == "" {
+    return (R.error, "runtime: tag is empty")
+  }
+  if req.tag.index_of(":") >= 0 || req.tag.index_of("/") >= 0 {
+    return (R.error, "runtime: tag '" + req.tag + "' is not a valid OCI tag")
+  }
+  if req.layout_dir == "" {
+    return (R.error, "runtime: layout directory is empty")
+  }
+  case select_runtime(tools, requested) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, runtime) then {
+      if !tools.skopeo {
+        return (R.error, skopeo_hint(runtime))
+      }
+      return (R.ok, plan_for(runtime, req))
+    }
+  }
+}
+
+// detect + plan in one call — the shape T1.14's pull command uses.
+def prepare(runner src.git.CommandRunner, requested String, req ImportRequest) (R, ImportPlan) {
+  return plan(detect(runner), requested, req)
+}
+
+def plan_for(runtime String, req ImportRequest) ImportPlan {
+  const ref = req.image + ":" + req.tag
+  const source = "oci:" + req.layout_dir + ":" + req.tag
+  if runtime == runtime_podman {
+    return ImportPlan.new(
+      runtime_podman,
+      "podman",
+      ref,
+      [ImportStep.new("skopeo", ["skopeo", "copy", source, "containers-storage:" + ref])],
+      ["podman", "image", "inspect", ref],
+      false,
+      ["podman", "image", "rm", ref],
+      "",
+      req.keep_archive
+    )
+  }
+  if runtime == runtime_containerd {
+    const archive = req.layout_dir + runtime_archive_suffix
+    return ImportPlan.new(
+      runtime_containerd,
+      "ctr",
+      ref,
+      [
+        ImportStep.new("skopeo", ["skopeo", "copy", source, "oci-archive:" + archive + ":" + req.tag]),
+        ImportStep.new("ctr", ["ctr", "images", "import", "--base-name", req.image, archive])
+      ],
+      ["ctr", "images", "ls", "--quiet"],
+      true,
+      ["ctr", "images", "rm", ref],
+      archive,
+      req.keep_archive
+    )
+  }
+  return ImportPlan.new(
+    runtime_docker,
+    "docker",
+    ref,
+    [ImportStep.new("skopeo", ["skopeo", "copy", source, "docker-daemon:" + ref])],
+    ["docker", "image", "inspect", ref],
+    false,
+    ["docker", "image", "rm", ref],
+    "",
+    req.keep_archive
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Execution.
+
+// Runs the plan, then verifies the tag is present. On any failure the temp
+// archive is removed and — only when the tag did not exist before the
+// import — the partially imported tag is removed as well.
+def execute(runner src.git.CommandRunner, plan ImportPlan, timeout Float64) (R, ImportResult) {
+  const existed = image_present(runner, plan, timeout)
+  case run_steps(runner, plan.import_steps, 0, plan.runtime, timeout) {
+    (R.error, why) then { return fail_import(runner, plan, existed, timeout, why) }
+    (R.ok, _) then {
+      if !image_present(runner, plan, timeout) {
+        return fail_import(runner, plan, existed, timeout, "runtime: " + plan.tool + " reported success but " + plan.ref + " is not present after import")
+      }
+      cleanup_archive(plan)
+      return (R.ok, ImportResult.new(plan.runtime, plan.ref, plan.archive_path))
+    }
+  }
+}
+
+def run_steps(runner src.git.CommandRunner, steps Array[ImportStep], index Int64, runtime String, timeout Float64) (R, Bool) {
+  if index >= steps.length() {
+    return (R.ok, true)
+  }
+  const step = steps[index]
+  case runner.run(step.argv, timeout) {
+    (R.error, why) then { return (R.error, map_error(step.tool, "import into " + runtime, why)) }
+    (R.ok, _) then { return run_steps(runner, steps, index + 1, runtime, timeout) }
+  }
+}
+
+// True when the tag exists. Docker and podman answer through image inspect;
+// ctr lists every name, so the output is scanned line by line.
+def image_present(runner src.git.CommandRunner, plan ImportPlan, timeout Float64) Bool {
+  case runner.run(plan.inspect_argv, timeout) {
+    (R.error, _) then { return false }
+    (R.ok, output) then {
+      if plan.inspect_lines {
+        return line_equals(output, plan.ref)
+      }
+      return true
+    }
+  }
+}
+
+def line_equals(text String, wanted String) Bool {
+  const lines = text.split("\n")
+  var i = 0
+  while i < lines.length() {
+    if lines[i].trim() == wanted {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+def fail_import(runner src.git.CommandRunner, plan ImportPlan, existed Bool, timeout Float64, why String) (R, ImportResult) {
+  cleanup_archive(plan)
+  if !existed {
+    // Best effort: drop a tag the failed import may have created.
+    case runner.run(plan.remove_argv, timeout) {
+      (R.ok, _) then { }
+      (R.error, _) then { }
+    }
+  }
+  return (R.error, why)
+}
+
+def cleanup_archive(plan ImportPlan) {
+  if plan.archive_path != "" && !plan.keep_archive {
+    os.unlink(plan.archive_path)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Error mapping. Runner failures arrive as "git: '<tool>' exited with code
+// N: <output>" because the shared RealRunner carries the git prefix; it is
+// stripped so runtime messages read cleanly.
+
+def skopeo_hint(runtime String) String {
+  return (
+    "runtime: importing into " + runtime + " requires skopeo. Install it and retry"
+    + " (macOS: brew install skopeo; Debian/Ubuntu: apt-get install skopeo;"
+    + " Fedora: dnf install skopeo)."
+  )
+}
+
+def map_error(tool String, action String, why String) String {
+  const reason = strip_runner_prefix(why)
+  if reason.index_of("exited with code 127") >= 0 {
+    return "runtime: '" + tool + "' is not installed or not on PATH (" + reason + ")"
+  }
+  if is_daemon_unreachable(reason) {
+    return "runtime: cannot reach the container runtime while trying to " + action + "; start Docker, Podman, or containerd and retry (" + reason + ")"
+  }
+  if reason.index_of("permission denied") >= 0 {
+    return "runtime: permission denied while trying to " + action + "; check access to the runtime socket (" + reason + ")"
+  }
+  return "runtime: " + action + " failed: " + reason
+}
+
+def strip_runner_prefix(why String) String {
+  if why.starts_with("git: ") && why.length() > 5 {
+    return why.substring(5, why.length() - 5)
+  }
+  return why
+}
+
+def is_daemon_unreachable(reason String) Bool {
+  if reason.index_of("Cannot connect to the Docker daemon") >= 0 {
+    return true
+  }
+  if reason.index_of("Is the docker daemon running") >= 0 {
+    return true
+  }
+  if reason.index_of("Cannot connect to Podman") >= 0 {
+    return true
+  }
+  if reason.index_of("connection refused") >= 0 {
+    return true
+  }
+  if reason.index_of("docker.sock") >= 0 && reason.index_of("no such file") >= 0 {
+    return true
+  }
+  return false
+}
