@@ -98,8 +98,8 @@ values name the variable.
 | --- | --- |
 | `GET /healthz` | 200 `ok` — the process is answering. |
 | `GET /readyz` | 200 `ready` when every readiness check passes; 503 `not ready: <check>: <reason>; …` otherwise. |
-| `GET /v2/` | 200 `{}` — a placeholder so a standard registry probe succeeds until T2.7 implements the distribution protocol. |
-| anything else | 404. `POST`/`PUT`/… on a known GET route: 405 with `Allow: GET`. |
+| `GET /v2/` | 200 `{}` with `Docker-Distribution-API-Version: registry/2.0`; other methods 405 with `Allow` ([registry-api.md](registry-api.md)). |
+| anything else | 404 as an OCI error (`NAME_UNKNOWN`). Every response carries `X-Request-Id`. |
 
 Readiness checks in v0.1:
 

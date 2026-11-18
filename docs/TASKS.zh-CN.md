@@ -352,7 +352,7 @@ images:
 | [x] | T2.4 | BlobStore 接口与本地文件后端 | T2.1 | 2h |
 | [x] | T2.5 | AWS SigV4 签名与预签名 URL | T2.1 | 3h |
 | [x] | T2.6 | S3 / MinIO BlobStore 适配 | T2.4、T2.5 | 3h |
-| [ ] | T2.7 | `/v2/` 基础协议与错误格式 | T2.1、T2.2 | 1-2h |
+| [x] | T2.7 | `/v2/` 基础协议与错误格式 | T2.1、T2.2 | 1-2h |
 | [ ] | T2.8 | Manifest GET / HEAD 与 tag / digest 解析 | T2.2、T2.3、T2.7 | 3h |
 | [ ] | T2.9 | Blob GET 与 307 预签名重定向 | T2.4、T2.6、T2.8 | 2-3h |
 | [ ] | T2.10 | Blob 上传：POST / PUT | T2.4、T2.7 | 3h |
@@ -457,6 +457,8 @@ images:
 **验收**：无认证模式 `GET /v2/` 返回 200；开启认证后由 T2.14 覆盖 401 挑战；未知路由返回 404；方法不匹配返回 405 并带 `Allow`；所有错误响应符合 OCI 错误格式；响应带 request id。
 
 **依赖**：T2.1、T2.2 · **预估**：1-2h
+
+> **备注**（2026-11-18，约 1.5h）：已完成。`registry/api.emo` 负责 distribution API 的外层：`GET /v2/`（以及 `/v2`）返回 200 `{}` 与 `Docker-Distribution-API-Version: registry/2.0`；所有响应（成功与错误）都带 `X-Request-Id`；所有错误都走 OCI 信封（`error_body`/`error_response`/`not_found`/`bad_request`/`method_not_allowed`/`unauthorized`，并导出完整错误码常量 BLOB_UNKNOWN … TOOMANYREQUESTS）。未知路由返回 404 `NAME_UNKNOWN`，`detail` 为 `"<METHOD> <path>"`；`/v2/` 方法不匹配返回 405 带 `Allow: GET` 与 `UNSUPPORTED`；401 助手（挑战头 + UNAUTHORIZED 码）留给 T2.14 使用。请求 id 仅在客户端 `X-Request-Id` 为 1–64 个 `[A-Za-z0-9._-]` 时回显（CR/LF 无法通过回显注入），否则生成 `pf-<pid>-<monotonic ns>`，在每连接一进程的模型下无需共享状态即可唯一。健康检查路由移到 `handle_health`，由路由器在兜底之前分派，`/healthz`、`/readyz` 仍返回纯文本。测试：`test/registry_api.emo` 12 个（探测与响应头、405/404 信封与 detail、健康分派、id 回显与净化、生成的 id 唯一、带/不带 detail 的信封形状、400 助手、401 挑战、公共头不重复）；`emo test` 326/326。已通过真实 HTTP 验证：`/v2/` 带版本头与 request id，`POST /v2/` 返回 UNSUPPORTED JSON 与 Allow，`/nope` 返回 NAME_UNKNOWN，客户端 `X-Request-Id` 被回显。踩坑：Emo 没有字符串比较运算符（id 字符集用 `index_of` 判断）；测试里用命名参数构造 `httpd.Request` 代替不存在的工厂函数。
 
 #### T2.8 Manifest GET / HEAD 与 tag / digest 解析
 

@@ -1,0 +1,145 @@
+// T2.7: the OCI distribution API's response shape — the error JSON
+// ({"errors":[{"code","message","detail"?}]}), the registry API version
+// header, and a request id on every response. The router here owns /v2/, the
+// health endpoints, and the catch-all so a client always gets a parseable OCI
+// error rather than plain text.
+//
+// A request id is taken from the client's X-Request-Id when it is safe
+// (alphanumerics, '.', '_', '-', at most 64 characters) and generated
+// otherwise; it is echoed on every response, including errors, so a log line
+// and a client report can be matched. The id is pid + monotonic nanoseconds,
+// unique without shared mutable state in the per-connection process.
+
+require "httpd"
+require "json"
+require "os"
+require "time"
+
+const api_version = "registry/2.0"
+const api_version_header = "Docker-Distribution-API-Version"
+const request_id_header = "X-Request-Id"
+
+// The OCI error codes the distribution API defines. Later tasks use the
+// blob/manifest/upload codes; the protocol ones are here from the start.
+const code_blob_unknown = "BLOB_UNKNOWN"
+const code_blob_upload_invalid = "BLOB_UPLOAD_INVALID"
+const code_blob_upload_unknown = "BLOB_UPLOAD_UNKNOWN"
+const code_digest_invalid = "DIGEST_INVALID"
+const code_manifest_blob_unknown = "MANIFEST_BLOB_UNKNOWN"
+const code_manifest_invalid = "MANIFEST_INVALID"
+const code_manifest_unknown = "MANIFEST_UNKNOWN"
+const code_name_invalid = "NAME_INVALID"
+const code_name_unknown = "NAME_UNKNOWN"
+const code_size_invalid = "SIZE_INVALID"
+const code_tag_invalid = "TAG_INVALID"
+const code_unauthorized = "UNAUTHORIZED"
+const code_denied = "DENIED"
+const code_unsupported = "UNSUPPORTED"
+const code_too_many_requests = "TOOMANYREQUESTS"
+
+// The error envelope; `detail` is omitted when empty.
+def error_body(code String, message String, detail String) String {
+  var entry = [
+    ("code", json.string(code)),
+    ("message", json.string(message))
+  ]
+  if detail != "" {
+    entry = entry.append(("detail", json.string(detail)))
+  }
+  return json.encode(json.object([("errors", json.array([json.object(entry)]))]))
+}
+
+def error_response(status Int64, code String, message String, detail String) httpd.Response {
+  return httpd.response(status, [("Content-Type", "application/json; charset=utf-8")], error_body(code, message, detail))
+}
+
+def not_found(code String, message String, detail String) httpd.Response {
+  return error_response(404, code, message, detail)
+}
+
+def bad_request(code String, message String, detail String) httpd.Response {
+  return error_response(400, code, message, detail)
+}
+
+// A method mismatch answers 405 with the Allow header, per the distribution
+// spec, and an UNSUPPORTED error body.
+def method_not_allowed(allow String) httpd.Response {
+  return httpd.response(405, [
+    ("Allow", allow),
+    ("Content-Type", "application/json; charset=utf-8")
+  ], error_body(code_unsupported, "the operation is unsupported", "allowed: " + allow))
+}
+
+// The 401 challenge helper T2.14 fills in; the header is the caller's.
+def unauthorized(challenge String, detail String) httpd.Response {
+  return httpd.response(401, [
+    ("WWW-Authenticate", challenge),
+    ("Content-Type", "application/json; charset=utf-8")
+  ], error_body(code_unauthorized, "authentication required", detail))
+}
+
+// ---------------------------------------------------------------------------
+// Request ids and the common headers.
+
+def request_id(req httpd.Request) String {
+  const provided = req.header(request_id_header)
+  if valid_request_id(provided) {
+    return provided
+  }
+  return "pf-" + os.getpid().to_string() + "-" + time.mono().to_string()
+}
+
+// Echo only ids that cannot inject a header line and cannot bloat a log.
+def valid_request_id(text String) Bool {
+  if text == "" || text.length() > 64 {
+    return false
+  }
+  var i = 0
+  while i < text.length() {
+    const c = text.substring(i, 1)
+    if !request_id_char(c) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+const request_id_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._"
+
+def request_id_char(c String) Bool {
+  return request_id_chars.index_of(c) >= 0
+}
+
+def decorate(response httpd.Response, id String) httpd.Response {
+  var headers = [
+    (api_version_header, api_version),
+    (request_id_header, id)
+  ]
+  var i = 0
+  while i < response.headers.length() {
+    headers = headers.append(response.headers[i])
+    i = i + 1
+  }
+  return httpd.response(response.status, headers, response.body)
+}
+
+// ---------------------------------------------------------------------------
+// Routing.
+
+def handle(req httpd.Request, config registry.config.RegistryConfig, db registry.health.DbHealth, blob registry.blobstore.BlobHealth) httpd.Response {
+  return decorate(route(req, config, db, blob), request_id(req))
+}
+
+def route(req httpd.Request, config registry.config.RegistryConfig, db registry.health.DbHealth, blob registry.blobstore.BlobHealth) httpd.Response {
+  if req.path == "/v2" || req.path == "/v2/" {
+    if req.method != "GET" {
+      return method_not_allowed("GET")
+    }
+    return httpd.response(200, [("Content-Type", "application/json; charset=utf-8")], "{}")
+  }
+  if req.path == "/healthz" || req.path == "/readyz" {
+    return registry.health.handle_health(req, config, db, blob)
+  }
+  return not_found(code_name_unknown, "unknown route", req.method + " " + req.path)
+}

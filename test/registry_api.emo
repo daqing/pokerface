@@ -1,0 +1,271 @@
+// T2.7 tests for the OCI error format, request ids, and the /v2/ router —
+// run with `emo test`.
+
+const api = registry.api
+const config_mod = registry.config
+
+require "httpd"
+require "json"
+require "os"
+require "file"
+
+def api_tmp_base() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def api_tmp(name String) String {
+  return api_tmp_base() + "pokerface-registry-api-" + os.getpid().to_string() + "-" + name
+}
+
+def make_config(name String) registry.config.RegistryConfig {
+  const data = api_tmp(name)
+  return registry.config.RegistryConfig.new(
+    registry.config.RegistryListen.new("127.0.0.1", 5000),
+    data,
+    data + "/registry.db",
+    registry.config.RegistryStore.new("fs", data + "/blobs", registry.config.default_s3()),
+    registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
+    data + "/registry.shutdown",
+    "<test>"
+  )
+}
+
+class ApiFakeDb {
+  def init(ok Bool) {
+    self.ok = ok
+  }
+
+  def ping() Bool {
+    return self.ok
+  }
+
+  def path() String {
+    return "/tmp/fake-registry.db"
+  }
+}
+
+class ApiFakeBlob {
+  def init(ok Bool) {
+    self.ok = ok
+  }
+
+  def probe() (R, String) {
+    if self.ok {
+      return (R.ok, "fs:/tmp/fake-store")
+    }
+    return (R.error, "fs:/tmp/fake-store (not writable)")
+  }
+}
+
+def make_request(method String, path String) httpd.Request {
+  return make_request_with(method, path, [])
+}
+
+def make_request_with(method String, path String, headers Array[(String, String)]) httpd.Request {
+  return httpd.Request.new(
+    method: method,
+    target: path,
+    path: path,
+    query: Map.new(),
+    proto: "HTTP/1.1",
+    headers: headers,
+    body: "",
+    params: Map.new()
+  )
+}
+
+def route(method String, path String) httpd.Response {
+  return api.handle(make_request(method, path), make_config("route"), ApiFakeDb.new(true), ApiFakeBlob.new(true))
+}
+
+def header_value(headers Array[(String, String)], name String) String {
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == name.lower() {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+def header_count(headers Array[(String, String)], name String) Int64 {
+  var count = 0
+  var i = 0
+  while i < headers.length() {
+    if headers[i][0].lower() == name.lower() {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
+// --- JSON inspection without raising accessors.
+
+def member_value(doc json.Json, key String) (R, json.Json) {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (k, v) = entries[i]
+      if k == key {
+        return (R.ok, v)
+      }
+      i = i + 1
+    }
+    return (R.error, "missing " + key)
+  }
+  return (R.error, "not an object")
+}
+
+def error_field(body String, field String) String {
+  case json.decode(body) {
+    (R.error, _) then { return "" }
+    (R.ok, doc) then {
+      case member_value(doc, "errors") {
+        (R.error, _) then { return "" }
+        (R.ok, errors) then {
+          if errors.is(json.JsonArray) {
+            const items = errors.items()
+            if items.length() == 0 {
+              return ""
+            }
+            case member_value(items[0], field) {
+              (R.error, _) then { return "" }
+              (R.ok, value) then {
+                if value.is(json.JsonString) {
+                  return value.as_string()
+                }
+                return ""
+              }
+            }
+          }
+          return ""
+        }
+      }
+    }
+  }
+}
+
+def test_v2_answers_with_the_api_version_and_a_request_id() {
+  const response = route("GET", "/v2/")
+  expect_equal(200, response.status)
+  expect_equal("{}", response.body)
+  expect_equal("registry/2.0", header_value(response.headers, "docker-distribution-api-version"))
+  expect_true(header_value(response.headers, "x-request-id") != "")
+  expect_true(header_value(response.headers, "content-type").index_of("application/json") >= 0)
+}
+
+def test_v2_without_the_slash_answers_too() {
+  const response = route("GET", "/v2")
+  expect_equal(200, response.status)
+  expect_equal("{}", response.body)
+}
+
+def test_method_mismatch_is_405_with_allow_and_an_oci_error() {
+  const response = route("POST", "/v2/")
+  expect_equal(405, response.status)
+  expect_equal("GET", header_value(response.headers, "allow"))
+  expect_equal(api.code_unsupported, error_field(response.body, "code"))
+  expect_true(error_field(response.body, "message") != "")
+  expect_true(header_value(response.headers, "x-request-id") != "")
+}
+
+def test_unknown_routes_are_oci_404s() {
+  const response = route("GET", "/v2/acme/app/manifests/latest")
+  expect_equal(404, response.status)
+  expect_equal(api.code_name_unknown, error_field(response.body, "code"))
+  expect_equal("GET /v2/acme/app/manifests/latest", error_field(response.body, "detail"))
+  expect_true(header_value(response.headers, "content-type").index_of("application/json") >= 0)
+  const plain = route("GET", "/nope")
+  expect_equal(404, plain.status)
+  expect_equal(api.code_name_unknown, error_field(plain.body, "code"))
+}
+
+def test_health_routes_still_dispatch() {
+  const health = route("GET", "/healthz")
+  expect_equal(200, health.status)
+  expect_equal("ok\n", health.body)
+  const bad = route("POST", "/healthz")
+  expect_equal(405, bad.status)
+  expect_equal("GET", header_value(bad.headers, "allow"))
+  const ready = route("GET", "/readyz")
+  expect_equal(200, ready.status)
+  expect_equal("ready\n", ready.body)
+  expect_true(header_value(ready.headers, "x-request-id") != "")
+}
+
+def test_the_client_request_id_is_echoed_when_safe() {
+  const response = api.handle(
+    make_request_with("GET", "/v2/", [("X-Request-Id", "abc-123_def.4")]),
+    make_config("echo"),
+    ApiFakeDb.new(true),
+    ApiFakeBlob.new(true)
+  )
+  expect_equal("abc-123_def.4", header_value(response.headers, "x-request-id"))
+}
+
+def test_unsafe_request_ids_are_replaced() {
+  const injected = api.handle(
+    make_request_with("GET", "/v2/", [("X-Request-Id", "abc\r\nX-Evil: 1")]),
+    make_config("inject"),
+    ApiFakeDb.new(true),
+    ApiFakeBlob.new(true)
+  )
+  const id = header_value(injected.headers, "x-request-id")
+  expect_true(id != "abc\r\nX-Evil: 1")
+  expect_true(id.starts_with("pf-"))
+  expect_equal("", header_value(injected.headers, "x-evil"))
+}
+
+def test_generated_request_ids_differ_per_request() {
+  const first = api.request_id(make_request("GET", "/v2/"))
+  const second = api.request_id(make_request("GET", "/v2/"))
+  expect_true(first != second)
+  expect_true(api.valid_request_id(first))
+}
+
+def test_error_body_shape() {
+  const body = api.error_body(api.code_manifest_unknown, "manifest unknown", "sha256:abc")
+  expect_equal(api.code_manifest_unknown, error_field(body, "code"))
+  expect_equal("manifest unknown", error_field(body, "message"))
+  expect_equal("sha256:abc", error_field(body, "detail"))
+  const bare = api.error_body(api.code_blob_unknown, "blob unknown", "")
+  expect_true(bare.index_of("\"detail\"") < 0)
+}
+
+def test_error_response_sets_json_and_status() {
+  const response = api.error_response(400, api.code_digest_invalid, "bad digest", "")
+  expect_equal(400, response.status)
+  expect_true(header_value(response.headers, "content-type").index_of("application/json") >= 0)
+  expect_equal(api.code_digest_invalid, error_field(response.body, "code"))
+}
+
+def test_unauthorized_carries_the_challenge() {
+  const response = api.unauthorized("Bearer realm=\"https://auth.example.com/token\",service=\"registry\"", "")
+  expect_equal(401, response.status)
+  expect_equal("Bearer realm=\"https://auth.example.com/token\",service=\"registry\"", header_value(response.headers, "www-authenticate"))
+  expect_equal(api.code_unauthorized, error_field(response.body, "code"))
+}
+
+def test_common_headers_are_added_once() {
+  const response = route("POST", "/v2/")
+  const allow = header_value(response.headers, "allow")
+  expect_equal("GET", allow)
+  expect_equal(1, header_count(response.headers, "x-request-id"))
+  expect_equal(1, header_count(response.headers, "docker-distribution-api-version"))
+}

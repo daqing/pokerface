@@ -109,9 +109,9 @@ def ensure_writable(path String) (R, Bool) {
   }
 }
 
-// T2.1 routing: the two health endpoints plus a placeholder /v2/ so a
-// standard registry probe succeeds before T2.7 lands.
-def handle(req httpd.Request, config registry.config.RegistryConfig, db DbHealth, blob registry.blobstore.BlobHealth) httpd.Response {
+// The two health endpoints. The router (registry/api.emo) calls this only for
+// those paths; the plain-text fallback is defensive.
+def handle_health(req httpd.Request, config registry.config.RegistryConfig, db DbHealth, blob registry.blobstore.BlobHealth) httpd.Response {
   if req.path == "/healthz" {
     if req.method != "GET" {
       return method_not_allowed()
@@ -123,12 +123,6 @@ def handle(req httpd.Request, config registry.config.RegistryConfig, db DbHealth
       return method_not_allowed()
     }
     return ready_response(config, db, blob)
-  }
-  if req.path == "/v2/" {
-    if req.method != "GET" {
-      return method_not_allowed()
-    }
-    return httpd.response(200, [("Content-Type", "application/json")], "{}")
   }
   return httpd.response(404, [("Content-Type", "text/plain; charset=utf-8")], "not found\n")
 }

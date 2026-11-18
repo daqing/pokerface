@@ -352,7 +352,7 @@ Exit criteria:
 | [x] | T2.4 | BlobStore interface and local filesystem backend | T2.1 | 2h |
 | [x] | T2.5 | AWS SigV4 signing and presigned URLs | T2.1 | 3h |
 | [x] | T2.6 | S3 / MinIO BlobStore adapter | T2.4, T2.5 | 3h |
-| [ ] | T2.7 | `/v2/` base protocol and error format | T2.1, T2.2 | 1-2h |
+| [x] | T2.7 | `/v2/` base protocol and error format | T2.1, T2.2 | 1-2h |
 | [ ] | T2.8 | Manifest GET / HEAD and tag / digest resolution | T2.2, T2.3, T2.7 | 3h |
 | [ ] | T2.9 | Blob GET and 307 presigned redirect | T2.4, T2.6, T2.8 | 2-3h |
 | [ ] | T2.10 | Blob upload: POST / PUT | T2.4, T2.7 | 3h |
@@ -457,6 +457,8 @@ Suggested tables:
 **Acceptance**: In unauthenticated mode `GET /v2/` returns 200; with auth enabled, T2.14 covers the 401 challenge; unknown routes return 404; method mismatches return 405 with `Allow`; all errors follow the OCI error format; responses carry a request id.
 
 **Depends on**: T2.1, T2.2 · **Estimate**: 1-2h
+
+> **Notes** (2026-11-18, ~1.5h): Done. `registry/api.emo` owns the distribution API's outer skin: `GET /v2/` (and `/v2`) answers 200 `{}` with `Docker-Distribution-API-Version: registry/2.0`, every response — success and error — carries `X-Request-Id`, and every error is the OCI envelope via `error_body`/`error_response`/`not_found`/`bad_request`/`method_not_allowed`/`unauthorized` with the full code constant set (BLOB_UNKNOWN … TOOMANYREQUESTS). Unknown routes answer 404 `NAME_UNKNOWN` with `detail: "<METHOD> <path>"`; a method mismatch on `/v2/` answers 405 with `Allow: GET` and `UNSUPPORTED`; the 401 helper (challenge header + UNAUTHORIZED code) is ready for T2.14. Request ids echo a client `X-Request-Id` only when it is 1–64 characters of `[A-Za-z0-9._-]` (CR/LF cannot be injected through the echo) and otherwise generate `pf-<pid>-<monotonic ns>`, unique without shared mutable state in the per-connection process. Health routing moved to `handle_health` and the router dispatches it ahead of the catch-all, so `/healthz` and `/readyz` keep their plain-text bodies. Tests: 12 in `test/registry_api.emo` (probe and headers, 405/404 envelopes with detail, health dispatch, id echo and sanitization, unique generated ids, envelope shape with/without detail, 400 helper, 401 challenge, single common headers); `emo test` 326/326. Manually verified over the wire: `/v2/` shows the version header and a request id, `POST /v2/` returns the UNSUPPORTED JSON with Allow, `/nope` returns NAME_UNKNOWN, and a client `X-Request-Id` is echoed. Gotchas: no string ordering operators in Emo (the id charset check uses `index_of`), and named-argument construction of `httpd.Request` works for tests in place of a factory.
 
 #### T2.8 Manifest GET / HEAD and Tag / Digest Resolution
 
