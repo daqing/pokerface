@@ -348,7 +348,7 @@ images:
 | --- | --- | --- | --- | --- |
 | [x] | T2.1 | 服务骨架、配置与健康检查 | T1.2 | 2h |
 | [x] | T2.2 | SQLite 数据层与迁移 | T2.1 | 2-3h |
-| [ ] | T2.3 | OCI Manifest / Index 模型与校验 | T1.5 | 2-3h |
+| [x] | T2.3 | OCI Manifest / Index 模型与校验 | T1.5 | 2-3h |
 | [ ] | T2.4 | BlobStore 接口与本地文件后端 | T2.1 | 2h |
 | [ ] | T2.5 | AWS SigV4 签名与预签名 URL | T2.1 | 3h |
 | [ ] | T2.6 | S3 / MinIO BlobStore 适配 | T2.4、T2.5 | 3h |
@@ -409,6 +409,8 @@ images:
 **验收**：真实镜像的 Manifest 可解析；缺字段 / digest 格式错误 / size 不匹配被拒绝；编码后的字节可复现；Index 的平台选择与客户端一致。
 
 **依赖**：T1.5 · **预估**：2-3h
+
+> **备注**（2026-11-18，约 2h）：已完成。`registry/oci.emo` 定义了 `Descriptor`、`Platform`、`IndexEntry`、`ImageManifest`、`ImageIndex`、`ImageConfig` 和一个 `Document` 包装（kind + 两种形态，Emo 没有和类型）。`parse_document` 从 `Content-Type`（去掉参数）或 body 的 `mediaType` 取类型，两者不一致即报错，再分派；`parse_manifest`/`parse_index` 接受调用方给出的类型；`parse_config` 读取 architecture/os/rootfs diff_ids 和 `config.Labels`。校验是全覆盖的，全部返回错误元组：schemaVersion 必须为 2、必需成员与 JSON 类型检查、digest 必须是 `sha256:` + 64 个小写十六进制、media type 必须是 `type/subtype` 且不含空白、size 必须是非负整数、annotation 必须是字符串。`verify_body` 对 body 计算哈希和字节数并与 descriptor 比对，不一致时同时报出两侧。编码用 `json.object` 固定字段顺序、紧凑分隔符，测试与新增的 golden fixture 逐字节比对，并验证 encode→parse→encode 稳定。`select_platform` 返回第一个 os+arch 完全匹配的条目（忽略 variant），与 `src/registry.emo` 一致，miss 时的 "available:" 信息也一样。Fixture：在现有 skopeo 可读镜像之上的多架构 `index.json`、`manifest.docker.json`，以及 `manifest.canonical.json`/`index.canonical.json`。`test/registry_oci.emo` 17 个测试；`emo test` 264/264。注意：反向守卫（`if !value.is(...) { return ... }` 之后再调用具体类方法）不会收窄类型，数组/对象解析都要写成正向分支；body 自身没有 `mediaType` 时 `parse_manifest(body, "")` 会报错，所以构造最小 body 的测试显式传入类型。编码是规范化而非无损——未知成员会被丢弃，registry 仍存储并返回客户端原始字节。
 
 #### T2.4 BlobStore 接口与本地文件后端
 

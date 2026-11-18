@@ -1,0 +1,314 @@
+// T2.3 tests for the registry's OCI document model — run with `emo test`.
+//
+// The fixtures under test/fixtures/oci/ are the client's single-layer image
+// plus an index over it, a Docker schema2 manifest, and the canonical
+// encodings the model must reproduce byte for byte.
+
+const reg_oci = registry.oci
+const fixture_dir = "test/fixtures/oci"
+
+require "file"
+require "crypto"
+
+def read_fixture(name String) String {
+  case file.read(fixture_dir + "/" + name) {
+    (R.ok, text) then { return text }
+    (R.error, why) then {
+      expect_fail("cannot read fixture " + name + ": " + why)
+      return ""
+    }
+  }
+}
+
+def digest_of(body String) String {
+  return "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+const manifest_digest = "sha256:18cc90b14b3f77e1c6f5755c82e32354f7c0827317526c74c3bf3e23860dbb55"
+const layer_digest = "sha256:0b44e2a8eac872b3721572d25ff549fa6c80262ff5aaa5c59f41a18f3f9c824e"
+
+// A one-config, no-layer manifest body with the descriptor fields filled in.
+// Values are spliced so the invalid cases vary exactly one thing.
+def manifest_body(digest String, size String) String {
+  return (
+    "{\"schemaVersion\":2,"
+    + "\"mediaType\":\"" + reg_oci.mt_oci_manifest + "\","
+    + "\"config\":{\"mediaType\":\"" + reg_oci.mt_oci_config + "\","
+    + "\"digest\":\"" + digest + "\",\"size\":" + size + "},"
+    + "\"layers\":[]}"
+  )
+}
+
+def expect_manifest_error(result (R, registry.oci.ImageManifest), needle String) {
+  case result {
+    (R.ok, _) then { expect_fail("expected an error containing '" + needle + "'") }
+    (R.error, why) then { expect_true(why.index_of(needle) >= 0) }
+  }
+}
+
+def expect_index_error(result (R, registry.oci.ImageIndex), needle String) {
+  case result {
+    (R.ok, _) then { expect_fail("expected an error containing '" + needle + "'") }
+    (R.error, why) then { expect_true(why.index_of(needle) >= 0) }
+  }
+}
+
+def expect_document_error(result (R, registry.oci.Document), needle String) {
+  case result {
+    (R.ok, _) then { expect_fail("expected an error containing '" + needle + "'") }
+    (R.error, why) then { expect_true(why.index_of(needle) >= 0) }
+  }
+}
+
+def expect_config_error(result (R, registry.oci.ImageConfig), needle String) {
+  case result {
+    (R.ok, _) then { expect_fail("expected an error containing '" + needle + "'") }
+    (R.error, why) then { expect_true(why.index_of(needle) >= 0) }
+  }
+}
+
+def parsed_manifest() registry.oci.ImageManifest {
+  case reg_oci.parse_manifest(read_fixture("manifest.json"), "") {
+    (R.ok, manifest) then { return manifest }
+    (R.error, why) then {
+      expect_fail("manifest fixture does not parse: " + why)
+      return reg_oci.absent_manifest()
+    }
+  }
+}
+
+def parsed_index() registry.oci.ImageIndex {
+  case reg_oci.parse_index(read_fixture("index.json"), "") {
+    (R.ok, index) then { return index }
+    (R.error, why) then {
+      expect_fail("index fixture does not parse: " + why)
+      return reg_oci.absent_index()
+    }
+  }
+}
+
+def test_oci_manifest_fixture_parses() {
+  const manifest = parsed_manifest()
+  expect_equal(reg_oci.mt_oci_manifest, manifest.media_type)
+  expect_equal(reg_oci.mt_oci_config, manifest.config.media_type)
+  expect_equal(manifest_digest, manifest.config.digest)
+  expect_equal(221, manifest.config.size)
+  expect_equal(1, manifest.layers.length())
+  expect_equal(layer_digest, manifest.layers[0].digest)
+  expect_equal(142, manifest.layers[0].size)
+  expect_equal(0, manifest.annotations.length())
+}
+
+def test_docker_manifest_fixture_parses() {
+  case reg_oci.parse_manifest(read_fixture("manifest.docker.json"), reg_oci.mt_docker_manifest) {
+    (R.ok, manifest) then {
+      expect_equal(reg_oci.mt_docker_manifest, manifest.media_type)
+      expect_equal("application/vnd.docker.container.image.v1+json", manifest.config.media_type)
+      expect_equal(5836, manifest.config.size)
+      expect_equal("application/vnd.docker.image.rootfs.diff.tar.gzip", manifest.layers[0].media_type)
+      expect_equal(2818413, manifest.layers[0].size)
+    }
+    (R.error, why) then { expect_fail("docker manifest fixture does not parse: " + why) }
+  }
+}
+
+def test_index_fixture_parses() {
+  const index = parsed_index()
+  expect_equal(reg_oci.mt_oci_index, index.media_type)
+  expect_equal(3, index.manifests.length())
+  expect_equal("amd64", index.manifests[0].platform.architecture)
+  expect_equal("linux", index.manifests[0].platform.os)
+  expect_equal("", index.manifests[0].platform.variant)
+  expect_equal("v8", index.manifests[1].platform.variant)
+  expect_true(!index.manifests[2].platform.present())
+  expect_equal(1, index.manifests[2].descriptor.annotations.length())
+  expect_equal(1, index.annotations.length())
+}
+
+def test_config_fixture_parses() {
+  case reg_oci.parse_config(read_fixture("config.json")) {
+    (R.ok, config) then {
+      expect_equal("amd64", config.architecture)
+      expect_equal("linux", config.os)
+      expect_equal("", config.variant)
+      expect_equal(1, config.diff_ids.length())
+      expect_equal("sha256:41086bcd8c639c3fc24ecb8da310eb9db7b3cda38e62ccbee7363619327557d4", config.diff_ids[0])
+      expect_equal(0, config.labels.length())
+    }
+    (R.error, why) then { expect_fail("config fixture does not parse: " + why) }
+  }
+}
+
+def test_missing_required_fields_are_rejected() {
+  expect_manifest_error(reg_oci.parse_manifest("{}", reg_oci.mt_oci_manifest), "schemaVersion: missing required field")
+  expect_manifest_error(reg_oci.parse_manifest("{\"schemaVersion\":2}", reg_oci.mt_oci_manifest), "manifest: config: missing required field")
+  expect_manifest_error(reg_oci.parse_manifest(manifest_body("sha256:abc", "1"), ""), "digest")
+  const no_layers = "{\"schemaVersion\":2,\"config\":{\"mediaType\":\"" + reg_oci.mt_oci_config + "\",\"digest\":\"" + manifest_digest + "\",\"size\":221}}"
+  expect_manifest_error(reg_oci.parse_manifest(no_layers, reg_oci.mt_oci_manifest), "manifest: layers: missing required field")
+  expect_index_error(reg_oci.parse_index("{\"schemaVersion\":2}", reg_oci.mt_oci_index), "index: manifests: missing required field")
+  expect_config_error(reg_oci.parse_config("{\"architecture\":\"amd64\"}"), "config: os: missing required field")
+  const no_rootfs = "{\"architecture\":\"amd64\",\"os\":\"linux\"}"
+  expect_config_error(reg_oci.parse_config(no_rootfs), "config: rootfs: missing required field")
+}
+
+def test_bad_digests_are_rejected() {
+  const bad = [
+    "sha1:0f343b0931126a20f133d67c2b018a3a2a3f2f5e3a5b8a4a1f2e3d4c5b6a7980",
+    "sha256:abc",
+    "sha256:0F343B0931126A20F133D67C2B018A3A2A3F2F5E3A5B8A4A1F2E3D4C5B6A7980",
+    "sha256:0f343b0931126a20f133d67c2b018a3a2a3f2f5e3a5b8a4a1f2e3d4c5b6a798g",
+    ""
+  ]
+  var i = 0
+  while i < bad.length() {
+    expect_manifest_error(reg_oci.parse_manifest(manifest_body(bad[i], "1"), ""),
+      "manifest: config: digest")
+    i = i + 1
+  }
+}
+
+def test_bad_descriptor_media_types_are_rejected() {
+  const bad = ["", "application", "application/", "application/ oci"]
+  var i = 0
+  while i < bad.length() {
+    const body = "{\"schemaVersion\":2,\"config\":{\"mediaType\":\"" + bad[i] + "\",\"digest\":\"" + manifest_digest + "\",\"size\":221},\"layers\":[]}"
+    expect_manifest_error(reg_oci.parse_manifest(body, reg_oci.mt_oci_manifest), "manifest: config: mediaType")
+    i = i + 1
+  }
+}
+
+def test_bad_sizes_are_rejected() {
+  expect_manifest_error(reg_oci.parse_manifest(manifest_body(manifest_digest, "-1"), ""), "size: must not be negative")
+  const text_size = "{\"schemaVersion\":2,\"config\":{\"mediaType\":\"" + reg_oci.mt_oci_config + "\",\"digest\":\"" + manifest_digest + "\",\"size\":\"221\"},\"layers\":[]}"
+  expect_manifest_error(reg_oci.parse_manifest(text_size, reg_oci.mt_oci_manifest), "size: expected an integer")
+}
+
+def test_schema_version_is_enforced() {
+  expect_manifest_error(reg_oci.parse_manifest("{\"schemaVersion\":1}", reg_oci.mt_oci_manifest), "schemaVersion must be 2, got 1")
+  expect_manifest_error(reg_oci.parse_manifest("{\"schemaVersion\":\"2\"}", reg_oci.mt_oci_manifest), "schemaVersion: expected an integer")
+}
+
+def test_document_type_comes_from_the_content_type_or_the_body() {
+  case reg_oci.parse_document(read_fixture("manifest.docker.json"), "application/vnd.docker.distribution.manifest.v2+json; charset=utf-8") {
+    (R.ok, document) then {
+      expect_equal(reg_oci.kind_manifest, document.kind)
+      expect_equal(reg_oci.mt_docker_manifest, document.media_type)
+    }
+    (R.error, why) then { expect_fail("docker Content-Type was not used: " + why) }
+  }
+  case reg_oci.parse_document(read_fixture("index.json"), "") {
+    (R.ok, document) then {
+      expect_true(document.is_index())
+      expect_equal(reg_oci.mt_oci_index, document.media_type)
+      expect_equal(3, document.index.manifests.length())
+    }
+    (R.error, why) then { expect_fail("body mediaType was not used: " + why) }
+  }
+}
+
+def test_document_type_conflicts_are_rejected() {
+  expect_document_error(
+    reg_oci.parse_document(read_fixture("manifest.json"), reg_oci.mt_oci_index),
+    "Content-Type says application/vnd.oci.image.index.v1+json, body says application/vnd.oci.image.manifest.v1+json")
+  expect_document_error(
+    reg_oci.parse_document("{\"schemaVersion\":2}", "application/json"),
+    "unsupported Content-Type 'application/json'")
+  expect_document_error(
+    reg_oci.parse_document("{\"schemaVersion\":2}", ""),
+    "no mediaType in the body and no Content-Type")
+  expect_document_error(
+    reg_oci.parse_document("{\"schemaVersion\":2,\"mediaType\":\"application/vnd.example.thing.v1+json\"}", ""),
+    "unsupported mediaType")
+}
+
+def test_manifest_encoding_is_reproducible() {
+  const manifest = parsed_manifest()
+  const encoded = reg_oci.encode_manifest(manifest)
+  expect_equal(read_fixture("manifest.canonical.json"), encoded + "\n")
+  expect_equal(encoded, reg_oci.encode_manifest(manifest))
+  case reg_oci.parse_manifest(encoded, "") {
+    (R.ok, again) then { expect_equal(encoded, reg_oci.encode_manifest(again)) }
+    (R.error, why) then { expect_fail("re-parsing the encoding failed: " + why) }
+  }
+}
+
+def test_index_encoding_is_reproducible() {
+  const index = parsed_index()
+  const encoded = reg_oci.encode_index(index)
+  expect_equal(read_fixture("index.canonical.json"), encoded + "\n")
+  expect_equal(encoded, reg_oci.encode_index(index))
+  case reg_oci.parse_index(encoded, "") {
+    (R.ok, again) then { expect_equal(encoded, reg_oci.encode_index(again)) }
+    (R.error, why) then { expect_fail("re-parsing the encoding failed: " + why) }
+  }
+}
+
+def test_config_encoding_is_reproducible() {
+  case reg_oci.parse_config(read_fixture("config.json")) {
+    (R.ok, config) then {
+      const expected = "{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{\"type\":\"layers\",\"diff_ids\":[\"sha256:41086bcd8c639c3fc24ecb8da310eb9db7b3cda38e62ccbee7363619327557d4\"]}}"
+      const encoded = reg_oci.encode_config(config)
+      expect_equal(expected, encoded)
+      expect_equal(encoded, reg_oci.encode_config(config))
+      case reg_oci.parse_config(encoded) {
+        (R.ok, again) then { expect_equal("amd64", again.architecture) }
+        (R.error, why) then { expect_fail("re-parsing the encoded config failed: " + why) }
+      }
+    }
+    (R.error, why) then { expect_fail("config fixture does not parse: " + why) }
+  }
+}
+
+def test_platform_selection_matches_the_client() {
+  const index = parsed_index()
+  case reg_oci.select_platform(index, "linux", "amd64") {
+    (R.ok, digest) then { expect_equal("sha256:3c5537ef65f0e6d1860ea6aa9272d42b14e7ee5209b8fe4670897db1d41555ab", digest) }
+    (R.error, why) then { expect_fail("linux/amd64 did not match: " + why) }
+  }
+  case reg_oci.select_platform(index, "linux", "arm64") {
+    (R.ok, digest) then { expect_equal("sha256:2222222222222222222222222222222222222222222222222222222222222222", digest) }
+    (R.error, why) then { expect_fail("linux/arm64 did not match: " + why) }
+  }
+  case reg_oci.select_platform(index, "windows", "amd64") {
+    (R.ok, _) then { expect_fail("windows/amd64 must not match") }
+    (R.error, why) then {
+      expect_true(why.index_of("index lists no windows/amd64 manifest") >= 0)
+      expect_true(why.index_of("linux/amd64 linux/arm64") >= 0)
+      expect_true(why.index_of("(no platform)") >= 0)
+    }
+  }
+}
+
+def test_verify_body_checks_digest_and_size() {
+  const body = read_fixture("manifest.canonical.json")
+  const descriptor = reg_oci.Descriptor.new(reg_oci.mt_oci_manifest, digest_of(body), body.to_bytes().length(), [])
+  case reg_oci.verify_body(descriptor, body, "manifest") {
+    (R.ok, digest) then { expect_equal(digest_of(body), digest) }
+    (R.error, why) then { expect_fail("a matching body was rejected: " + why) }
+  }
+  const wrong_digest = reg_oci.Descriptor.new(reg_oci.mt_oci_manifest, "sha256:2222222222222222222222222222222222222222222222222222222222222222", body.to_bytes().length(), [])
+  case reg_oci.verify_body(wrong_digest, body, "manifest") {
+    (R.ok, _) then { expect_fail("a wrong digest was accepted") }
+    (R.error, why) then {
+      expect_true(why.index_of("digest mismatch") >= 0)
+      expect_true(why.index_of("sha256:2222222222222222222222222222222222222222222222222222222222222222") >= 0)
+      expect_true(why.index_of(digest_of(body)) >= 0)
+    }
+  }
+  const wrong_size = reg_oci.Descriptor.new(reg_oci.mt_oci_manifest, digest_of(body), body.to_bytes().length() - 1, [])
+  case reg_oci.verify_body(wrong_size, body, "manifest") {
+    (R.ok, _) then { expect_fail("a wrong size was accepted") }
+    (R.error, why) then {
+      expect_true(why.index_of("size mismatch") >= 0)
+      expect_true(why.index_of("descriptor says 401") >= 0)
+      expect_true(why.index_of("body is 402 bytes") >= 0)
+    }
+  }
+}
+
+def test_garbage_bodies_are_error_tuples() {
+  expect_document_error(reg_oci.parse_document("not json", ""), "not valid JSON")
+  expect_manifest_error(reg_oci.parse_manifest("[]", ""), "expected a JSON object")
+  expect_config_error(reg_oci.parse_config("42"), "expected a JSON object")
+  expect_index_error(reg_oci.parse_index("{\"schemaVersion\":2,\"manifests\":{}}", reg_oci.mt_oci_index), "manifests: expected an array")
+}

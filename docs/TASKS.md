@@ -348,7 +348,7 @@ Exit criteria:
 | --- | --- | --- | --- | --- |
 | [x] | T2.1 | Service skeleton, configuration, and health checks | T1.2 | 2h |
 | [x] | T2.2 | SQLite data layer and migrations | T2.1 | 2-3h |
-| [ ] | T2.3 | OCI manifest / index model and validation | T1.5 | 2-3h |
+| [x] | T2.3 | OCI manifest / index model and validation | T1.5 | 2-3h |
 | [ ] | T2.4 | BlobStore interface and local filesystem backend | T2.1 | 2h |
 | [ ] | T2.5 | AWS SigV4 signing and presigned URLs | T2.1 | 3h |
 | [ ] | T2.6 | S3 / MinIO BlobStore adapter | T2.4, T2.5 | 3h |
@@ -409,6 +409,8 @@ Suggested tables:
 **Acceptance**: Real image manifests parse; missing fields, bad digest formats, and size mismatches are rejected; encoded bytes are reproducible; index platform selection matches the client.
 
 **Depends on**: T1.5 · **Estimate**: 2-3h
+
+> **Notes** (2026-11-18, ~2h): Done. `registry/oci.emo` models `Descriptor`, `Platform`, `IndexEntry`, `ImageManifest`, `ImageIndex`, `ImageConfig`, and a `Document` wrapper (kind + both shapes, because Emo has no sum types). `parse_document` takes the media type from the `Content-Type` header (parameters stripped) or the body's `mediaType`, requires them to agree, and dispatches; `parse_manifest`/`parse_index` accept a caller-supplied type; `parse_config` reads architecture/os/rootfs diff_ids and `config.Labels`. Validation is total and answers error tuples: schemaVersion must be 2, required members and JSON kinds are checked, digests must be `sha256:` + 64 lowercase hex, media types must be `type/subtype` with no whitespace, sizes must be non-negative integers, annotations must be string-valued. `verify_body` hashes and measures a body against a descriptor and names both sides on a mismatch. Encoding uses `json.object` in a fixed field order with compact separators; a test pins byte equality against two new golden fixtures and proves encode→parse→encode is stable. `select_platform` returns the first entry matching os+arch exactly (variant ignored), mirroring `src/registry.emo`, with the same "available:" miss message. Fixtures: a multi-arch `index.json` over the existing skopeo-valid image, `manifest.docker.json`, and `manifest.canonical.json`/`index.canonical.json`. 17 tests in `test/registry_oci.emo`; `emo test` 264/264. Gotchas: the negative-guard form (`if !value.is(...) { return ... }` then use class methods) does not narrow, so every array/object parse uses the positive branch; `parse_manifest(body, "")` errors when the body itself omits `mediaType`, so tests that build minimal bodies pass the type explicitly. Encoding is documented as canonical, not lossless — unknown members are dropped and the registry still stores the client's original bytes.
 
 #### T2.4 BlobStore Interface and Local Filesystem Backend
 

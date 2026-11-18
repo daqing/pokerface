@@ -1,0 +1,924 @@
+// T2.3: the registry's OCI document model — image manifests, image indexes,
+// and image configs — with descriptor validation (media type, digest, size),
+// deterministic encoding, and the same platform selection rule the client
+// uses (src/registry.emo: os + architecture).
+//
+// Parsing is the registry's boundary: every document a client pushes is
+// untrusted. Missing required fields, malformed digests, invalid media types,
+// and negative sizes are error tuples with the offending path
+// (registry: oci: manifest: config: digest: ...), never raises — the JSON
+// accessors raise on missing keys, so every lookup goes through a scanning
+// member() first.
+//
+// Encoding is canonical, not lossless: it emits the modeled fields in a fixed
+// order with compact separators, so encoding the same value twice is the same
+// bytes. Unknown members (subject, artifactType, urls, ...) are dropped;
+// the registry stores and serves the original bytes it received, so a push
+// digest always covers what the client sent. Spec: docs/spec/registry-oci.md.
+
+require "json"
+require "crypto"
+
+const mt_oci_manifest = "application/vnd.oci.image.manifest.v1+json"
+const mt_oci_index = "application/vnd.oci.image.index.v1+json"
+const mt_oci_config = "application/vnd.oci.image.config.v1+json"
+const mt_docker_manifest = "application/vnd.docker.distribution.manifest.v2+json"
+const mt_docker_list = "application/vnd.docker.distribution.manifest.list.v2+json"
+const mt_docker_config = "application/vnd.docker.container.image.v1+json"
+
+const kind_manifest = "manifest"
+const kind_index = "index"
+
+const schema_version = 2
+const digest_prefix = "sha256:"
+const digest_hex_length = 64
+const lower_hex = "0123456789abcdef"
+
+class Descriptor {
+  def init(media_type String, digest String, size Int64, annotations Array[(String, String)]) {
+    self.media_type = media_type
+    self.digest = digest
+    self.size = size
+    self.annotations = annotations
+  }
+}
+
+def absent_descriptor() Descriptor {
+  return Descriptor.new("", "", -1, [])
+}
+
+class Platform {
+  def init(os String, architecture String, variant String, os_version String) {
+    self.os = os
+    self.architecture = architecture
+    self.variant = variant
+    self.os_version = os_version
+  }
+
+  def present() Bool {
+    return self.os != "" || self.architecture != "" || self.variant != "" || self.os_version != ""
+  }
+}
+
+def absent_platform() Platform {
+  return Platform.new("", "", "", "")
+}
+
+class IndexEntry {
+  def init(descriptor Descriptor, platform Platform) {
+    self.descriptor = descriptor
+    self.platform = platform
+  }
+}
+
+class ImageManifest {
+  def init(media_type String, config Descriptor, layers Array[Descriptor], annotations Array[(String, String)]) {
+    self.media_type = media_type
+    self.config = config
+    self.layers = layers
+    self.annotations = annotations
+  }
+}
+
+class ImageIndex {
+  def init(media_type String, manifests Array[IndexEntry], annotations Array[(String, String)]) {
+    self.media_type = media_type
+    self.manifests = manifests
+    self.annotations = annotations
+  }
+}
+
+def absent_manifest() ImageManifest {
+  return ImageManifest.new("", absent_descriptor(), [], [])
+}
+
+def absent_index() ImageIndex {
+  return ImageIndex.new("", [], [])
+}
+
+// A parsed body of either kind. `kind` says which of manifest/index is the
+// live one; the other is the absent placeholder.
+class Document {
+  def init(kind String, media_type String, manifest ImageManifest, index ImageIndex) {
+    self.kind = kind
+    self.media_type = media_type
+    self.manifest = manifest
+    self.index = index
+  }
+
+  def is_index() Bool {
+    return self.kind == kind_index
+  }
+}
+
+class ImageConfig {
+  def init(architecture String, os String, variant String, os_version String, diff_ids Array[String], labels Array[(String, String)]) {
+    self.architecture = architecture
+    self.os = os
+    self.variant = variant
+    self.os_version = os_version
+    self.diff_ids = diff_ids
+    self.labels = labels
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Media types and digests.
+
+def is_manifest_type(media_type String) Bool {
+  return media_type == mt_oci_manifest || media_type == mt_docker_manifest
+}
+
+def is_index_type(media_type String) Bool {
+  return media_type == mt_oci_index || media_type == mt_docker_list
+}
+
+def classify(media_type String) String {
+  if is_manifest_type(media_type) {
+    return kind_manifest
+  }
+  if is_index_type(media_type) {
+    return kind_index
+  }
+  return ""
+}
+
+// "sha256:" followed by exactly 64 lowercase hex characters; answers the hex
+// part, or "" for anything else.
+def digest_hex(digest String) String {
+  if digest.length() != digest_prefix.length() + digest_hex_length {
+    return ""
+  }
+  if !digest.starts_with(digest_prefix) {
+    return ""
+  }
+  const hex = digest.substring(digest_prefix.length(), digest_hex_length)
+  var i = 0
+  while i < digest_hex_length {
+    if lower_hex.index_of(hex.substring(i, 1)) < 0 {
+      return ""
+    }
+    i = i + 1
+  }
+  return hex
+}
+
+// RFC 6838 shape, loosely: two non-empty parts around one "/", no whitespace.
+def valid_media_type(media_type String) Bool {
+  if media_type == "" {
+    return false
+  }
+  const slash = media_type.index_of("/")
+  if slash <= 0 {
+    return false
+  }
+  if slash >= media_type.length() - 1 {
+    return false
+  }
+  var i = 0
+  while i < media_type.length() {
+    const c = media_type.substring(i, 1)
+    if c == " " || c == "\t" || c == "\n" || c == "\r" {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// A descriptor's digest and size must describe `body` exactly. Answers the
+// verified digest, so callers can store it without recomputing.
+def verify_body(descriptor Descriptor, body String, label String) (R, String) {
+  const expected = digest_hex(descriptor.digest)
+  if expected == "" {
+    return (R.error, oci_error(label, descriptor.digest, "digest is not sha256:<64 lowercase hex>"))
+  }
+  const actual = crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+  if actual != expected {
+    return (R.error, oci_error(label, descriptor.digest,
+      "digest mismatch — body hashes to " + digest_prefix + actual))
+  }
+  const size = body.to_bytes().length()
+  if size != descriptor.size {
+    return (R.error, oci_error(label, descriptor.digest,
+      "size mismatch — descriptor says " + descriptor.size.to_string()
+      + ", body is " + size.to_string() + " bytes"))
+  }
+  return (R.ok, digest_prefix + actual)
+}
+
+def oci_error(label String, subject String, message String) String {
+  return "registry: oci: " + label + ": " + subject + ": " + message
+}
+
+// ---------------------------------------------------------------------------
+// Parsing.
+
+// Parses a body of either kind. The Content-Type header (when it names a
+// manifest or index type) and the body's own mediaType must agree; either one
+// can supply the type, but one of them must.
+def parse_document(body String, content_type String) (R, Document) {
+  case decode_object(body, "document") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, doc) then {
+      case require_schema_version(doc, "document") {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, _) then { }
+      }
+      var declared = ""
+      case optional_string(doc, "mediaType") {
+        (R.error, why) then { return (R.error, "registry: oci: document: mediaType: " + why) }
+        (R.ok, text) then { declared = text }
+      }
+      case resolve_document_type(normalize_content_type(content_type), declared) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, resolved) then {
+          const (media_type, kind) = resolved
+          if kind == kind_index {
+            case parse_index_object(doc, media_type) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, index) then { return (R.ok, Document.new(kind_index, media_type, absent_manifest(), index)) }
+            }
+          }
+          case parse_manifest_object(doc, media_type) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, manifest) then { return (R.ok, Document.new(kind_manifest, media_type, manifest, absent_index())) }
+          }
+        }
+      }
+    }
+  }
+}
+
+def resolve_document_type(header String, declared String) (R, (String, String)) {
+  const header_kind = classify(header)
+  const declared_kind = classify(declared)
+  if header_kind != "" && declared_kind != "" {
+    if header != declared {
+      return (R.error, "registry: oci: document: Content-Type says " + header + ", body says " + declared)
+    }
+  }
+  if header_kind != "" {
+    return (R.ok, (header, header_kind))
+  }
+  if declared_kind != "" {
+    return (R.ok, (declared, declared_kind))
+  }
+  if declared != "" {
+    return (R.error, "registry: oci: document: unsupported mediaType '" + declared + "'")
+  }
+  if header != "" {
+    return (R.error, "registry: oci: document: unsupported Content-Type '" + header + "'")
+  }
+  return (R.error, "registry: oci: document: no mediaType in the body and no Content-Type on the request")
+}
+
+def parse_manifest(body String, media_type String) (R, ImageManifest) {
+  case decode_object(body, "manifest") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, doc) then {
+      case require_schema_version(doc, "manifest") {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, _) then { }
+      }
+      case document_type(doc, media_type, "manifest", kind_manifest) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, resolved) then { return parse_manifest_object(doc, resolved) }
+      }
+    }
+  }
+}
+
+def parse_index(body String, media_type String) (R, ImageIndex) {
+  case decode_object(body, "index") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, doc) then {
+      case require_schema_version(doc, "index") {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, _) then { }
+      }
+      case document_type(doc, media_type, "index", kind_index) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, resolved) then { return parse_index_object(doc, resolved) }
+      }
+    }
+  }
+}
+
+// The caller's media type wins when it is given, but it must be a type of the
+// expected kind and must not contradict the body's own declaration.
+def document_type(doc json.Json, media_type String, label String, expected_kind String) (R, String) {
+  var declared = ""
+  case optional_string(doc, "mediaType") {
+    (R.error, why) then { return (R.error, "registry: oci: " + label + ": mediaType: " + why) }
+    (R.ok, text) then { declared = text }
+  }
+  if media_type != "" && declared != "" && media_type != declared {
+    return (R.error, "registry: oci: " + label + ": mediaType says " + declared + ", caller says " + media_type)
+  }
+  var resolved = media_type
+  if resolved == "" {
+    resolved = declared
+  }
+  if resolved == "" {
+    return (R.error, "registry: oci: " + label + ": no mediaType")
+  }
+  if classify(resolved) != expected_kind {
+    return (R.error, "registry: oci: " + label + ": media type '" + resolved + "' is not a" + article(expected_kind))
+  }
+  return (R.ok, resolved)
+}
+
+def article(kind String) String {
+  if kind == kind_index {
+    return "n image index"
+  }
+  return "n image manifest"
+}
+
+def parse_manifest_object(doc json.Json, media_type String) (R, ImageManifest) {
+  var config = absent_descriptor()
+  var layers = []
+  var annotations = []
+  case member(doc, "config") {
+    (R.error, why) then { return (R.error, "registry: oci: manifest: config: " + why) }
+    (R.ok, value) then {
+      case parse_descriptor(value, "manifest: config") {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, parsed) then { config = parsed }
+      }
+    }
+  }
+  case member(doc, "layers") {
+    (R.error, why) then { return (R.error, "registry: oci: manifest: layers: " + why) }
+    (R.ok, value) then {
+      if value.is(json.JsonArray) {
+        case parse_descriptors(value.items(), "manifest: layers", 0, []) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, parsed) then { layers = parsed }
+        }
+      } else {
+        return (R.error, "registry: oci: manifest: layers: expected an array")
+      }
+    }
+  }
+  case member(doc, "annotations") {
+    (R.error, _) then { }
+    (R.ok, value) then {
+      case parse_annotations(value, "manifest: annotations") {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, parsed) then { annotations = parsed }
+      }
+    }
+  }
+  return (R.ok, ImageManifest.new(media_type, config, layers, annotations))
+}
+
+def parse_index_object(doc json.Json, media_type String) (R, ImageIndex) {
+  var manifests = []
+  var annotations = []
+  case member(doc, "manifests") {
+    (R.error, why) then { return (R.error, "registry: oci: index: manifests: " + why) }
+    (R.ok, value) then {
+      if value.is(json.JsonArray) {
+        case parse_entries(value.items(), "index: manifests", 0, []) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, parsed) then { manifests = parsed }
+        }
+      } else {
+        return (R.error, "registry: oci: index: manifests: expected an array")
+      }
+    }
+  }
+  case member(doc, "annotations") {
+    (R.error, _) then { }
+    (R.ok, value) then {
+      case parse_annotations(value, "index: annotations") {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, parsed) then { annotations = parsed }
+      }
+    }
+  }
+  return (R.ok, ImageIndex.new(media_type, manifests, annotations))
+}
+
+def parse_descriptors(items Array[json.Json], label String, index Int64, out Array[Descriptor]) (R, Array[Descriptor]) {
+  if index >= items.length() {
+    return (R.ok, out)
+  }
+  case parse_descriptor(items[index], label + "[" + index.to_string() + "]") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, descriptor) then {
+      return parse_descriptors(items, label, index + 1, out.append(descriptor))
+    }
+  }
+}
+
+def parse_descriptor(value json.Json, label String) (R, Descriptor) {
+  if !value.is(json.JsonObject) {
+    return (R.error, "registry: oci: " + label + ": expected a mapping")
+  }
+  var media_type = ""
+  case required_string(value, "mediaType", label) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, text) then {
+      if !valid_media_type(text) {
+        return (R.error, oci_error(label, "mediaType", "not a media type: '" + text + "'"))
+      }
+      media_type = text
+    }
+  }
+  var digest = ""
+  case required_string(value, "digest", label) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, text) then {
+      if digest_hex(text) == "" {
+        return (R.error, oci_error(label, "digest", "expected sha256: and 64 lowercase hex characters, got '" + text + "'"))
+      }
+      digest = text
+    }
+  }
+  var size = 0
+  case required_size(value, "size", label) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, n) then { size = n }
+  }
+  var annotations = []
+  case member(value, "annotations") {
+    (R.error, _) then { }
+    (R.ok, annotations_value) then {
+      case parse_annotations(annotations_value, label + ": annotations") {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, parsed) then { annotations = parsed }
+      }
+    }
+  }
+  return (R.ok, Descriptor.new(media_type, digest, size, annotations))
+}
+
+def parse_entries(items Array[json.Json], label String, index Int64, out Array[IndexEntry]) (R, Array[IndexEntry]) {
+  if index >= items.length() {
+    return (R.ok, out)
+  }
+  case parse_entry(items[index], label + "[" + index.to_string() + "]") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, entry) then {
+      return parse_entries(items, label, index + 1, out.append(entry))
+    }
+  }
+}
+
+def parse_entry(value json.Json, label String) (R, IndexEntry) {
+  case parse_descriptor(value, label) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, descriptor) then {
+      var platform = absent_platform()
+      case member(value, "platform") {
+        (R.error, _) then { }
+        (R.ok, platform_value) then {
+          case parse_platform(platform_value, label + ": platform") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, parsed) then { platform = parsed }
+          }
+        }
+      }
+      return (R.ok, IndexEntry.new(descriptor, platform))
+    }
+  }
+}
+
+def parse_platform(value json.Json, label String) (R, Platform) {
+  if !value.is(json.JsonObject) {
+    return (R.error, "registry: oci: " + label + ": expected a mapping")
+  }
+  var os = ""
+  var architecture = ""
+  var variant = ""
+  var os_version = ""
+  case optional_string(value, "os") {
+    (R.error, why) then { return (R.error, "registry: oci: " + label + ": os: " + why) }
+    (R.ok, text) then { os = text }
+  }
+  case optional_string(value, "architecture") {
+    (R.error, why) then { return (R.error, "registry: oci: " + label + ": architecture: " + why) }
+    (R.ok, text) then { architecture = text }
+  }
+  case optional_string(value, "variant") {
+    (R.error, why) then { return (R.error, "registry: oci: " + label + ": variant: " + why) }
+    (R.ok, text) then { variant = text }
+  }
+  case optional_string(value, "os.version") {
+    (R.error, why) then { return (R.error, "registry: oci: " + label + ": os.version: " + why) }
+    (R.ok, text) then { os_version = text }
+  }
+  return (R.ok, Platform.new(os, architecture, variant, os_version))
+}
+
+def parse_annotations(value json.Json, label String) (R, Array[(String, String)]) {
+  if value.is(json.JsonObject) {
+    const entries = value.entries()
+    var out = []
+    var i = 0
+    while i < entries.length() {
+      const (key, item) = entries[i]
+      if key == "" {
+        return (R.error, "registry: oci: " + label + ": annotation key must not be empty")
+      }
+      if !item.is(json.JsonString) {
+        return (R.error, "registry: oci: " + label + ": '" + key + "': expected a string")
+      }
+      out = out.append((key, item.as_string()))
+      i = i + 1
+    }
+    return (R.ok, out)
+  }
+  return (R.error, "registry: oci: " + label + ": expected a mapping")
+}
+
+// Parses an image config: the platform it runs on and the diff ids that tie
+// it to its layers. Other members (Cmd, Env, history, ...) are not modeled.
+def parse_config(body String) (R, ImageConfig) {
+  case decode_object(body, "config") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, doc) then {
+      var architecture = ""
+      var os = ""
+      var variant = ""
+      var os_version = ""
+      var diff_ids = []
+      var labels = []
+      case required_string(doc, "architecture", "config") {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, text) then {
+          if text == "" {
+            return (R.error, "registry: oci: config: architecture: must not be empty")
+          }
+          architecture = text
+        }
+      }
+      case required_string(doc, "os", "config") {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, text) then {
+          if text == "" {
+            return (R.error, "registry: oci: config: os: must not be empty")
+          }
+          os = text
+        }
+      }
+      case optional_string(doc, "variant") {
+        (R.error, why) then { return (R.error, "registry: oci: config: variant: " + why) }
+        (R.ok, text) then { variant = text }
+      }
+      case optional_string(doc, "os.version") {
+        (R.error, why) then { return (R.error, "registry: oci: config: os.version: " + why) }
+        (R.ok, text) then { os_version = text }
+      }
+      case member(doc, "rootfs") {
+        (R.error, why) then { return (R.error, "registry: oci: config: rootfs: " + why) }
+        (R.ok, rootfs) then {
+          case parse_rootfs(rootfs, "config: rootfs") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, ids) then { diff_ids = ids }
+          }
+        }
+      }
+      case member(doc, "config") {
+        (R.error, _) then { }
+        (R.ok, config_value) then {
+          case parse_labels(config_value, "config: config") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, parsed) then { labels = parsed }
+          }
+        }
+      }
+      return (R.ok, ImageConfig.new(architecture, os, variant, os_version, diff_ids, labels))
+    }
+  }
+}
+
+def parse_rootfs(value json.Json, label String) (R, Array[String]) {
+  if !value.is(json.JsonObject) {
+    return (R.error, "registry: oci: " + label + ": expected a mapping")
+  }
+  case required_string(value, "type", label) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, text) then {
+      if text != "layers" {
+        return (R.error, "registry: oci: " + label + ": type must be 'layers', got '" + text + "'")
+      }
+    }
+  }
+  case member(value, "diff_ids") {
+    (R.error, why) then { return (R.error, "registry: oci: " + label + ": diff_ids: " + why) }
+    (R.ok, ids) then {
+      if ids.is(json.JsonArray) {
+        return parse_diff_ids(ids.items(), label + ": diff_ids", 0, [])
+      }
+      return (R.error, "registry: oci: " + label + ": diff_ids: expected an array")
+    }
+  }
+}
+
+def parse_diff_ids(items Array[json.Json], label String, index Int64, out Array[String]) (R, Array[String]) {
+  if index >= items.length() {
+    return (R.ok, out)
+  }
+  const item = items[index]
+  if !item.is(json.JsonString) {
+    return (R.error, "registry: oci: " + label + "[" + index.to_string() + "]: expected a string")
+  }
+  const text = item.as_string()
+  if digest_hex(text) == "" {
+    return (R.error, "registry: oci: " + label + "[" + index.to_string() + "]: expected sha256: and 64 lowercase hex characters, got '" + text + "'")
+  }
+  return parse_diff_ids(items, label, index + 1, out.append(text))
+}
+
+def parse_labels(value json.Json, label String) (R, Array[(String, String)]) {
+  case member(value, "Labels") {
+    (R.error, _) then { return (R.ok, []) }
+    (R.ok, labels) then {
+      return parse_annotations(labels, label + ": Labels")
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Encoding. Fixed field order, compact separators, optional members omitted
+// when empty — encoding the same value twice is always the same bytes.
+
+def encode_document(document Document) String {
+  if document.is_index() {
+    return encode_index(document.index)
+  }
+  return encode_manifest(document.manifest)
+}
+
+def encode_manifest(manifest ImageManifest) String {
+  var fields = [
+    ("schemaVersion", json.int64(schema_version)),
+    ("mediaType", json.string(manifest.media_type)),
+    ("config", descriptor_json(manifest.config)),
+    ("layers", descriptors_json(manifest.layers))
+  ]
+  if manifest.annotations.length() > 0 {
+    fields = fields.append(("annotations", annotations_json(manifest.annotations)))
+  }
+  return json.encode(json.object(fields))
+}
+
+def encode_index(index ImageIndex) String {
+  var fields = [
+    ("schemaVersion", json.int64(schema_version)),
+    ("mediaType", json.string(index.media_type)),
+    ("manifests", entries_json(index.manifests))
+  ]
+  if index.annotations.length() > 0 {
+    fields = fields.append(("annotations", annotations_json(index.annotations)))
+  }
+  return json.encode(json.object(fields))
+}
+
+def encode_config(config ImageConfig) String {
+  var fields = [
+    ("architecture", json.string(config.architecture)),
+    ("os", json.string(config.os))
+  ]
+  if config.variant != "" {
+    fields = fields.append(("variant", json.string(config.variant)))
+  }
+  if config.os_version != "" {
+    fields = fields.append(("os.version", json.string(config.os_version)))
+  }
+  fields = fields.append(("rootfs", rootfs_json(config.diff_ids)))
+  if config.labels.length() > 0 {
+    var config_fields = [("Labels", annotations_json(config.labels))]
+    fields = fields.append(("config", json.object(config_fields)))
+  }
+  return json.encode(json.object(fields))
+}
+
+def descriptor_json(descriptor Descriptor) json.Json {
+  var fields = [
+    ("mediaType", json.string(descriptor.media_type)),
+    ("digest", json.string(descriptor.digest)),
+    ("size", json.int64(descriptor.size))
+  ]
+  if descriptor.annotations.length() > 0 {
+    fields = fields.append(("annotations", annotations_json(descriptor.annotations)))
+  }
+  return json.object(fields)
+}
+
+def descriptors_json(descriptors Array[Descriptor]) json.Json {
+  var items = []
+  var i = 0
+  while i < descriptors.length() {
+    items = items.append(descriptor_json(descriptors[i]))
+    i = i + 1
+  }
+  return json.array(items)
+}
+
+def entries_json(entries Array[IndexEntry]) json.Json {
+  var items = []
+  var i = 0
+  while i < entries.length() {
+    items = items.append(entry_json(entries[i]))
+    i = i + 1
+  }
+  return json.array(items)
+}
+
+def entry_json(entry IndexEntry) json.Json {
+  const descriptor = entry.descriptor
+  var fields = [
+    ("mediaType", json.string(descriptor.media_type)),
+    ("digest", json.string(descriptor.digest)),
+    ("size", json.int64(descriptor.size))
+  ]
+  if entry.platform.present() {
+    fields = fields.append(("platform", platform_json(entry.platform)))
+  }
+  if descriptor.annotations.length() > 0 {
+    fields = fields.append(("annotations", annotations_json(descriptor.annotations)))
+  }
+  return json.object(fields)
+}
+
+def platform_json(platform Platform) json.Json {
+  var fields = [
+    ("architecture", json.string(platform.architecture)),
+    ("os", json.string(platform.os))
+  ]
+  if platform.variant != "" {
+    fields = fields.append(("variant", json.string(platform.variant)))
+  }
+  if platform.os_version != "" {
+    fields = fields.append(("os.version", json.string(platform.os_version)))
+  }
+  return json.object(fields)
+}
+
+def rootfs_json(diff_ids Array[String]) json.Json {
+  var items = []
+  var i = 0
+  while i < diff_ids.length() {
+    items = items.append(json.string(diff_ids[i]))
+    i = i + 1
+  }
+  return json.object([
+    ("type", json.string("layers")),
+    ("diff_ids", json.array(items))
+  ])
+}
+
+def annotations_json(annotations Array[(String, String)]) json.Json {
+  var fields = []
+  var i = 0
+  while i < annotations.length() {
+    const (key, value) = annotations[i]
+    fields = fields.append((key, json.string(value)))
+    i = i + 1
+  }
+  return json.object(fields)
+}
+
+// ---------------------------------------------------------------------------
+// Platform selection. Same rule as the client: the first entry whose os and
+// architecture match exactly, variants ignored.
+
+def select_platform(index ImageIndex, os String, arch String) (R, String) {
+  var available = ""
+  var i = 0
+  while i < index.manifests.length() {
+    const entry = index.manifests[i]
+    if entry.platform.present() {
+      available = available + " " + entry.platform.os + "/" + entry.platform.architecture
+      if entry.platform.os == os && entry.platform.architecture == arch {
+        return (R.ok, entry.descriptor.digest)
+      }
+    } else {
+      available = available + " " + entry.descriptor.digest + " (no platform)"
+    }
+    i = i + 1
+  }
+  return (R.error, "registry: oci: index lists no " + os + "/" + arch + " manifest (available:" + available + ")")
+}
+
+// ---------------------------------------------------------------------------
+// Small JSON helpers. Json.get raises on a missing key and Emo has no catch,
+// so every member goes through the scanning member() first.
+
+def decode_object(body String, label String) (R, json.Json) {
+  case json.decode(body) {
+    (R.error, why) then { return (R.error, "registry: oci: " + label + " is not valid JSON: " + why) }
+    (R.ok, doc) then {
+      if doc.is(json.JsonObject) {
+        return (R.ok, doc)
+      }
+      return (R.error, "registry: oci: " + label + ": expected a JSON object at the top level")
+    }
+  }
+}
+
+def require_schema_version(doc json.Json, label String) (R, Bool) {
+  case member(doc, "schemaVersion") {
+    (R.error, why) then { return (R.error, "registry: oci: " + label + ": schemaVersion: " + why) }
+    (R.ok, value) then {
+      if !value.is(json.JsonInt) {
+        return (R.error, "registry: oci: " + label + ": schemaVersion: expected an integer")
+      }
+      if value.as_int() != schema_version {
+        return (R.error, "registry: oci: " + label + ": schemaVersion must be " + schema_version.to_string() + ", got " + value.as_int().to_string())
+      }
+      return (R.ok, true)
+    }
+  }
+}
+
+def member(doc json.Json, key String) (R, json.Json) {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (k, v) = entries[i]
+      if k == key {
+        return (R.ok, v)
+      }
+      i = i + 1
+    }
+    return (R.error, "missing required field")
+  }
+  return (R.error, "expected a mapping")
+}
+
+def required_string(doc json.Json, key String, label String) (R, String) {
+  case member(doc, key) {
+    (R.error, why) then { return (R.error, "registry: oci: " + label + ": " + key + ": " + why) }
+    (R.ok, value) then {
+      if value.is(json.JsonString) {
+        return (R.ok, value.as_string())
+      }
+      return (R.error, "registry: oci: " + label + ": " + key + ": expected a string")
+    }
+  }
+}
+
+def optional_string(doc json.Json, key String) (R, String) {
+  case member(doc, key) {
+    (R.error, _) then { return (R.ok, "") }
+    (R.ok, value) then {
+      if value.is(json.JsonString) {
+        return (R.ok, value.as_string())
+      }
+      return (R.error, "expected a string")
+    }
+  }
+}
+
+def required_size(doc json.Json, key String, label String) (R, Int64) {
+  case member(doc, key) {
+    (R.error, why) then { return (R.error, "registry: oci: " + label + ": " + key + ": " + why) }
+    (R.ok, value) then {
+      if !value.is(json.JsonInt) {
+        return (R.error, "registry: oci: " + label + ": " + key + ": expected an integer")
+      }
+      if value.as_int() < 0 {
+        return (R.error, "registry: oci: " + label + ": " + key + ": must not be negative")
+      }
+      return (R.ok, value.as_int())
+    }
+  }
+}
+
+def normalize_content_type(text String) String {
+  var out = text
+  const semi = out.index_of(";")
+  if semi >= 0 {
+    out = out.substring(0, semi)
+  }
+  return trim(out)
+}
+
+def trim(text String) String {
+  var start = 0
+  var end = text.length()
+  while start < end {
+    const c = text.substring(start, 1)
+    if c == " " || c == "\t" || c == "\n" || c == "\r" {
+      start = start + 1
+    } else {
+      break
+    }
+  }
+  while end > start {
+    const c = text.substring(end - 1, 1)
+    if c == " " || c == "\t" || c == "\n" || c == "\r" {
+      end = end - 1
+    } else {
+      break
+    }
+  }
+  return text.substring(start, end - start)
+}
