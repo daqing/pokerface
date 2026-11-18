@@ -1,0 +1,185 @@
+// T1.9: the resolve command — parse the reference, resolve the ref to a
+// commit, read pokerface.lock.yaml from the Git mirror cache, and print
+// ref -> commit -> image -> digest. Git failures never fall back to a stale
+// cache: read_lock's fast path serves the same commit without a fetch, and a
+// fetch failure is a hard error.
+
+require "os"
+
+
+const resolve_default_platform = "linux/amd64"
+
+class ResolveResult {
+  def init(display_ref String, commit String, image String, digest String, manifest_digest String, tags Array[String], platforms Array[String]) {
+    self.display_ref = display_ref
+    self.commit = commit
+    self.image = image
+    self.digest = digest
+    self.manifest_digest = manifest_digest
+    self.tags = tags
+    self.platforms = platforms
+  }
+}
+
+def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) Int64 {
+  if rest.length() == 0 {
+    src.common.eprint("pokerface: resolve expects a repository reference argument\n")
+    return src.common.exit_usage
+  }
+  if rest.length() > 1 {
+    src.common.eprint("pokerface: resolve takes exactly one repository reference, got " + rest.length().to_string() + "\n")
+    return src.common.exit_usage
+  }
+
+  const display_ref = rest[0]
+  case src.ref.parse(display_ref) {
+    (R.error, why) then {
+      src.common.eprint("pokerface: resolve: " + why + "\n")
+      return src.common.exit_usage
+    }
+    (R.ok, parsed) then {
+      const runner = src.git.RealRunner.new()
+      const wanted = wanted_for(parsed.ref)
+      case src.git.resolve(runner, parsed.git_url, wanted, resolve_timeout(flags)) {
+        (R.error, why) then {
+          src.common.eprint("pokerface: resolve: " + why + "\n")
+          return src.common.exit_failure
+        }
+        (R.ok, commit) then {
+          case load_doc(flags, env, parsed, commit, wanted) {
+            (R.error, why) then {
+              src.common.eprint("pokerface: resolve: " + why + "\n")
+              return src.common.exit_failure
+            }
+            (R.ok, doc) then {
+              case pick_image(doc, flags) {
+                (R.error, why) then {
+                  src.common.eprint("pokerface: resolve: " + why + "\n")
+                  return src.common.exit_failure
+                }
+                (R.ok, entry) then {
+                  var display = parsed.host + "/" + parsed.owner + "/" + parsed.repo + ":" + parsed.ref
+                  if parsed.host == parsed.git_url {
+                    // Local path form: git_url is the path itself; show it
+                    // verbatim instead of re-assembling host/owner/repo.
+                    display = parsed.git_url + ":" + parsed.ref
+                  }
+                  const result = ResolveResult.new(
+                    display,
+                    commit,
+                    entry.image,
+                    digest_for(entry),
+                    entry.manifest_digest,
+                    entry.tags,
+                    entry.platforms
+                  )
+                  print_result(result, flags)
+                  return src.common.exit_ok
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// The ref part goes through the same resolver the pull side will use:
+// latest/HEAD/names/SHAs/refs all have defined meanings there.
+def wanted_for(ref_part String) String {
+  return ref_part
+}
+
+def resolve_timeout(flags src.common.Flags) Float64 {
+  return 30.0
+}
+
+// Read the lock through the mirror cache at the resolved commit. The cache
+// root comes from settings (POKERFACE_CACHE_DIR or the XDG default); the ref
+// hint is the user's ref, so the fetch touches only what the request needs.
+def load_doc(flags src.common.Flags, env src.settings.EnvSource, parsed src.ref.Reference, commit String, wanted String) (R, src.lockfile.LockDoc) {
+  var cache_root = src.git_cache.default_cache_root()
+  case src.settings.load(src.git.RealRunner.new(), env, flags.config) {
+    (R.ok, s) then {
+      if s.cache_dir != "" {
+        cache_root = s.cache_dir
+      }
+    }
+    (R.error, why) then { return (R.error, why) }
+  }
+  return src.git_cache.load_lock(src.git.RealRunner.new(), parsed.git_url, commit, wanted, cache_root, resolve_timeout(flags))
+}
+
+// Pick the lock entry for the image the reference names, or the single entry
+// when the lock carries one.
+def pick_image(doc src.lockfile.LockDoc, flags src.common.Flags) (R, src.lockfile.LockImage) {
+  if doc.images.length() == 1 {
+    return (R.ok, doc.images[0])
+  }
+  return (R.error, "the lock at this commit lists " + doc.images.length().to_string() + " images; pass --image (not yet implemented) or commit a single-image lock")
+}
+
+// manifest_digest when a platform is selected and the entry carries one;
+// digest otherwise (T1.10's manifest client will select per platform).
+def digest_for(entry src.lockfile.LockImage) String {
+  if entry.manifest_digest != "" {
+    return entry.manifest_digest
+  }
+  return entry.digest
+}
+
+// Stable, script-friendly field order: ref, commit, image, digest,
+// manifest_digest, tags, platforms.
+def json_text(r ResolveResult) String {
+  var out = ""
+  out = out + "{"
+  out = out + "\"ref\": \"" + r.display_ref + "\", "
+  out = out + "\"commit\": \"" + r.commit + "\", "
+  out = out + "\"image\": \"" + r.image + "\", "
+  out = out + "\"digest\": \"" + r.digest + "\""
+  if r.manifest_digest != "" {
+    out = out + ", \"manifest_digest\": \"" + r.manifest_digest + "\""
+  }
+  out = out + ", \"tags\": [" + json_string_array(r.tags) + "]"
+  out = out + ", \"platforms\": [" + json_string_array(r.platforms) + "]"
+  out = out + "}"
+  return out
+}
+
+def json_string_array(arr Array[String]) String {
+  var out = ""
+  var i = 0
+  while i < arr.length() {
+    if i > 0 {
+      out = out + ", "
+    }
+    out = out + "\"" + arr[i] + "\""
+    i = i + 1
+  }
+  return out
+}
+
+def print_result(r ResolveResult, flags src.common.Flags) {
+  if flags.json {
+    println(json_text(r))
+  } else {
+    var tag_list = ""
+    var i = 0
+    while i < r.tags.length() {
+      if i > 0 {
+        tag_list = tag_list + ", "
+      }
+      tag_list = tag_list + r.tags[i]
+      i = i + 1
+    }
+    println("ref:     " + r.display_ref)
+    println("commit:  " + r.commit)
+    println("image:   " + r.image)
+    println("digest:  " + r.digest)
+    println("tags:    " + tag_list)
+    if r.manifest_digest != "" && r.manifest_digest != r.digest {
+      println("index:   " + r.digest)
+    }
+  }
+}

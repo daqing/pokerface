@@ -406,7 +406,7 @@ def kind_word(kind yaml.YamlKind) String {
 def encode(doc LockDoc) String {
   var out = ""
   out = out + "version: " + doc.version.to_string() + "\n"
-  out = out + "commit: " + doc.commit + "\n"
+  out = out + "commit: \"" + doc.commit + "\"\n"
   out = out + "source: " + doc.source + "\n"
   if doc.generated_at != "" {
     out = out + "generated_at: \"" + doc.generated_at + "\"\n"

@@ -1,24 +1,16 @@
-// pokerface CLI skeleton (T1.1): command routing, help text, and exit codes.
+// pokerface CLI routing (T1.1): command dispatch, help text, and usage
+// errors. Shared constants and Flags live in src/src.common.emo; command
+// handlers live in src/commands/*.
 require "os"
 
-// 0 success, 1 command failure, 2 usage error. T1.16 (docs/spec/errors.md)
-// grows this into the full, stable table.
-const exit_ok = 0
-const exit_failure = 1
-const exit_usage = 2
-
-const version = "0.1.0"
-
-class Flags {
-  def init(config String, verbose Bool, json Bool) {
-    self.config = config
-    self.verbose = verbose
-    self.json = json
-  }
-}
+// Aliases for test compatibility; the definitions live in src/src.common.emo.
+const exit_ok = src.common.exit_ok
+const exit_failure = src.common.exit_failure
+const exit_usage = src.common.exit_usage
+const version = src.common.version
 
 def eprint(text String) {
-  const (R.ok, _) = os.write(2, text)
+  src.common.eprint(text)
 }
 
 def help_text() String {
@@ -53,7 +45,7 @@ def usage_text() String {
   )
 }
 
-def run_version(flags Flags) Int64 {
+def run_version(flags src.common.Flags) Int64 {
   if flags.json {
     println("{\"name\": \"pokerface\", \"version\": \"" + version + "\"}")
   } else {
@@ -62,7 +54,7 @@ def run_version(flags Flags) Int64 {
   return exit_ok
 }
 
-def not_implemented(name String, flags Flags) Int64 {
+def not_implemented(name String, flags src.common.Flags) Int64 {
   eprint("pokerface: " + name + " is not implemented yet; see docs/TASKS.md\n")
   if flags.verbose {
     eprint("pokerface: verbose logging is not wired up yet (planned for T1.16)\n")
@@ -116,10 +108,10 @@ def route(argv Array[String]) Int64 {
     return exit_usage
   }
 
-  const flags = Flags.new(config, verbose, json)
+  const flags = src.common.Flags.new(config, verbose, json)
   case command {
     "version" then { return run_version(flags) }
-    "resolve" then { return not_implemented(command, flags) }
+    "resolve" then { return src.commands.resolve.run(flags, rest, src.settings.RealEnv.new()) }
     "pull" then { return not_implemented(command, flags) }
     "build" then { return not_implemented(command, flags) }
     "config" then { return not_implemented(command, flags) }

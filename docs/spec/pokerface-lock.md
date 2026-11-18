@@ -10,7 +10,7 @@
 
 ```yaml
 version: 1
-commit: 0123456789abcdef0123456789abcdef01234567
+commit: "0123456789abcdef0123456789abcdef01234567"
 source: github.com/acme/app
 generated_at: "2026-11-18T08:30:00Z"
 images:

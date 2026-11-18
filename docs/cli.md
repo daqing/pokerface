@@ -63,8 +63,38 @@ git@github.com:acme/app.git:main            # git@ form
 - `http://` and URL credentials are rejected. Refs containing `/` and path
   shapes other than `<owner>/<repo>` after the host are rejected with an
   error naming the offending field.
+- **Local path form (T1.9)**: a reference starting with `/`, `./`, or `../`
+  is a filesystem path git uses directly (`/tmp/fixtures/origin.git:main`).
+  `host` is the path itself, `owner`/`repo` come from the last two segments,
+  and `git_url` stays the raw path — this is what local e2e fixtures run on.
 
-### Ref resolution (T1.6)
+### The `resolve` command (T1.9)
+
+```console
+$ pokerface resolve github.com/acme/app:latest
+ref:     github.com/acme/app:latest
+commit:  0e05a2ea964dbda0ef105221ed505826c46babf8
+image:   registry.example.com/acme/app
+digest:  sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+tags:    latest, sha-01234567
+```
+
+`--json` prints the same fields in a stable, script-friendly order:
+
+```json
+{"ref": "github.com/acme/app:latest", "commit": "...", "image": "...", "digest": "sha256:...", "manifest_digest": "sha256:...", "tags": ["..."], "platforms": ["..."]}
+```
+
+Behavior:
+
+- the chain is `ref → commit (git ls-remote) → pokerface.lock.yaml at that
+  commit (mirror cache) → image → digest`;
+- exit 0 on success, 2 for a missing/malformed reference argument, 1 for
+  git, cache, config, or lock failures — **git failures never fall back to
+  a stale cache** (a same-commit cache hit is fine and needs no network);
+- `manifest_digest` is served when the lock entry carries one (the selected
+  platform's manifest), else the index `digest`;
+- a lock listing several images is an error for now (`--image` lands later).
 
 The ref part of a reference resolves to a full commit SHA via
 `git ls-remote` (`src/git.emo`):

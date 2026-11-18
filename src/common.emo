@@ -1,0 +1,26 @@
+// Shared CLI pieces (T1.9 split): exit codes, the parsed global flags, and
+// stderr output. Routing lives in src/cli.emo; command handlers in
+// src/commands/* depend on this module, never on the router, so the
+// dependency graph stays acyclic.
+
+require "os"
+
+// 0 success, 1 command failure, 2 usage error. T1.16 (docs/spec/errors.md)
+// grows this into the full, stable table.
+const exit_ok = 0
+const exit_failure = 1
+const exit_usage = 2
+
+const version = "0.1.0"
+
+class Flags {
+  def init(config String, verbose Bool, json Bool) {
+    self.config = config
+    self.verbose = verbose
+    self.json = json
+  }
+}
+
+def eprint(text String) {
+  const (R.ok, _) = os.write(2, text)
+}

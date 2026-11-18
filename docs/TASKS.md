@@ -78,7 +78,7 @@ Exit criteria:
 | [x] | T1.6 | Git ref resolution: tag / branch / commit | T1.3 | 2-3h |
 | [x] | T1.7 | Read Git metadata and cache repository mirrors | T1.6, T1.5 | 3h |
 | [x] | T1.8 | Configuration, credentials, and XDG paths | T1.1 | 2h |
-| [ ] | T1.9 | Wire up the `resolve` command | T1.4-T1.8 | 2h |
+| [x] | T1.9 | Wire up the `resolve` command | T1.4-T1.8 | 2h |
 | [ ] | T1.10 | Registry authentication and manifest client | T1.5, T1.8 | 3h |
 | [ ] | T1.11 | Blob downloader: retries, verification, resume | T1.10 | 3-4h |
 | [ ] | T1.12 | Assemble an OCI image layout | T1.10, T1.11 | 2-3h |
@@ -228,6 +228,8 @@ images:
 **Acceptance**: Output is stable for fixture repositories; `--json` fields are stable and script-friendly; a missing image or platform in the lock exits non-zero; Git failures do not fall back to stale caches.
 
 **Depends on**: T1.4-T1.8 · **Estimate**: 2h
+
+> **Notes** (2026-11-18, ~2.5h): Done. `src/commands/resolve.emo` chains ref → commit → lock → image → digest with `--json` (stable field order) and human output; a multi-image lock is a clear error, missing refs/lock/config each exit 1 with the reason, and git failures never fall back to a stale cache (the same-commit cache hit stays offline-friendly). Two structural changes: (1) the resolve→cli reference was a module cycle, so Flags/eprint/exit codes moved to a new `src/common.emo` — command handlers depend on common, never on the router; (2) refs gained a local-path form (`/…`, `./…`, `../…` → git_url stays the raw path) because local e2e fixtures are a hard requirement for T1.17's offline script. Two loader pitfalls cost real time: a test file mirroring its subject's path (test/commands/resolve.emo) trips E5003, and so does any top-level `const X = src.<mod>.new(...)` — cross-module construction must happen inside defs (test/resolve_cmd.emo documents both). Also fixed en route: lockfile.encode now quotes `commit:` so an all-digit SHA survives round-trip. Verified end to end against a local bare origin with the real binary (human + json + not-found paths); `emo test` 90/90.
 
 #### T1.10 Registry Authentication and Manifest Client
 

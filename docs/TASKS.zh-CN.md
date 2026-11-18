@@ -78,7 +78,7 @@
 | [x] | T1.6 | Git ref 解析：tag / branch / commit | T1.3 | 2-3h |
 | [x] | T1.7 | Git 元数据读取与镜像缓存 | T1.6、T1.5 | 3h |
 | [x] | T1.8 | 配置、凭据与 XDG 路径 | T1.1 | 2h |
-| [ ] | T1.9 | `resolve` 命令串联 | T1.4-T1.8 | 2h |
+| [x] | T1.9 | `resolve` 命令串联 | T1.4-T1.8 | 2h |
 | [ ] | T1.10 | Registry 认证与 Manifest 客户端 | T1.5、T1.8 | 3h |
 | [ ] | T1.11 | Blob 下载器：重试、校验、续传 | T1.10 | 3-4h |
 | [ ] | T1.12 | OCI 镜像布局组装 | T1.10、T1.11 | 2-3h |
@@ -228,6 +228,8 @@ images:
 **验收**：对 fixture 仓库输出稳定；`--json` 字段固定且可被脚本消费；lock 中没有匹配镜像 / 平台时非零退出；Git 失败不读取旧缓存。
 
 **依赖**：T1.4-T1.8 · **预估**：2h
+
+> **笔记**（2026-11-18，约 2.5h）：完成。`src/commands/resolve.emo` 串联 ref → commit → lock → image → digest，支持 `--json`（字段顺序固定）与人类可读输出；多镜像 lock 明确报错，缺 ref/lock/config 各自退出 1 并带原因；git 失败绝不回退旧缓存（同 commit 的缓存命中不需要网络，保持离线可用）。两个结构性调整：(1) resolve→cli 的引用构成模块环，Flags/eprint/退出码抽到新的 `src/common.emo`——命令 handler 依赖 common，永不依赖路由器；(2) 引用新增本地路径形式（`/…`、`./…`、`../…` → git_url 保留原始路径），因为本地 e2e fixture 是 T1.17 离线脚本的硬需求。两个加载器深坑耗了不少时间：测试文件镜像被测路径（test/commands/resolve.emo）会触发 E5003，顶层 `const X = src.<mod>.new(...)` 同样会触发——跨模块构造必须放进 def 里（test/resolve_cmd.emo 顶部注释记录了这两条）。顺手修复：lockfile.encode 给 `commit:` 加引号，全数字 SHA 也能安全往返。用真实二进制对本地 bare origin 做了端到端验证（人类输出 + json + not-found 路径）；`emo test` 90/90。
 
 #### T1.10 Registry 认证与 Manifest 客户端
 
