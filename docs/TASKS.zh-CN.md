@@ -75,7 +75,7 @@
 | [x] | T1.3 | 仓库引用解析 | T1.1 | 1-2h |
 | [x] | T1.4 | `pokerface.yaml` v0.1 规范与解析 | T1.2 | 2-3h |
 | [x] | T1.5 | `pokerface.lock.yaml` v0.1 规范与解析 | T1.2 | 2h |
-| [ ] | T1.6 | Git ref 解析：tag / branch / commit | T1.3 | 2-3h |
+| [x] | T1.6 | Git ref 解析：tag / branch / commit | T1.3 | 2-3h |
 | [ ] | T1.7 | Git 元数据读取与镜像缓存 | T1.6、T1.5 | 3h |
 | [ ] | T1.8 | 配置、凭据与 XDG 路径 | T1.1 | 2h |
 | [ ] | T1.9 | `resolve` 命令串联 | T1.4-T1.8 | 2h |
@@ -192,6 +192,8 @@ images:
 **验收**：轻量 tag、annotated tag、branch、HEAD、完整 SHA、短 SHA 均有测试；不存在的 ref 返回明确错误；子进程有超时；参数以数组传递，不经过 shell 拼接。
 
 **依赖**：T1.3 · **预估**：2-3h
+
+> **笔记**（2026-11-18，约 2.5h）：完成。`src/git.emo` 以可注入的 `CommandRunner` 接口暴露 `resolve(runner, git_url, wanted, timeout)`；wanted 语义钉在 docs/cli.md——`latest` 解析为默认分支 HEAD（一次 `--symref` 调用），annotated tag 剥离到 `^{}` commit，分支/tagName 同名冲突报 ambiguous，`refs/...` 是精确逃生通道，完整 SHA 直接放行（存在性在 T1.7 拉取时校验）。重要发现：**`os.waitpid` 会阻塞整个调度器**——父进程等待期间 `time.after` 看门狗根本不跑，所以 `RealRunner` 用双 fork 看门狗（子进程再 fork 孙进程，孙进程睡到 deadline 后杀掉子进程；父进程随意阻塞）。实测：0.3s 超时在 ~0.30s 杀掉 2s 的 sleep；快命令零额外延迟。测试共 14 个——fixture 仓库（轻量/annotated tag、branch、HEAD、完整/短 SHA、缺失、歧义、latest）经 git 子进程建在 TMPDIR（留给系统清理），另有 FakeRunner 逻辑测试。测试抓出的坑：ls-remote 循环里提前 `return HEAD` 对任何 wanted 都命中——条件必须是 `wanted == "HEAD" && name == "HEAD"`。
 
 #### T1.7 Git 元数据读取与镜像缓存
 

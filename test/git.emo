@@ -1,0 +1,233 @@
+// T1.6 tests for src/git.emo — run with `emo test`.
+// Fixture repositories are created under TMPDIR with unique per-run names and
+// are left for the OS temp cleaner; the tests never delete anything.
+
+const git_mod = src.git
+const real_runner = src.git.RealRunner.new()
+
+def temp_base_dir() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def fixture_path(name String) String {
+  return temp_base_dir() + "pokerface-git-fixture-" + os.getpid().to_string() + "-" + name
+}
+
+def expect_runner_ok(result (R, String)) {
+  case result {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("fixture git command failed: " + why) }
+  }
+}
+
+def make_fixture(name String) String {
+  const dir = fixture_path(name)
+  expect_runner_ok(real_runner.run(["git", "init", "-b", "main", dir], 10.0))
+  expect_runner_ok(real_runner.run(["git", "-C", dir, "-c", "user.name=pf", "-c", "user.email=pf@example.com", "commit", "--allow-empty", "-m", "initial"], 10.0))
+  expect_runner_ok(real_runner.run(["git", "-C", dir, "tag", "v1.0"], 10.0))
+  expect_runner_ok(real_runner.run(["git", "-C", dir, "tag", "-a", "v2.0", "-m", "annotated"], 10.0))
+  expect_runner_ok(real_runner.run(["git", "-C", dir, "branch", "feature"], 10.0))
+  expect_runner_ok(real_runner.run(["git", "-C", dir, "branch", "dup"], 10.0))
+  expect_runner_ok(real_runner.run(["git", "-C", dir, "tag", "dup"], 10.0))
+  return dir
+}
+
+def resolve_ok(dir String, wanted String) String {
+  case git_mod.resolve(real_runner, dir, wanted, 10.0) {
+    (R.ok, sha) then { return sha }
+    (R.error, why) then {
+      expect_fail("resolve '" + wanted + "' failed: " + why)
+      return ""
+    }
+  }
+}
+
+def resolve_error(dir String, wanted String) String {
+  case git_mod.resolve(real_runner, dir, wanted, 10.0) {
+    (R.ok, sha) then {
+      expect_fail("expected '" + wanted + "' to fail, got " + sha)
+      return ""
+    }
+    (R.error, why) then { return why }
+  }
+}
+
+def test_fixture_lightweight_tag() {
+  const dir = make_fixture("lightweight")
+  const head = resolve_ok(dir, "HEAD")
+  expect_equal(head, resolve_ok(dir, "v1.0"))
+}
+
+def test_fixture_annotated_tag_peels_to_commit() {
+  const dir = make_fixture("annotated")
+  const head = resolve_ok(dir, "HEAD")
+  expect_equal(head, resolve_ok(dir, "v2.0"))
+}
+
+def test_fixture_branch() {
+  const dir = make_fixture("branch")
+  const head = resolve_ok(dir, "HEAD")
+  expect_equal(head, resolve_ok(dir, "feature"))
+  expect_equal(head, resolve_ok(dir, "main"))
+}
+
+def test_fixture_full_sha() {
+  const dir = make_fixture("full")
+  const head = resolve_ok(dir, "HEAD")
+  expect_equal(head, resolve_ok(dir, head))
+}
+
+def test_fixture_short_sha() {
+  const dir = make_fixture("short")
+  const head = resolve_ok(dir, "HEAD")
+  expect_equal(head, resolve_ok(dir, head.substring(0, 7)))
+}
+
+def test_fixture_missing_ref() {
+  const dir = make_fixture("missing")
+  expect_true(resolve_error(dir, "nope").index_of("not found") >= 0)
+}
+
+def test_fixture_ambiguous_ref() {
+  const dir = make_fixture("ambiguous")
+  expect_true(resolve_error(dir, "dup").index_of("ambiguous") >= 0)
+}
+
+def test_fixture_default_branch_and_latest() {
+  const dir = make_fixture("latest")
+  const (R.ok, branch) = git_mod.default_branch(real_runner, dir, 10.0)
+  expect_equal("main", branch)
+  const head = resolve_ok(dir, "HEAD")
+  expect_equal(head, resolve_ok(dir, "latest"))
+}
+
+def test_fixture_exact_ref() {
+  const dir = make_fixture("exact")
+  const head = resolve_ok(dir, "HEAD")
+  expect_equal(head, resolve_ok(dir, "refs/tags/v1.0"))
+  expect_equal(head, resolve_ok(dir, "refs/heads/feature"))
+  expect_equal(head, resolve_ok(dir, "refs/tags/v2.0"))
+}
+
+def test_real_runner_enforces_timeout() {
+  const start = time.mono()
+  case real_runner.run(["sleep", "2"], 0.3) {
+    (R.ok, out) then { expect_fail("expected sleep to be killed, got: " + out) }
+    (R.error, why) then {
+      expect_true(why.index_of("killed") >= 0)
+    }
+  }
+  expect_true(time.mono() - start < 1500000000)
+}
+
+def test_invalid_wanted() {
+  case git_mod.resolve(real_runner, "/nowhere", "", 10.0) {
+    (R.ok, _) then { expect_fail("empty wanted should fail") }
+    (R.error, why) then { expect_true(why.index_of("empty") >= 0) }
+  }
+  case git_mod.resolve(real_runner, "/nowhere", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", 10.0) {
+    (R.ok, _) then { expect_fail("non-hex 40-char wanted should fail") }
+    (R.error, why) then { expect_true(why.index_of("hex") >= 0) }
+  }
+}
+
+def test_fake_runner_peels_annotated_tag() {
+  const fake = FakeRunner.new([
+    ("ls-remote", fake_ls_remote_output())
+  ])
+  case git_mod.resolve(fake, "https://github.com/acme/app.git", "v1.0", 0.0) {
+    (R.ok, sha) then { expect_equal("0123456789abcdef0123456789abcdef01234567", sha) }
+    (R.error, why) then { expect_fail("expected peeled commit: " + why) }
+  }
+}
+
+def test_fake_runner_short_sha_ambiguous() {
+  const fake = FakeRunner.new([
+    ("ls-remote", fake_ambiguous_output())
+  ])
+  case git_mod.resolve(fake, "https://github.com/acme/app.git", "01234567", 0.0) {
+    (R.ok, sha) then { expect_fail("expected ambiguity, got " + sha) }
+    (R.error, why) then { expect_true(why.index_of("matches multiple commits") >= 0) }
+  }
+}
+
+def test_fake_runner_records_array_argv_and_timeout() {
+  const fake = FakeRunner.new([
+    ("ls-remote", fake_ls_remote_output())
+  ])
+  case git_mod.resolve(fake, "https://github.com/acme/app.git", "v1.0", 10.0) {
+    (R.ok, _) then { }
+    (R.error, why) then { expect_fail("expected resolve to work: " + why) }
+  }
+  const calls = fake.calls_text()
+  expect_true(calls.index_of("timeout=10") >= 0)
+  expect_true(calls.index_of("git ls-remote https://github.com/acme/app.git") >= 0)
+}
+
+def fake_ls_remote_output() String {
+  return (
+    "0123456789abcdef0123456789abcdef01234567\trefs/heads/main\n"
+    + "0123456789abcdef0123456789abcdef01234567\tHEAD\n"
+    + "89abcdef0123456789abcdef0123456789abcdef\trefs/tags/v1.0\n"
+    + "0123456789abcdef0123456789abcdef01234567\trefs/tags/v1.0^{}\n"
+  )
+}
+
+def fake_ambiguous_output() String {
+  return (
+    "0123456700000000000000000000000000000001\trefs/heads/a\n"
+    + "0123456700000000000000000000000000000002\trefs/heads/b\n"
+  )
+}
+
+class FakeRunner {
+  def init(responses Array[(String, String)]) {
+    self.responses = responses
+    self.calls = Box.new(ArrayBuilder.new())
+  }
+
+  def run(argv Array[String], timeout Float64) (R, String) {
+    var summary = ""
+    var i = 0
+    while i < argv.length() {
+      if i > 0 {
+        summary = summary + " "
+      }
+      summary = summary + argv[i]
+      i = i + 1
+    }
+    self.calls.read().push("timeout=" + timeout.to_string() + " argv=" + summary)
+    var j = 0
+    while j < self.responses.length() {
+      const (needle, output) = self.responses[j]
+      if summary.index_of(needle) >= 0 {
+        return (R.ok, output)
+      }
+      j = j + 1
+    }
+    return (R.error, "fake: no response for '" + summary + "'")
+  }
+
+  def calls_text() String {
+    var out = ""
+    const arr = self.calls.read().to_array()
+    var i = 0
+    while i < arr.length() {
+      out = out + arr[i] + "\n"
+      i = i + 1
+    }
+    return out
+  }
+}

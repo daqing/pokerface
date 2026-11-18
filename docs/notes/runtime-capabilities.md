@@ -77,6 +77,12 @@ Plan for the pull path (recorded now, executed in T1.10/T1.11):
   `def` at the bottom.
 - `os._exit(status)` works under both the interpreter and the c binary, and
   stdout is flushed before it.
+- **`os.waitpid` blocks the entire runtime, not just the calling process** —
+  a `time.after` watchdog never fires while the parent waits (verified: a
+  0.3s watchdog against a 2s child did nothing). Timeouts around subprocesses
+  therefore use a double-fork watchdog: the child forks a grandchild that
+  closes the pipe fds, sleeps the deadline, then kills the child; the parent
+  blocks freely in `waitpid` (see `src/git.emo`'s `RealRunner`).
 - `emo deps resolve` writes `package.lock` listing every transitive pin;
   commit it beside the manifest.
 

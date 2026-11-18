@@ -1,0 +1,290 @@
+// T1.6: resolve a tag / branch / short SHA / full SHA to a full commit SHA
+// via `git ls-remote`. Subprocesses run through the injectable CommandRunner
+// (arguments as an argv array, never through a shell) with a double-fork
+// watchdog enforcing the timeout: `os.waitpid` stalls the whole scheduler, so
+// the killer must be an independent OS process.
+
+require "os"
+require "time"
+
+interface CommandRunner {
+  def run(argv Array[String], timeout Float64) (R, String)
+}
+
+class RealRunner {
+  def init() {
+  }
+
+  def run(argv Array[String], timeout Float64) (R, String) {
+    if argv.length() == 0 {
+      return (R.error, "git: empty argv")
+    }
+    const (R.ok, fds) = os.pipe()
+    const read_fd = fds[0]
+    const write_fd = fds[1]
+    const (R.ok, pid) = os.fork()
+    if pid == 0 {
+      const my_pid = os.getpid()
+      if timeout > 0.0 {
+        const (R.ok, grand) = os.fork()
+        if grand == 0 {
+          os.close(read_fd)
+          os.close(write_fd)
+          time.sleep(timeout)
+          const (_, _) = os.kill(my_pid, os.sig_term)
+          os._exit(0)
+        }
+      }
+      const (R.ok, _) = os.dup2(write_fd, 1)
+      os.close(read_fd)
+      os.close(write_fd)
+      os.execvp(argv[0], argv)
+      os._exit(127)
+    }
+    os.close(write_fd)
+    var out = ""
+    while true {
+      const (R.ok, chunk) = os.read(read_fd, 4096)
+      if chunk == "" {
+        break
+      }
+      out = out + chunk
+    }
+    os.close(read_fd)
+    const w = os.waitpid(pid)
+    if os.wait_signaled(w[1]) {
+      return (R.error, "git: '" + argv[0] + "' was killed by signal " + os.wait_signal(w[1]).to_string() + " — the " + timeout.to_string() + "s timeout likely fired")
+    }
+    const code = os.wait_exit_code(w[1])
+    if code != 0 {
+      return (R.error, "git: '" + argv[0] + "' exited with code " + code.to_string())
+    }
+    return (R.ok, out)
+  }
+}
+
+const hex_charset = "0123456789abcdef"
+
+// wanted semantics (documented in docs/cli.md):
+//   latest            the default branch's newest commit (one --symref call)
+//   HEAD              the advertised HEAD commit
+//   40 lowercase hex  taken as the commit SHA; existence is checked when the
+//                     commit is fetched (T1.7)
+//   4-39 lowercase hex  short SHA, matched against the advertised refs
+//   refs/...          exact refname
+//   anything else     a branch or tag name; matching both is an error, an
+//                     annotated tag resolves to its peeled commit
+def resolve(runner CommandRunner, git_url String, wanted String, timeout Float64) (R, String) {
+  const w = wanted.trim()
+  if w == "" {
+    return (R.error, "git: the ref to resolve is empty")
+  }
+  if w == "latest" {
+    return resolve_latest(runner, git_url, timeout)
+  }
+  if w == "HEAD" {
+    return resolve_named(runner, git_url, w, timeout)
+  }
+  if w.length() == 40 {
+    if all_hex(w) {
+      return (R.ok, w)
+    }
+    return (R.error, "git: '" + w + "' has 40 characters but is not 40 lowercase hex characters")
+  }
+  if w.length() >= 4 && w.length() < 40 && all_hex(w) {
+    return resolve_short_sha(runner, git_url, w, timeout)
+  }
+  if w.starts_with("refs/") {
+    return resolve_exact_ref(runner, git_url, w, timeout)
+  }
+  return resolve_named(runner, git_url, w, timeout)
+}
+
+def default_branch(runner CommandRunner, git_url String, timeout Float64) (R, String) {
+  case symref_output(runner, git_url, timeout) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, output) then {
+      const lines = output.split("\n")
+      var i = 0
+      while i < lines.length() {
+        const line = lines[i]
+        if line.starts_with("ref: ") {
+          const rest = line.substring(5, line.length() - 5)
+          const tab = rest.index_of("\t")
+          if tab < 0 {
+            return (R.error, "git: malformed symref line '" + line + "'")
+          }
+          const refname = rest.substring(0, tab)
+          if refname.starts_with("refs/heads/") {
+            return (R.ok, refname.substring(11, refname.length() - 11))
+          }
+          return (R.error, "git: HEAD points at unexpected ref '" + refname + "'")
+        }
+        i = i + 1
+      }
+      return (R.error, "git: ls-remote --symref returned no 'ref:' line for " + git_url)
+    }
+  }
+}
+
+def resolve_latest(runner CommandRunner, git_url String, timeout Float64) (R, String) {
+  case symref_output(runner, git_url, timeout) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, output) then {
+      const refs = parse_ls_remote(output)
+      var i = 0
+      while i < refs.length() {
+        const (sha, name) = refs[i]
+        if name == "HEAD" {
+          return (R.ok, sha)
+        }
+        i = i + 1
+      }
+      return (R.error, "git: no HEAD advertised by " + git_url)
+    }
+  }
+}
+
+def symref_output(runner CommandRunner, git_url String, timeout Float64) (R, String) {
+  case runner.run(["git", "ls-remote", "--symref", git_url, "HEAD"], timeout) {
+    (R.error, why) then { return (R.error, "git: ls-remote --symref failed: " + why) }
+    (R.ok, output) then { return (R.ok, output) }
+  }
+}
+
+def ls_remote(runner CommandRunner, git_url String, timeout Float64) (R, Array[(String, String)]) {
+  case runner.run(["git", "ls-remote", git_url], timeout) {
+    (R.error, why) then { return (R.error, "git: ls-remote failed: " + why) }
+    (R.ok, output) then { return (R.ok, parse_ls_remote(output)) }
+  }
+}
+
+// "sha<TAB>refname" lines; malformed lines and symref markers are skipped.
+def parse_ls_remote(output String) Array[(String, String)] {
+  var out = []
+  const lines = output.split("\n")
+  var i = 0
+  while i < lines.length() {
+    const line = lines[i]
+    if line != "" {
+      const tab = line.index_of("\t")
+      if tab > 0 {
+        const sha = line.substring(0, tab)
+        const name = line.substring(tab + 1, line.length() - tab - 1)
+        if sha.length() == 40 && all_hex(sha) {
+          out = out.append((sha, name))
+        }
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+def resolve_named(runner CommandRunner, git_url String, wanted String, timeout Float64) (R, String) {
+  case ls_remote(runner, git_url, timeout) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, refs) then {
+      var branch_sha = ""
+      var tag_sha = ""
+      var peeled_sha = ""
+      var i = 0
+      while i < refs.length() {
+        const (sha, name) = refs[i]
+        if name == "refs/heads/" + wanted {
+          branch_sha = sha
+        }
+        if name == "refs/tags/" + wanted {
+          tag_sha = sha
+        }
+        if name == "refs/tags/" + wanted + "^{}" {
+          peeled_sha = sha
+        }
+        if wanted == "HEAD" && name == "HEAD" {
+          return (R.ok, sha)
+        }
+        i = i + 1
+      }
+      if branch_sha != "" && tag_sha != "" {
+        return (R.error, "git: ref '" + wanted + "' is ambiguous: it matches both a branch and a tag in " + git_url + " — use refs/heads/" + wanted + " or refs/tags/" + wanted)
+      }
+      if tag_sha != "" {
+        if peeled_sha != "" {
+          return (R.ok, peeled_sha)
+        }
+        return (R.ok, tag_sha)
+      }
+      if branch_sha != "" {
+        return (R.ok, branch_sha)
+      }
+      return (R.error, "git: ref '" + wanted + "' not found in " + git_url + " (ls-remote lists no such branch or tag)")
+    }
+  }
+}
+
+def resolve_exact_ref(runner CommandRunner, git_url String, wanted String, timeout Float64) (R, String) {
+  case ls_remote(runner, git_url, timeout) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, refs) then {
+      var direct = ""
+      var peeled = ""
+      var i = 0
+      while i < refs.length() {
+        const (sha, name) = refs[i]
+        if name == wanted {
+          direct = sha
+        }
+        if name == wanted + "^{}" {
+          peeled = sha
+        }
+        i = i + 1
+      }
+      if direct == "" {
+        return (R.error, "git: ref '" + wanted + "' not found in " + git_url)
+      }
+      if peeled != "" {
+        return (R.ok, peeled)
+      }
+      return (R.ok, direct)
+    }
+  }
+}
+
+def resolve_short_sha(runner CommandRunner, git_url String, wanted String, timeout Float64) (R, String) {
+  case ls_remote(runner, git_url, timeout) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, refs) then {
+      var found = ""
+      var ambiguous = false
+      var i = 0
+      while i < refs.length() {
+        const (sha, name) = refs[i]
+        if sha.starts_with(wanted) {
+          if found != "" && found != sha {
+            ambiguous = true
+          }
+          found = sha
+        }
+        i = i + 1
+      }
+      if ambiguous {
+        return (R.error, "git: short SHA '" + wanted + "' matches multiple commits in " + git_url)
+      }
+      if found == "" {
+        return (R.error, "git: short SHA '" + wanted + "' not found among the refs advertised by " + git_url)
+      }
+      return (R.ok, found)
+    }
+  }
+}
+
+def all_hex(s String) Bool {
+  var i = 0
+  while i < s.length() {
+    if hex_charset.index_of(s.substring(i, 1)) < 0 {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}

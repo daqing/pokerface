@@ -63,3 +63,20 @@ git@github.com:acme/app.git:main            # git@ form
 - `http://` and URL credentials are rejected. Refs containing `/` and path
   shapes other than `<owner>/<repo>` after the host are rejected with an
   error naming the offending field.
+
+### Ref resolution (T1.6)
+
+The ref part of a reference resolves to a full commit SHA via
+`git ls-remote` (`src/git.emo`):
+
+| Wanted | Resolves to |
+| --- | --- |
+| `latest` (default) | The repository's **default branch** newest commit (`git ls-remote --symref`) |
+| `HEAD` | The advertised HEAD commit |
+| 40 lowercase hex chars | Taken as the commit SHA; existence is checked when the commit is fetched (T1.7) |
+| 4–39 lowercase hex chars | Short SHA, matched against the advertised refs; ambiguous prefixes are rejected |
+| `refs/...` | An exact refname (`refs/tags/v1.2.0`, `refs/heads/main`) |
+| anything else | A branch or tag name; a name matching both is rejected as ambiguous, and an annotated tag resolves to its peeled `^{}` commit |
+
+All git subprocesses run with an argv array (never a shell) and enforce a
+timeout via a double-fork watchdog.

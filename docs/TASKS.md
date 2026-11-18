@@ -75,7 +75,7 @@ Exit criteria:
 | [x] | T1.3 | Parse repository references | T1.1 | 1-2h |
 | [x] | T1.4 | `pokerface.yaml` v0.1 spec and parser | T1.2 | 2-3h |
 | [x] | T1.5 | `pokerface.lock.yaml` v0.1 spec and parser | T1.2 | 2h |
-| [ ] | T1.6 | Git ref resolution: tag / branch / commit | T1.3 | 2-3h |
+| [x] | T1.6 | Git ref resolution: tag / branch / commit | T1.3 | 2-3h |
 | [ ] | T1.7 | Read Git metadata and cache repository mirrors | T1.6, T1.5 | 3h |
 | [ ] | T1.8 | Configuration, credentials, and XDG paths | T1.1 | 2h |
 | [ ] | T1.9 | Wire up the `resolve` command | T1.4-T1.8 | 2h |
@@ -192,6 +192,8 @@ images:
 **Acceptance**: Tests cover lightweight tags, annotated tags, branches, HEAD, full SHA, and short SHA; missing refs return a clear error; subprocesses have timeouts; arguments are passed as an array, never through a shell.
 
 **Depends on**: T1.3 · **Estimate**: 2-3h
+
+> **Notes** (2026-11-18, ~2.5h): Done. `src/git.emo` exposes `resolve(runner, git_url, wanted, timeout)` behind the injectable `CommandRunner` interface; wanted semantics are pinned in docs/cli.md — `latest` resolves the default branch HEAD (one `--symref` call), annotated tags peel to `^{}`, branch/tag name collisions are ambiguous errors, `refs/...` is the escape hatch, full SHAs pass through (existence checked at fetch time in T1.7). Big finding: **`os.waitpid` stalls the whole scheduler** — a `time.after` watchdog never fires while the parent waits, so `RealRunner` uses a double-fork watchdog (child forks a grandchild that sleeps the deadline and kills the child; parent blocks freely). Verified live: 0.3s timeout kills a 2s sleep at ~0.30s; fast commands pay no latency. Tests: 14 total — fixture repos (lightweight/annotated tags, branch, HEAD, full+short SHA, missing, ambiguous, latest) built via git subprocesses under TMPDIR (left for the OS cleaner), plus FakeRunner logic tests. Gotcha found by test: an early `return HEAD` inside the ls-remote loop matched for *every* wanted — condition must be `wanted == "HEAD" && name == "HEAD"`.
 
 #### T1.7 Read Git Metadata and Cache Repository Mirrors
 
