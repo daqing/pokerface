@@ -80,7 +80,7 @@ Exit criteria:
 | [x] | T1.8 | Configuration, credentials, and XDG paths | T1.1 | 2h |
 | [x] | T1.9 | Wire up the `resolve` command | T1.4-T1.8 | 2h |
 | [x] | T1.10 | Registry authentication and manifest client | T1.5, T1.8 | 3h |
-| [ ] | T1.11 | Blob downloader: retries, verification, resume | T1.10 | 3-4h |
+| [x] | T1.11 | Blob downloader: retries, verification, resume | T1.10 | 3-4h |
 | [ ] | T1.12 | Assemble an OCI image layout | T1.10, T1.11 | 2-3h |
 | [ ] | T1.13 | Runtime import adapter | T1.12 | 3h |
 | [ ] | T1.14 | Wire up the `pull` command and failure fallbacks | T1.9-T1.13 | 3h |
@@ -252,6 +252,8 @@ images:
 **Acceptance**: Retries recover from simulated 500s, timeouts, and interruptions; corrupted blobs are rejected and never enter the OCI layout; fall back to a full download when the server does not support Range; temp files are cleaned up on failure; large layers do not cause unacceptable memory use (if `http` cannot meet this, switch to a streaming `net` implementation in this task and record the decision).
 
 **Depends on**: T1.10 · **Estimate**: 3-4h
+
+> **Notes** (2026-11-18, ~3h): Done. **The recorded T1.2 decision is now executed: blobs stream through `net`** — `HttpBlobTransport` speaks HTTP/1.1 by hand (TLS or plain per scheme, Connection: close, Content-Length and chunked bodies, close-delimited rejected as the documented narrow case), so a large layer never sits in one String. Presigned redirects are followed up to 3 hops (the D4 mechanism; absolute Locations, as real CDNs issue). Retry/resume: `.part` + `.meta` offset sidecar, Range resume, automatic fallback to a full download when the server answers 200 to a Range request, exponential backoff with the retry count and base delay as parameters, 4xx classified permanent (no retry), incremental SHA-256 via `crypto.sha2.new()` Digest + size check, and `os.rename` commit — corrupted bytes never reach the layout, temp files cleaned on every failure path. **Concurrency cap deferred**: Emo's Boxes snapshot across processes so a shared semaphore needs a message-passing token process; the sequential `download_all_blobs` keeps memory bounded and ordering deterministic, and the parallel form is recorded as a follow-up (candidates: T1.14 wiring or a dedicated task). Tests: 15 — mock failure injection (open failures, mid-stream drops with exact resume offsets, Range fallback, 403 no-retry, corruption, size mismatch, cleanup) plus a REAL local httpd server leg (full download, 206 resume, 307 absolute redirect) over the live net stack; `emo test` 122/122. Gotchas: `TcpConn` is a bare builtin type (no `net.TcpConn` path); a `var` initialized from a tuple literal pins that tuple's type — initialize `var conn_result = net.connect(...)` not `(R.error, "...")`; one-line `if` expressions cannot nest inside binary operators (bind to a const first); `while true` loops need an unreachable trailing `return` to satisfy E4017.
 
 #### T1.12 Assemble an OCI Image Layout
 

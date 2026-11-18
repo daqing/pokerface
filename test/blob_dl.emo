@@ -1,0 +1,367 @@
+// T1.11 tests for the blob downloader — run with `emo test`.
+//
+// Two legs: MockBlobTransport with failure injection (retries, Range
+// fallback, corruption, cleanup) and a REAL local httpd server exercising
+// HttpBlobTransport over the actual net stack. Fixture files live under
+// TMPDIR with unique per-run names and are left for the OS temp cleaner.
+
+const blob_mod = src.blob
+const reg_mod = src.registry
+
+require "net"
+require "httpd"
+
+const blob_hex_a = "1111111111111111111111111111111111111111111111111111111111111111"
+const blob_hex_b = "2222222222222222222222222222222222222222222222222222222222222222"
+const blob_body = "The quick brown fox jumps over the lazy dog. "
+const blob_large = blob_body + blob_body + blob_body + blob_body
+
+def temp_base_dir() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def blob_final(name String) String {
+  return temp_base_dir() + "pokerface-blob-" + os.getpid().to_string() + "-" + name
+}
+
+def sha_hex(body String) String {
+  return crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+def make_route(url_contains String, status Int64, body String, honors_range Bool, fail_opens Int64, fail_after Int64) src.blob.MockBlobRoute {
+  return src.blob.MockBlobRoute.new(url_contains, status, body, honors_range, fail_opens, fail_after, Box.new(0))
+}
+
+def make_transport(routes Array[src.blob.MockBlobRoute]) src.blob.MockBlobTransport {
+  return src.blob.MockBlobTransport.new(routes)
+}
+
+def expect_ok_str(result (R, String)) String {
+  case result {
+    (R.ok, v) then { return v }
+    (R.error, why) then {
+      expect_fail("expected ok, got: " + why)
+      return ""
+    }
+  }
+}
+
+def expect_file_content(path String, want String) {
+  case file.read(path) {
+    (R.ok, text) then { expect_equal(want, text) }
+    (R.error, why) then { expect_fail("cannot read " + path + ": " + why) }
+  }
+}
+
+def test_simple_download_verifies_and_commits() {
+  const final = blob_final("simple")
+  const t = make_transport([make_route("blob-a", 200, blob_body, true, 0, -1)])
+  const url = "https://cdn.example.com/blob-a"
+  const result = blob_mod.download_blob_with(t, url, "sha256:" + sha_hex(blob_body), blob_body.length(), final, 3, 0.01, 16, 5.0, false)
+  expect_ok_str(result)
+  expect_file_content(final, blob_body)
+  case file.read(final + ".part") {
+    (R.ok, _) then { expect_fail(".part survived a successful download") }
+    (R.error, _) then { expect_true(true) }
+  }
+  case file.read(final + ".meta") {
+    (R.ok, _) then { expect_fail(".meta survived a successful download") }
+    (R.error, _) then { expect_true(true) }
+  }
+}
+
+def expect_false(v Bool) {
+  expect_true(!v)
+}
+
+def test_corrupt_blob_rejected_and_never_committed() {
+  const final = blob_final("corrupt")
+  const t = make_transport([make_route("blob-b", 200, blob_body, true, 0, -1)])
+  const wrong_digest = "sha256:" + blob_hex_a
+  case blob_mod.download_blob_with(t, "https://cdn.example.com/blob-b", wrong_digest, blob_body.length(), final, 3, 0.01, 16, 5.0, false) {
+    (R.ok, _) then { expect_fail("expected a digest mismatch") }
+    (R.error, why) then {
+      expect_true(why.index_of("digest mismatch") >= 0)
+      expect_true(why.index_of(wrong_digest) >= 0)
+    }
+  }
+  case file.read(final) {
+    (R.ok, _) then { expect_fail("corrupt blob was committed") }
+    (R.error, _) then { expect_true(true) }
+  }
+  case file.read(final + ".part") {
+    (R.ok, _) then { expect_fail("temp part survived") }
+    (R.error, _) then { expect_true(true) }
+  }
+}
+
+def test_size_mismatch_rejected() {
+  const final = blob_final("sizemismatch")
+  const t = make_transport([make_route("blob-c", 200, blob_body, true, 0, -1)])
+  case blob_mod.download_blob_with(t, "https://cdn.example.com/blob-c", "sha256:" + sha_hex(blob_body), blob_body.length() + 5, final, 3, 0.01, 16, 5.0, false) {
+    (R.ok, _) then { expect_fail("expected a size mismatch") }
+    (R.error, why) then { expect_true(why.index_of("size mismatch") >= 0) }
+  }
+  case file.read(final) {
+    (R.ok, _) then { expect_fail("bad blob was committed") }
+    (R.error, _) then { expect_true(true) }
+  }
+}
+
+def test_retries_recover_from_open_failures() {
+  const final = blob_final("retryopens")
+  const t = make_transport([make_route("blob-d", 200, blob_body, true, 2, -1)])
+  const result = blob_mod.download_blob_with(t, "https://cdn.example.com/blob-d", "sha256:" + sha_hex(blob_body), blob_body.length(), final, 3, 0.01, 16, 5.0, false)
+  expect_ok_str(result)
+  expect_file_content(final, blob_body)
+  const calls = t.requests_text()
+  expect_true(calls.index_of("range=0") >= 0)
+}
+
+def test_retry_gives_up_after_max_attempts() {
+  const final = blob_final("giveup")
+  const t = make_transport([make_route("blob-e", 200, blob_body, true, 99, -1)])
+  case blob_mod.download_blob_with(t, "https://cdn.example.com/blob-e", "sha256:" + sha_hex(blob_body), blob_body.length(), final, 2, 0.01, 16, 5.0, false) {
+    (R.ok, _) then { expect_fail("expected to give up") }
+    (R.error, why) then { expect_true(why.index_of("giving up") >= 0) }
+  }
+  case file.read(final + ".part") {
+    (R.ok, _) then { expect_fail("temp survived the final failure") }
+    (R.error, _) then { expect_true(true) }
+  }
+}
+
+def test_midstream_drop_resumes_with_range() {
+  const final = blob_final("resume")
+  const t = make_transport([make_route("blob-f", 200, blob_large, true, 0, 20)])
+  const result = blob_mod.download_blob_with(t, "https://cdn.example.com/blob-f", "sha256:" + sha_hex(blob_large), blob_large.length(), final, 3, 0.01, 8, 5.0, false)
+  expect_ok_str(result)
+  expect_file_content(final, blob_large)
+  const calls = t.requests_text()
+  // The drop lands mid-chunk: the last fully-written chunk ends at 16 bytes
+  // (chunk size 8: 8 + 8 written, the third read drops its partial 4), so
+  // the resume request must start exactly there.
+  expect_true(calls.index_of("range=" + 16.to_string()) >= 0)
+}
+
+def test_server_without_range_falls_back_to_full() {
+  const final = blob_final("norange")
+  const t = make_transport([make_route("blob-g", 200, blob_large, false, 0, 10)])
+  const result = blob_mod.download_blob_with(t, "https://cdn.example.com/blob-g", "sha256:" + sha_hex(blob_large), blob_large.length(), final, 3, 0.01, 8, 5.0, false)
+  expect_ok_str(result)
+  expect_file_content(final, blob_large)
+}
+
+def test_403_is_permanent_and_does_not_retry() {
+  const final = blob_final("forbidden")
+  const t = make_transport([make_route("blob-h", 403, "expired signature", true, 0, -1)])
+  case blob_mod.download_blob_with(t, "https://cdn.example.com/blob-h", "sha256:" + sha_hex(blob_body), blob_body.length(), final, 3, 0.01, 16, 5.0, false) {
+    (R.ok, _) then { expect_fail("expected a permanent error") }
+    (R.error, why) then { expect_true(why.index_of("403") >= 0) }
+  }
+  const calls = t.requests_text()
+  expect_equal(1, count_lines(calls))
+}
+
+def count_lines(text String) Int64 {
+  const lines = text.split("\n")
+  var n = 0
+  var i = 0
+  while i < lines.length() {
+    if lines[i] != "" {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
+def test_resume_from_existing_part_file() {
+  const final = blob_final("preresume")
+  const part = final + ".part"
+  const meta = final + ".meta"
+  const first_half = blob_body.substring(0, 20)
+  case file.write(part, first_half) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("fixture part write failed: " + why) }
+  }
+  case file.write(meta, 20.to_string()) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("fixture meta write failed: " + why) }
+  }
+  const t = make_transport([make_route("blob-i", 200, blob_body, true, 0, -1)])
+  const result = blob_mod.download_blob_with(t, "https://cdn.example.com/blob-i", "sha256:" + sha_hex(blob_body), blob_body.length(), final, 3, 0.01, 16, 5.0, false)
+  expect_ok_str(result)
+  expect_file_content(final, blob_body)
+  const calls = t.requests_text()
+  expect_true(calls.index_of("range=20") >= 0)
+}
+
+def test_parse_blob_url() {
+  case blob_mod.parse_blob_url("https://cdn.example.com/v2/blobs/sha256:" + blob_hex_a + "?sig=abc") {
+    (R.ok, parsed) then {
+      const (scheme, host, port, target) = parsed
+      expect_equal("https", scheme)
+      expect_equal("cdn.example.com", host)
+      expect_equal(443, port)
+      expect_equal("/v2/blobs/sha256:" + blob_hex_a + "?sig=abc", target)
+    }
+    (R.error, why) then { expect_fail("url parse failed: " + why) }
+  }
+  case blob_mod.parse_blob_url("http://127.0.0.1:8080/x") {
+    (R.ok, parsed) then {
+      const (scheme, host, port, target) = parsed
+      expect_equal("http", scheme)
+      expect_equal("127.0.0.1", host)
+      expect_equal(8080, port)
+      expect_equal("/x", target)
+    }
+    (R.error, why) then { expect_fail("url parse failed: " + why) }
+  }
+  case blob_mod.parse_blob_url("ftp://x/y") {
+    (R.ok, _) then { expect_fail("ftp should be rejected") }
+    (R.error, why) then { expect_true(why.index_of("scheme") >= 0) }
+  }
+}
+
+def test_parse_hex_int() {
+  expect_equal(26, expect_ok_str_to_int(blob_mod.parse_hex_int("1a")))
+  expect_equal(0, expect_ok_str_to_int(blob_mod.parse_hex_int("0")))
+  case blob_mod.parse_hex_int("zz") {
+    (R.ok, _) then { expect_fail("expected a hex error") }
+    (R.error, _) then { expect_true(true) }
+  }
+}
+
+def expect_ok_str_to_int(result (R, Int64)) Int64 {
+  case result {
+    (R.ok, v) then { return v }
+    (R.error, why) then {
+      expect_fail("expected ok, got: " + why)
+      return 0
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Real-stack leg: HttpBlobTransport against a live local httpd server.
+
+class BlobFixtureServer {
+  def init(port Int64, server_handle httpd.Server) {
+    self.port = port
+    self.handle = server_handle
+  }
+
+  def stop() {
+    self.handle.stop()
+    self.handle.wait()
+  }
+}
+
+def start_blob_fixture() BlobFixtureServer {
+  case net.listen("127.0.0.1", 0) {
+    (R.error, why) then {
+      expect_fail("cannot listen: " + why)
+      return BlobFixtureServer.new(0, dead_fixture_server())
+    }
+    (R.ok, listener) then {
+      const port = listener.port()
+      const base = "http://127.0.0.1:" + port.to_string()
+      const server = httpd.serve(listener) -> (req httpd.Request) {
+        return blob_fixture_handler(req, base)
+      }
+      return BlobFixtureServer.new(port, server)
+    }
+  }
+}
+
+// A stopped server for the unreachable listen-failure path; the test has
+// already failed by the time this runs.
+def dead_fixture_server() httpd.Server {
+  case net.listen("127.0.0.1", 0) {
+    (R.ok, listener) then {
+      return httpd.serve(listener) -> (req httpd.Request) {
+        return httpd.response(500, [], "dead fixture")
+      }
+    }
+    (R.error, _) then {
+      expect_fail("cannot listen even for the dead fixture")
+      return dead_fixture_server()
+    }
+  }
+}
+
+// Presigned redirects carry absolute URLs on real CDNs, so the fixture's
+// Location is absolute too (base is captured from the listener).
+def blob_fixture_handler(req httpd.Request, base String) httpd.Response {
+  if req.path == "/blob/full" {
+    return httpd.response(200, [("Content-Type", "application/octet-stream")], blob_large)
+  }
+  if req.path == "/blob/ranged" {
+    const range = req.header("Range")
+    if range.starts_with("bytes=") && range.index_of("-") >= 0 {
+      const start_text = range.substring(6, range.index_of("-") - 6)
+      const start = start_text.to_int64()
+      if start > 0 && start < blob_large.length() {
+        const slice = blob_large.substring(start, blob_large.length() - start)
+        return httpd.response(206, [("Content-Type", "application/octet-stream"), ("Content-Range", "bytes " + start.to_string() + "-" + (blob_large.length() - 1).to_string() + "/" + blob_large.length().to_string())], slice)
+      }
+    }
+    return httpd.response(200, [("Content-Type", "application/octet-stream")], blob_large)
+  }
+  if req.path == "/blob/redirect" {
+    return httpd.response(307, [("Location", base + "/blob/full")], "")
+  }
+  return httpd.response(404, [], "not found")
+}
+
+def test_live_http_full_download() {
+  const fixture = start_blob_fixture()
+  const t = src.blob.HttpBlobTransport.new()
+  const final = blob_final("livefull")
+  const url = "http://127.0.0.1:" + fixture.port.to_string() + "/blob/full"
+  const result = blob_mod.download_blob_with(t, url, "sha256:" + sha_hex(blob_large), blob_large.length(), final, 3, 0.01, 64, 5.0, false)
+  expect_ok_str(result)
+  expect_file_content(final, blob_large)
+  fixture.stop()
+}
+
+def test_live_http_range_resume_and_redirect() {
+  const fixture = start_blob_fixture()
+  const t = src.blob.HttpBlobTransport.new()
+  const final = blob_final("liveresume")
+  const part = final + ".part"
+  const meta = final + ".meta"
+  const first = blob_large.substring(0, 15)
+  case file.write(part, first) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("fixture write failed: " + why) }
+  }
+  case file.write(meta, 15.to_string()) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail("fixture write failed: " + why) }
+  }
+  const url = "http://127.0.0.1:" + fixture.port.to_string() + "/blob/ranged"
+  const result = blob_mod.download_blob_with(t, url, "sha256:" + sha_hex(blob_large), blob_large.length(), final, 3, 0.01, 32, 5.0, false)
+  expect_ok_str(result)
+  expect_file_content(final, blob_large)
+
+  const final2 = blob_final("liveredirect")
+  const url2 = "http://127.0.0.1:" + fixture.port.to_string() + "/blob/redirect"
+  const result2 = blob_mod.download_blob_with(t, url2, "sha256:" + sha_hex(blob_large), blob_large.length(), final2, 3, 0.01, 64, 5.0, false)
+  expect_ok_str(result2)
+  expect_file_content(final2, blob_large)
+  fixture.stop()
+}

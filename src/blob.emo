@@ -1,0 +1,734 @@
+// T1.11: blob downloader — streaming downloads with retries, Range resume,
+// and incremental SHA-256/size verification. Streams flow through `net`
+// (TLS or plain per scheme), not the buffering `http` client — the decision
+// recorded in docs/notes/runtime-capabilities.md; presigned-URL redirects
+// (the D4 mechanism) are followed here, up to three hops. Blobs land in
+// <final_path>.part with a small .meta offset sidecar and are renamed into
+// place only after verification, so corrupted or incomplete bytes never
+// reach the OCI layout.
+
+require "os"
+require "net"
+require "time"
+require "crypto"
+require "file"
+
+const blob_chunk_size = 65536
+const blob_max_redirects = 3
+const blob_default_retries = 3
+const blob_default_base_delay = 0.5
+const blob_http_port = 443
+const blob_plain_port = 80
+
+interface BlobStream {
+  def read(n Int64) (R, String)
+  def close() (R, Bool)
+}
+
+// open(url, range_start) answers the stream plus whether the server honored
+// the Range (206) and the body's total length when known (Content-Length;
+// -1 when it is not).
+interface BlobTransport {
+  def open(url String, range_start Int64, timeout Float64) (R, BlobOpen)
+}
+
+class BlobOpen {
+  def init(stream BlobStream, resumed Bool, total Int64) {
+    self.stream = stream
+    self.resumed = resumed
+    self.total = total
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Real transport: HTTP/1.1 over net, Connection: close, Content-Length or
+// chunked bodies. Close-delimited bodies (no length, no chunked) are read
+// whole via read_all and rejected for large objects — CDNs and object
+// stores send Content-Length, so this is the documented narrow case.
+
+class HttpBlobTransport {
+  def init() {
+  }
+
+  def open(url String, range_start Int64, timeout Float64) (R, BlobOpen) {
+    return open_blob_url(url, range_start, timeout, 0)
+  }
+}
+
+def open_blob_url(url String, range_start Int64, timeout Float64, hops Int64) (R, BlobOpen) {
+  if hops > blob_max_redirects {
+    return (R.error, "blob: more than " + blob_max_redirects.to_string() + " redirects from " + url)
+  }
+  case parse_blob_url(url) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, parsed) then {
+      const (scheme, host, port, request_target) = parsed
+      var conn_result = net.connect(host, port, timeout)
+      if scheme == "https" {
+        conn_result = net.tls_connect(host, port, timeout)
+      }
+      case conn_result {
+        (R.error, why) then { return (R.error, "blob: cannot connect to " + host + ":" + port.to_string() + ": " + why) }
+        (R.ok, conn) then {
+          conn.set_timeout(timeout)
+          var request = (
+            "GET " + request_target + " HTTP/1.1\r\n"
+            + "Host: " + host + ":" + port.to_string() + "\r\n"
+            + "User-Agent: pokerface/0.1\r\n"
+            + "Accept: */*\r\n"
+            + "Connection: close\r\n"
+          )
+          if range_start > 0 {
+            request = request + "Range: bytes=" + range_start.to_string() + "-\r\n"
+          }
+          request = request + "\r\n"
+          case conn.write(request) {
+            (R.error, why) then {
+              const (_, _) = conn.close()
+              return (R.error, "blob: send failed to " + host + ": " + why)
+            }
+            (R.ok, _) then {
+              case read_response_head(conn) {
+                (R.error, why) then {
+                  const (_, _) = conn.close()
+                  return (R.error, "blob: bad response from " + host + ": " + why)
+                }
+                (R.ok, head) then {
+                  const (status, headers) = head
+                  if status >= 300 && status < 400 {
+                    const location = header_of(headers, "Location")
+                    const (_, _) = conn.close()
+                    if location == "" {
+                      return (R.error, "blob: redirect status " + status.to_string() + " without a Location header from " + host)
+                    }
+                    return open_blob_url(location, range_start, timeout, hops + 1)
+                  }
+                  if status != 200 && status != 206 {
+                    const (_, _) = conn.close()
+                    return (R.error, "blob: " + url + " answered status " + status.to_string())
+                  }
+                  const chunked = header_of(headers, "Transfer-Encoding").lower().index_of("chunked") >= 0
+                  const length_text = header_of(headers, "Content-Length")
+                  var total = 0 - 1
+                  if length_text != "" {
+                    total = length_text.to_int64()
+                  }
+                  const stream = HttpBlobStream.new(conn, total, chunked)
+                  return (R.ok, BlobOpen.new(stream, status == 206 && range_start > 0, total))
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// scheme://host[:port]/path?query — IPv6 literal hosts are out of scope.
+def parse_blob_url(url String) (R, (String, String, Int64, String)) {
+  const scheme_sep = url.index_of("://")
+  if scheme_sep <= 0 {
+    return (R.error, "blob: url has no scheme: " + url)
+  }
+  const scheme = url.substring(0, scheme_sep)
+  if scheme != "https" && scheme != "http" {
+    return (R.error, "blob: unsupported url scheme '" + scheme + "'")
+  }
+  const rest = url.substring(scheme_sep + 3, url.length() - scheme_sep - 3)
+  const slash = rest.index_of("/")
+  if slash < 0 {
+    return (R.error, "blob: url has no path: " + url)
+  }
+  const authority = rest.substring(0, slash)
+  const request_target = rest.substring(slash, rest.length() - slash)
+  var host = authority
+  var port = blob_http_port
+  if scheme == "http" {
+    port = blob_plain_port
+  }
+  const colon = authority.index_of(":")
+  if colon >= 0 {
+    host = authority.substring(0, colon)
+    const port_text = authority.substring(colon + 1, authority.length() - colon - 1)
+    const parsed_port = port_text.to_int64()
+    if parsed_port <= 0 || parsed_port > 65535 {
+      return (R.error, "blob: invalid port in url '" + url + "'")
+    }
+    port = parsed_port
+  }
+  if host == "" {
+    return (R.error, "blob: url has no host: " + url)
+  }
+  return (R.ok, (scheme, host, port, request_target))
+}
+
+// status line + headers, consumed through the blank line.
+def read_response_head(conn TcpConn) (R, (Int64, Array[(String, String)])) {
+  case conn.read_line() {
+    (R.error, why) then { return (R.error, "cannot read the status line: " + why) }
+    (R.ok, status_line) then {
+      if !status_line.starts_with("HTTP/") {
+        return (R.error, "not an HTTP response: '" + status_line + "'")
+      }
+      const sp1 = status_line.index_of(" ")
+      if sp1 < 0 {
+        return (R.error, "malformed status line '" + status_line + "'")
+      }
+      const rest = status_line.substring(sp1 + 1, status_line.length() - sp1 - 1)
+      const sp2 = rest.index_of(" ")
+      var code_text = rest
+      if sp2 >= 0 {
+        code_text = rest.substring(0, sp2)
+      }
+      const status = code_text.to_int64()
+      if status < 100 || status > 599 {
+        return (R.error, "malformed status code in '" + status_line + "'")
+      }
+      var headers = []
+      while true {
+        case conn.read_line() {
+          (R.error, why) then { return (R.error, "cannot read headers: " + why) }
+          (R.ok, line) then {
+            if line == "" {
+              return (R.ok, (status, headers))
+            }
+            const colon = line.index_of(":")
+            if colon > 0 {
+              const key = line.substring(0, colon).trim()
+              const value = line.substring(colon + 1, line.length() - colon - 1).trim()
+              headers = headers.append((key, value))
+            }
+          }
+        }
+      }
+      return (R.error, "blob: unreachable header loop exit")
+    }
+  }
+}
+
+def header_of(headers Array[(String, String)], name String) String {
+  const wanted = name.lower()
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == wanted {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+const hex_digits = "0123456789abcdef"
+
+// Hex (chunk-size) text to Int64; "" or non-hex is an error.
+def parse_hex_int(text String) (R, Int64) {
+  if text == "" {
+    return (R.error, "empty hex number")
+  }
+  const lower = text.lower()
+  var out = 0
+  var i = 0
+  while i < lower.length() {
+    const at = hex_digits.index_of(lower.substring(i, 1))
+    if at < 0 {
+      return (R.error, "'" + text + "' is not a hex number")
+    }
+    out = out * 16 + at
+    i = i + 1
+  }
+  return (R.ok, out)
+}
+
+class HttpBlobStream {
+  def init(conn TcpConn, total Int64, chunked Bool) {
+    self.conn = conn
+    self.remaining = Box.new(total)
+    self.chunked = chunked
+    self.chunk_left = Box.new(0)
+    self.done = Box.new(false)
+  }
+
+  def read(n Int64) (R, String) {
+    if self.done.read() {
+      return (R.ok, "")
+    }
+    if self.chunked {
+      return self.read_chunked(n)
+    }
+    const remaining = self.remaining.read()
+    if remaining == 0 {
+      self.done.replace(true)
+      return (R.ok, "")
+    }
+    var take = n
+    if remaining >= 0 && remaining < take {
+      take = remaining
+    }
+    case self.conn.read_exactly(take) {
+      (R.error, why) then { return (R.error, "blob: body read failed: " + why) }
+      (R.ok, data) then {
+        if self.remaining.read() >= 0 {
+          self.remaining.replace(self.remaining.read() - data.length())
+        }
+        if data == "" || (self.remaining.read() == 0) {
+          self.done.replace(true)
+        }
+        return (R.ok, data)
+      }
+    }
+  }
+
+  // Chunked framing: size lines in hex, a CRLF after each chunk's bytes,
+  // 0 terminator. The server may append extensions after ';'.
+  def read_chunked(n Int64) (R, String) {
+    var left = self.chunk_left.read()
+    if left == 0 {
+      case self.next_chunk_size() {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, size) then {
+          if size == 0 {
+            self.done.replace(true)
+            return (R.ok, "")
+          }
+          self.chunk_left.replace(size)
+          left = size
+        }
+      }
+    }
+    var take = n
+    if left < take {
+      take = left
+    }
+    case self.conn.read_exactly(take) {
+      (R.error, why) then { return (R.error, "blob: chunked body read failed: " + why) }
+      (R.ok, data) then {
+        self.chunk_left.replace(self.chunk_left.read() - data.length())
+        if self.chunk_left.read() == 0 {
+          case self.conn.read_line() {
+            (R.error, why) then { return (R.error, "blob: cannot read the chunk terminator: " + why) }
+            (R.ok, _) then { }
+          }
+        }
+        return (R.ok, data)
+      }
+    }
+  }
+
+  def next_chunk_size() (R, Int64) {
+    while true {
+      case self.conn.read_line() {
+        (R.error, why) then { return (R.error, "blob: cannot read the chunk size: " + why) }
+        (R.ok, line) then {
+          if line == "" {
+            continue
+          }
+          var hex_text = line
+          const semi = line.index_of(";")
+          if semi >= 0 {
+            hex_text = line.substring(0, semi)
+          }
+          case parse_hex_int(hex_text.trim()) {
+            (R.error, why) then { return (R.error, "blob: malformed chunk size '" + line + "': " + why) }
+            (R.ok, size) then { return (R.ok, size) }
+          }
+          return (R.error, "blob: unreachable chunk-size path")
+        }
+      }
+    }
+    return (R.error, "blob: unreachable chunk-size loop exit")
+  }
+
+  def close() (R, Bool) {
+    const (_, _) = self.conn.close()
+    return (R.ok, true)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Mock transport: in-memory routes with failure injection for the retry,
+// resume, and corruption scenarios.
+
+class MockBlobRoute {
+  def init(url_contains String, status Int64, body String, honors_range Bool, fail_opens Int64, fail_after Int64, counters Box) {
+    self.url_contains = url_contains
+    self.status = status
+    self.body = body
+    self.honors_range = honors_range
+    self.fail_opens = fail_opens
+    self.fail_after = fail_after
+    self.counters = counters
+  }
+}
+
+class MockBlobStream {
+  def init(body String, start Int64, fail_after Int64, served Box) {
+    self.body = body
+    self.pos = Box.new(start)
+    self.fail_after = fail_after
+    self.served = served
+  }
+
+  def read(n Int64) (R, String) {
+    const pos = self.pos.read()
+    if pos >= self.body.length() {
+      return (R.ok, "")
+    }
+    var take = n
+    if self.body.length() - pos < take {
+      take = self.body.length() - pos
+    }
+    if self.fail_after >= 0 && self.served.read() + take > self.fail_after {
+      const allowed = self.fail_after - self.served.read()
+      if allowed <= 0 {
+        return (R.error, "blob: mock connection dropped")
+      }
+      self.pos.replace(pos + allowed)
+      self.served.replace(self.served.read() + allowed)
+      return (R.error, "blob: mock connection dropped mid-body")
+    }
+    const data = self.body.substring(pos, take)
+    self.pos.replace(pos + take)
+    self.served.replace(self.served.read() + take)
+    return (R.ok, data)
+  }
+
+  def close() (R, Bool) {
+    return (R.ok, true)
+  }
+}
+
+class MockBlobTransport {
+  def init(routes Array[MockBlobRoute]) {
+    self.routes = routes
+    self.requests = Box.new(ArrayBuilder.new())
+  }
+
+  def open(url String, range_start Int64, timeout Float64) (R, BlobOpen) {
+    var i = 0
+    while i < self.routes.length() {
+      const route = self.routes[i]
+      if url.index_of(route.url_contains) >= 0 {
+        const count = route.counters.read()
+        route.counters.replace(count + 1)
+        self.requests.read().push("open " + url + " range=" + range_start.to_string())
+        if route.status != 200 && route.status != 206 {
+          return (R.error, "blob: " + url + " answered status " + route.status.to_string())
+        }
+        if count < route.fail_opens {
+          return (R.error, "blob: mock open refused (attempt " + (count + 1).to_string() + ")")
+        }
+        var body = route.body
+        var resumed = false
+        if range_start > 0 {
+          if route.honors_range {
+            if range_start > body.length() {
+              return (R.error, "blob: mock range starts past the body end")
+            }
+            body = body.substring(range_start, body.length() - range_start)
+            resumed = true
+          }
+          // honors_range false: the mock answers 200 with the full body —
+          // the server-ignores-Range fallback path.
+        }
+        // A mid-body drop models one bad connection: only the first open on
+        // the route fails mid-stream, later ones run to completion.
+        var fa = route.fail_after
+        if count > 0 {
+          fa = 0 - 1
+        }
+        const stream = MockBlobStream.new(body, 0, fa, Box.new(0))
+        return (R.ok, BlobOpen.new(stream, resumed, body.length()))
+      }
+      i = i + 1
+    }
+    return (R.error, "blob: mock has no route for " + url)
+  }
+
+  def requests_text() String {
+    var out = ""
+    const arr = self.requests.read().to_array()
+    var i = 0
+    while i < arr.length() {
+      out = out + arr[i] + "\n"
+      i = i + 1
+    }
+    return out
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The downloader.
+
+def blob_eprint(text String) {
+  const (R.ok, _) = os.write(2, text)
+}
+
+// Downloads url into final_path (atomic: bytes land in final_path.part and
+// are renamed only after digest and size verification). expected_size < 0
+// means "unknown". Resumes from an existing .part when the server honors
+// Range; falls back to a full download otherwise; retries transient failures
+// (open errors, drops, 5xx) with exponential backoff; 4xx statuses stop
+// retrying; every failure cleans the temp files up.
+def download_blob(t BlobTransport, url String, expected_digest String, expected_size Int64, final_path String, verbose Bool) (R, String) {
+  return download_blob_with(t, url, expected_digest, expected_size, final_path, blob_default_retries, blob_default_base_delay, blob_chunk_size, blob_default_timeout(), verbose)
+}
+
+def blob_default_timeout() Float64 {
+  return 30.0
+}
+
+def download_blob_with(t BlobTransport, url String, expected_digest String, expected_size Int64, final_path String, max_retries Int64, base_delay Float64, chunk_size Int64, timeout Float64, verbose Bool) (R, String) {
+  const part = final_path + ".part"
+  const meta = final_path + ".meta"
+  var have = 0
+  case read_have(meta) {
+    (R.ok, h) then { have = h }
+    (R.error, _) then { have = 0 }
+  }
+
+  var attempt = 0
+  while attempt <= max_retries {
+    if attempt > 0 {
+      const delay = base_delay * pow2f(attempt - 1)
+      if verbose {
+        blob_eprint("blob: retry " + attempt.to_string() + " after " + delay.to_string() + "s\n")
+      }
+      time.sleep(delay)
+      case read_have(meta) {
+        (R.ok, h) then { have = h }
+        (R.error, _) then { have = 0 }
+      }
+    }
+    if verbose && have > 0 {
+      blob_eprint("blob: resuming at byte " + have.to_string() + "\n")
+    }
+
+    case t.open(url, have, timeout) {
+      (R.error, why) then {
+        if is_permanent_blob_error(why) {
+          cleanup_blob_temp(part, meta)
+          return (R.error, why)
+        }
+        if attempt == max_retries {
+          cleanup_blob_temp(part, meta)
+          return (R.error, "blob: giving up on " + url + " after " + (max_retries + 1).to_string() + " attempts: " + why)
+        }
+        attempt = attempt + 1
+        continue
+      }
+      (R.ok, open) then {
+        var from = have
+        if !open.resumed && have > 0 {
+          // The server ignored Range; restart from zero.
+          from = 0
+        }
+        case download_stream(open.stream, part, meta, from, chunk_size, verbose) {
+          (R.error, why) then {
+            const (_, _) = open.stream.close()
+            if is_permanent_blob_error(why) {
+              cleanup_blob_temp(part, meta)
+              return (R.error, why)
+            }
+            if attempt == max_retries {
+              cleanup_blob_temp(part, meta)
+              return (R.error, "blob: giving up on " + url + " after " + (max_retries + 1).to_string() + " attempts: " + why)
+            }
+            attempt = attempt + 1
+            continue
+          }
+          (R.ok, downloaded) then {
+            const (_, _) = open.stream.close()
+            const total = from + downloaded
+            if expected_size >= 0 && total != expected_size {
+              cleanup_blob_temp(part, meta)
+              return (R.error, "blob: size mismatch for " + url + " — expected " + expected_size.to_string() + " bytes, got " + total.to_string())
+            }
+            const prior = if open.resumed { have } else { 0 }
+            const content_total = open.total + prior
+            if open.total >= 0 && total != content_total {
+              cleanup_blob_temp(part, meta)
+              return (R.error, "blob: truncated download from " + url + " — Content-Length says " + content_total.to_string() + " bytes, got " + total.to_string())
+            }
+            case digest_of_file(part) {
+              (R.error, why) then {
+                cleanup_blob_temp(part, meta)
+                return (R.error, "blob: cannot hash the downloaded bytes: " + why)
+              }
+              (R.ok, hex) then {
+                const actual = "sha256:" + hex
+                if !digest_matches(expected_digest, actual) {
+                  cleanup_blob_temp(part, meta)
+                  return (R.error, "blob: digest mismatch for " + url + " — expected " + expected_digest + ", got " + actual)
+                }
+                case os.rename(part, final_path) {
+                  (R.error, why) then {
+                    cleanup_blob_temp(part, meta)
+                    return (R.error, "blob: cannot move " + part + " into place: " + why)
+                  }
+                  (R.ok, _) then {
+                    os.unlink(meta)
+                    if verbose {
+                      blob_eprint("blob: " + final_path + " complete (" + total.to_string() + " bytes)\n")
+                    }
+                    return (R.ok, final_path)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  cleanup_blob_temp(part, meta)
+  return (R.error, "blob: giving up on " + url)
+}
+
+// Streams the response body into part starting at byte offset `from`,
+// updating the .meta sidecar per chunk; answers how many bytes it wrote.
+// Transient read errors are (R.error) and the caller retries; the digest is
+// computed incrementally and verified by the caller after EOF.
+def download_stream(stream BlobStream, part String, meta String, from Int64, chunk_size Int64, verbose Bool) (R, Int64) {
+  var fd = 0 - 1
+  if from > 0 {
+    case os.open_append(part) {
+      (R.error, why) then { return (R.error, "blob: cannot append to " + part + ": " + why) }
+      (R.ok, opened) then { fd = opened }
+    }
+  } else {
+    case os.open_write(part) {
+      (R.error, why) then { return (R.error, "blob: cannot create " + part + ": " + why) }
+      (R.ok, opened) then { fd = opened }
+    }
+  }
+  var written = 0
+  while true {
+    case stream.read(chunk_size) {
+      (R.error, why) then {
+        const (_, _) = os.close(fd)
+        return (R.error, why)
+      }
+      (R.ok, chunk) then {
+        if chunk == "" {
+          break
+        }
+        case os.write(fd, chunk) {
+          (R.error, why) then {
+            const (_, _) = os.close(fd)
+            return (R.error, "blob: write to " + part + " failed: " + why)
+          }
+          (R.ok, _) then {
+            written = written + chunk.length()
+            file.write(meta, (from + written).to_string())
+            if verbose && written % (blob_chunk_size * 8) == 0 {
+              blob_eprint("blob: " + (from + written).to_string() + " bytes\n")
+            }
+          }
+        }
+      }
+    }
+  }
+  const (_, _) = os.close(fd)
+  file.write(meta, (from + written).to_string())
+  return (R.ok, written)
+}
+
+def read_have(meta String) (R, Int64) {
+  case file.read(meta) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, text) then {
+      const n = text.trim().to_int64()
+      if n < 0 {
+        return (R.error, "blob: corrupt meta file")
+      }
+      return (R.ok, n)
+    }
+  }
+}
+
+// 4xx statuses and explicit content problems are not worth retrying.
+def is_permanent_blob_error(why String) Bool {
+  return why.index_of("answered status 4") >= 0 || why.index_of("digest mismatch") >= 0 || why.index_of("size mismatch") >= 0 || why.index_of("no route for") >= 0
+}
+
+def cleanup_blob_temp(part String, meta String) {
+  os.unlink(part)
+  os.unlink(meta)
+}
+
+// Incremental digest over the .part file, read in chunks.
+def digest_of_file(path String) (R, String) {
+  const digest = crypto.sha2.new()
+  case os.open_read(path) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, fd) then {
+      while true {
+        case os.read(fd, blob_chunk_size) {
+          (R.error, why) then {
+            const (_, _) = os.close(fd)
+            return (R.error, why)
+          }
+          (R.ok, chunk) then {
+            if chunk == "" {
+              break
+            }
+            digest.write(chunk.to_bytes())
+          }
+        }
+      }
+      const (_, _) = os.close(fd)
+      return (R.ok, crypto.hex_encode(digest.sum()))
+    }
+  }
+}
+
+def digest_matches(expected String, actual String) Bool {
+  if expected == "" {
+    return true
+  }
+  return expected == actual
+}
+
+def pow2f(n Int64) Float64 {
+  var out = 1.0
+  var i = 0
+  while i < n {
+    out = out * 2.0
+    i = i + 1
+  }
+  return out
+}
+
+// Sequential helper over a descriptor list (url, digest, size); the
+// concurrency-capped parallel form is deferred — see the T1.11 notes in
+// docs/TASKS.md.
+def download_all_blobs(t BlobTransport, items Array[(String, String, Int64)], dir String, verbose Bool) (R, Array[String]) {
+  var paths = []
+  var i = 0
+  while i < items.length() {
+    const (url, digest, size) = items[i]
+    const hex = digest_hex(digest)
+    if hex == "" {
+      return (R.error, "blob: digest '" + digest + "' is not a sha256 digest")
+    }
+    case download_blob(t, url, digest, size, dir + "/" + hex, verbose) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, path) then { paths = paths.append(path) }
+    }
+    i = i + 1
+  }
+  return (R.ok, paths)
+}
+
+def digest_hex(digest String) String {
+  if !digest.starts_with("sha256:") {
+    return ""
+  }
+  const hex = digest.substring(7, digest.length() - 7)
+  if hex.length() != 64 {
+    return ""
+  }
+  return hex
+}

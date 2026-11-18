@@ -27,6 +27,8 @@ package {
     "json" = "0.1.0"
     "file" = "0.1.0"
     "time" = "0.1.0"
+    "net" = "0.1.0"
+    "httpd" = "0.1.0"
   }
   // After editing deps: `emo deps add <name> <version>` pins a package
   // and locks it, `emo deps resolve` writes package.lock,
