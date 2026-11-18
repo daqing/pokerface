@@ -1,0 +1,101 @@
+// M1 mock distribution service for scripts/e2e-m1.sh (T1.17). One local
+// listener plays both halves:
+//
+//   /v2/...                  the registry API (probe, manifest by digest)
+//   /v2/acme/app/blobs/<d>   307 to the CDN endpoint
+//   /cdn/<hex>               the CDN: blob bytes, no auth
+//
+// It serves a prepared OCI layout directory and prints the registry address
+// and manifest digest for the script to consume. No Docker Hub, no network
+// beyond 127.0.0.1. Not part of the CLI package.
+
+require "os"
+require "file"
+require "net"
+require "httpd"
+
+const manifest_media_type = "application/vnd.oci.image.manifest.v1+json"
+const blob_prefix = "/v2/acme/app/blobs/"
+const manifest_prefix = "/v2/acme/app/manifests/"
+const cdn_prefix = "/cdn/"
+
+def blob_path(layout String, digest String) String {
+  return layout + "/blobs/sha256/" + digest.substring(7, digest.length() - 7)
+}
+
+def read_blob(layout String, digest String) String {
+  case file.read(blob_path(layout, digest)) {
+    (R.ok, text) then { return text }
+    (R.error, _) then { return "" }
+  }
+}
+
+def handle(req httpd.Request, base String, layout String, manifest String) httpd.Response {
+  if req.path == "/v2/" {
+    return httpd.response(200, [("Content-Type", "application/json")], "{}")
+  }
+  if req.path.starts_with(manifest_prefix) {
+    const reference = req.path.substring(manifest_prefix.length(), req.path.length() - manifest_prefix.length())
+    if reference == manifest {
+      const body = read_blob(layout, manifest)
+      if body == "" {
+        return httpd.response(404, [], "manifest unknown")
+      }
+      return httpd.response(200, [
+        ("Content-Type", manifest_media_type),
+        ("Docker-Content-Digest", manifest)
+      ], body)
+    }
+    return httpd.response(404, [], "manifest unknown")
+  }
+  if req.path.starts_with(blob_prefix) {
+    const digest = req.path.substring(blob_prefix.length(), req.path.length() - blob_prefix.length())
+    if read_blob(layout, digest) == "" {
+      return httpd.response(404, [], "blob unknown")
+    }
+    const hex = digest.substring(7, digest.length() - 7)
+    return httpd.response(307, [("Location", base + cdn_prefix + hex)], "")
+  }
+  if req.path.starts_with(cdn_prefix) {
+    const hex = req.path.substring(cdn_prefix.length(), req.path.length() - cdn_prefix.length())
+    const body = read_blob(layout, "sha256:" + hex)
+    if body == "" {
+      return httpd.response(404, [], "not found")
+    }
+    return httpd.response(200, [("Content-Type", "application/octet-stream")], body)
+  }
+  return httpd.response(404, [], "not found")
+}
+
+def main() {
+  const argv = os.argv()
+  if argv.length() < 3 {
+    println("usage: m1_fixture <oci-layout-dir> <manifest-digest>")
+    os._exit(2)
+  }
+  const layout = argv[1]
+  const manifest = argv[2]
+  // httpd runs the accept loop in a child process; scripts/e2e-m1.sh stops
+  // it with `pkill -P <mock pid>` before killing the mock itself.
+  case net.listen("127.0.0.1", 0) {
+    (R.error, why) then {
+      println("listen failed: " + why)
+      os._exit(1)
+    }
+    (R.ok, listener) then {
+      const port = listener.port()
+      const base = "http://127.0.0.1:" + port.to_string()
+      const server = httpd.serve(listener) -> (req httpd.Request) {
+        return handle(req, base, layout, manifest)
+      }
+      // Raw fd writes: the script polls this log before proceeding, so the
+      // readiness lines must not sit in a stdio buffer.
+      const (_, _) = os.write(1, "REGISTRY=127.0.0.1:" + port.to_string() + "\n")
+      const (_, _) = os.write(1, "CDN=" + base + cdn_prefix + "\n")
+      const (_, _) = os.write(1, "MANIFEST=" + manifest + "\n")
+      server.wait()
+    }
+  }
+}
+
+main()

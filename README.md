@@ -128,25 +128,66 @@ User            pokerface CLI        Git Remote         Registry/Metadata       
  │                   │                    │                    │                    │                    │
 ```
 
-Failure fallback (to be made explicit in implementation): Git resolution failure → hard error; Manifest request failure → fall back to local cache; CDN download failure → per-blob retry with digest verification; runtime import failure → clean up temp files.
+Failure fallback: Git resolution failure → hard error; manifest request failure → fall back to the verified local manifest cache; blob failure → per-blob retry with digest verification; import failure → temp files cleaned up. The implemented behavior is in [docs/spec/pull.md](docs/spec/pull.md).
 
 ## Quick Start
 
-> Commands below reflect the planned CLI shape and will be updated as implementation progresses.
+> The M1 client (`resolve`, `pull`, `cache`, `version`) is implemented; `build` lands in a later milestone.
 
 ```bash
-# Install
-curl -fsSL https://pokerface.mindwork.cool/install.sh | sh
-
 # Pull an image (resolve from Git metadata, download via CDN, import into local Docker)
 pokerface pull github.com/you/app:latest
 
 # Inspect resolution (tag → Commit → Digest)
 pokerface resolve github.com/you/app:latest
 
-# Build and push (called from CI)
+# Build and push (planned for a later milestone)
 pokerface build --repo github.com/you/app --push
 ```
+
+### M1 client walkthrough
+
+```console
+$ pokerface resolve github.com/acme/app:latest
+ref:     github.com/acme/app:latest
+commit:  c1e0a12d02ba5efbdd3d5ac6358ee1b7f12b079e
+image:   registry.example.com/acme/app
+digest:  sha256:720e8b95ef5c4ccb7b71101986481029202e7d5ecd9e644fdd089590ff9cf131
+tags:    latest
+
+$ pokerface pull github.com/acme/app:latest
+image:    registry.example.com/acme/app:latest
+digest:   sha256:720e8b95ef5c4ccb7b71101986481029202e7d5ecd9e644fdd089590ff9cf131
+commit:   c1e0a12d02ba5efbdd3d5ac6358ee1b7f12b079e
+platform: linux/amd64
+runtime:  docker (registry.example.com/acme/app:latest)
+
+$ pokerface cache ls
+cache: /Users/you/.cache/pokerface
+  git        1 entries  27.4 KiB
+  manifests  1 entries  805 B
+  blobs      2 entries  363 B
+  refs       1 entries  41 B
+  total      5 entries  28.6 KiB
+  limits     ttl=(unset) max_size=(unset)
+```
+
+`pokerface pull <ref> --offline` repeats the pull from the local cache after
+one online run. `pokerface cache verify` checks the cache and evicts damaged
+entries; `pokerface cache rm` clears it. The M1 flow is specified in
+`docs/spec/pull.md` and `docs/spec/cache.md`.
+
+For a fully local check — a fixture Git repository plus an Emo mock
+registry/CDN, no Docker Hub — run:
+
+```bash
+./scripts/e2e-m1.sh
+```
+
+It builds the CLI, resolves and pulls the fixture image, verifies the offline
+second pull and the cache commands, and imports into the detected runtime when
+skopeo plus docker/podman/ctr are available. Set `KEEP_TMP=1` to keep the
+temp directory and logs.
 
 ## Design Notes
 
@@ -158,11 +199,11 @@ pokerface build --repo github.com/you/app --push
 
 ## Roadmap
 
-- [ ] CLI skeleton and `pokerface.yaml` spec definition
-- [ ] Git metadata resolution (tag → Commit → Digest)
+- [x] CLI skeleton and `pokerface.yaml` spec definition
+- [x] Git metadata resolution (tag → Commit → Digest)
 - [ ] Minimal Registry/metadata service (Manifest + presigned URLs)
 - [ ] CDN/object storage backend integration (S3/MinIO compatible)
-- [ ] `skopeo` integration and local runtime import
+- [x] `skopeo` integration and local runtime import
 - [ ] Build trigger and CI templates
 - [ ] Docs site and end-to-end example
 

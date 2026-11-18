@@ -86,7 +86,7 @@
 | [x] | T1.14 | `pull` 命令串联与失败回退 | T1.9-T1.13 | 3h |
 | [x] | T1.15 | 本地缓存与离线模式 | T1.7、T1.14 | 2-3h |
 | [x] | T1.16 | 错误模型、退出码与日志 | T1.1 | 2h |
-| [ ] | T1.17 | M1 测试基线、E2E 脚本与规范文档 | T1.1-T1.16 | 2-3h |
+| [x] | T1.17 | M1 测试基线、E2E 脚本与规范文档 | T1.1-T1.16 | 2-3h |
 
 ### 4.3 任务详情
 
@@ -324,6 +324,8 @@ images:
 **验收**：`emo test` 通过；`scripts/e2e-m1.sh` 在干净临时目录可重复运行；不依赖真实 Docker Hub；文档中的命令与实际输出一致。
 
 **依赖**：T1.1-T1.16 · **预估**：2-3h
+
+> **备注**（2026-11-18，约 2h）：完成。`scripts/e2e-m1.sh` 是可重复、完全本地的 M1 端到端脚本：构建 CLI 与 `mock/m1_fixture.emo`，从 `test/fixtures/oci` 组装 OCI Layout，创建本地 Git 仓库并让锁指向 loopback mock registry，然后执行 `resolve`、`pull`（导入检测到的 Docker/Podman/containerd）、停掉 mock 后再 `pull --offline`、`cache ls`、`cache verify`，以及损坏缓存腿（`verify --check` 退出 7，修复后退出 0）。mock 是一个 loopback `httpd` 服务，同时扮演 registry（`/v2/`、按 digest 提供 manifest、blob GET → 307）和 CDN（`/cdn/<hex>`），读取准备好的布局；就绪行用裸 `os.write(1, …)` 输出，脚本轮询不会卡在 stdio 缓冲上。没有 skopeo + 运行时的情况下，脚本仍会跑 resolve/manifest/blob/cache，并确认 pull 以退出码 8 结束。`KEEP_TMP=1` 保留临时目录与日志；默认 trap 会清理临时目录、停止 mock（其 accept loop 子进程用 `pkill -P`）与 CLI 残留的调度器 worker（按本次运行的二进制路径匹配），并删除导入的镜像。`docs/spec/README.md` 汇总所有 M1 规范（YAML、lock、config、errors、registry client、pull、OCI layout、runtime import、cache）与流程；README（英/中）新增与实际输出一致的 M1 示例、更新后的失败回退说明，并勾选路线图条目。`emo test` 220/220；E2E 已用 Docker 29.9.3 + skopeo 1.25.2 完整跑通。踩坑：c target 的调度器在 CLI 主进程退出后仍会留下空闲 worker 进程，它们继承 stdout，所以用 `$(...)`/管道包住 CLI 会挂起——脚本把每次 CLI 调用的输出重定向到文件，并由 trap 按二进制路径清理；`httpd.serve` 的 accept loop 是子进程，停 mock 前要先 `pkill -P` 主进程；小的 gzip fixture 由 `httpd` 完整提供（之前 29MB 失败是大 body 场景，不是 NUL 截断）；fixture 是 linux/amd64 跑在 arm64 主机上，因此 E2E 用 `docker image inspect` 校验导入结果（可运行镜像的 `docker run` 已在 T1.14 手工验证）。M1（T1.1-T1.17）到此完成。
 
 ## 5. M2：分发层 MVP
 

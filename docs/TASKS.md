@@ -86,7 +86,7 @@ Exit criteria:
 | [x] | T1.14 | Wire up the `pull` command and failure fallbacks | T1.9-T1.13 | 3h |
 | [x] | T1.15 | Local cache and offline mode | T1.7, T1.14 | 2-3h |
 | [x] | T1.16 | Error model, exit codes, and logging | T1.1 | 2h |
-| [ ] | T1.17 | M1 test baseline, E2E script, and spec docs | T1.1-T1.16 | 2-3h |
+| [x] | T1.17 | M1 test baseline, E2E script, and spec docs | T1.1-T1.16 | 2-3h |
 
 ### 4.3 Task Details
 
@@ -324,6 +324,8 @@ images:
 **Acceptance**: `emo test` passes; `scripts/e2e-m1.sh` is repeatable in a clean temp directory; it does not depend on the real Docker Hub; documented commands match actual output.
 
 **Depends on**: T1.1-T1.16 · **Estimate**: 2-3h
+
+> **Notes** (2026-11-18, ~2h): Done. `scripts/e2e-m1.sh` is the repeatable, fully local M1 end-to-end: it builds the CLI and `mock/m1_fixture.emo`, assembles an OCI layout from `test/fixtures/oci`, creates a local Git repository whose lock names the loopback mock registry, then runs `resolve`, `pull` (importing into the detected Docker/Podman/containerd), a second `pull --offline` with the mock stopped, `cache ls`, `cache verify`, and a corruption leg (`verify --check` exits 7, repair exits 0). The mock is one loopback `httpd` server acting as both the registry (`/v2/`, manifest by digest, blob GET → 307) and the CDN (`/cdn/<hex>`), reading the prepared layout; readiness lines use raw `os.write(1, …)` so the script's poll never waits on a stdio buffer. Without skopeo plus a runtime the script still exercises resolve/manifest/blob/cache and checks that pull exits 8. `KEEP_TMP=1` keeps the temp dir and logs; by default the trap removes the temp dir, stops the mock (its accept-loop child via `pkill -P`) and the CLI's lingering scheduler workers (matched by the run's binary path), and removes the imported image. `docs/spec/README.md` indexes all M1 specs (YAML, lock, config, errors, registry client, pull, OCI layout, runtime import, cache) and summarizes the flow; the README (EN + zh-CN) gained an M1 walkthrough whose output matches the CLI, the updated failure-fallback text, and checked roadmap items. `emo test` 220/220; the E2E ran end to end against Docker 29.9.3 + skopeo 1.25.2. Gotchas: the c-target scheduler leaves idle worker processes after the CLI's main exits; they inherit stdout, so `$(...)`/pipes around the CLI hang — the script redirects every CLI invocation to a file and the trap kills the run's binary path; `httpd.serve`'s accept loop is a child process, so the mock is stopped with `pkill -P` before the main pid; the small gzip fixture is served intact by `httpd` (the earlier 29 MB failure was the large-body case, not NUL truncation); the fixture is linux/amd64 on an arm64 host, so the E2E verifies the imported image with `docker image inspect` (the runnable-image `docker run` check was T1.14's manual E2E). This closes M1 (T1.1-T1.17).
 
 ## 5. M2: Distribution MVP
 

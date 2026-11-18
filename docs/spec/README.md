@@ -1,0 +1,44 @@
+# Specification Index (M1)
+
+> The client's v0.1 contracts. M1 (T1.1-T1.17) is implemented by the modules
+> named below; M2 adds the registry/server side.
+
+| Spec | Covers | Implemented by |
+| --- | --- | --- |
+| [pokerface-yaml.md](pokerface-yaml.md) | The build input committed with the app: image, tags, platforms, builder. | `src/config.emo` |
+| [pokerface-lock.md](pokerface-lock.md) | The metadata CI writes back: `commit → image → digest` chain. | `src/lockfile.emo` |
+| [config.md](config.md) | Client config precedence, credentials, XDG paths, cache limits. | `src/settings.emo` |
+| [errors.md](errors.md) | Error kinds, fixed exit codes, remediation hints, JSON errors, verbose logging and redaction. | `src/errors.emo`, `src/common.emo` |
+| [registry-client.md](registry-client.md) | `/v2/` probe, Bearer auth, manifest/index fetch, media types. | `src/registry.emo` |
+| [pull.md](pull.md) | The pull chain, failure fallbacks, offline mode, host discipline. | `src/commands/pull.emo` |
+| [oci-layout.md](oci-layout.md) | Writing/validating `oci-layout`, `index.json`, `blobs/sha256`. | `src/oci.emo` |
+| [runtime-import.md](runtime-import.md) | Docker/Podman/containerd import via skopeo, verification, cleanup. | `src/runtime.emo` |
+| [cache.md](cache.md) | Cache layout, marker, TTL/size limits, `cache ls/rm/verify`. | `src/cache.emo`, `src/commands/cache.emo` |
+
+## M1 flow
+
+```text
+repository reference
+  → parse + resolve the ref to a commit            docs/cli.md (ref syntax)
+  → read pokerface.lock.yaml from the mirror cache  pokerface-lock.md
+  → pick image / digest / tag / platform
+  → fetch the manifest (cache fallback)            registry-client.md, pull.md
+  → download + verify blobs                        pull.md, cache.md
+  → assemble an OCI layout                         oci-layout.md
+  → import into Docker/Podman/containerd           runtime-import.md
+  → enforce cache limits                           cache.md
+```
+
+Every failure is classified into the kinds in [errors.md](errors.md).
+
+## Validating the M1 client
+
+```console
+$ emo build main.emo       # compile the CLI
+$ emo test                 # the full unit/integration suite
+$ ./scripts/e2e-m1.sh      # local fixture repo + Emo mock registry/CDN
+```
+
+`scripts/e2e-m1.sh` never contacts Docker Hub: the lock names a loopback mock
+registry, whose blob endpoint redirects to a local CDN path. Set `KEEP_TMP=1`
+to keep its temp directory and logs.

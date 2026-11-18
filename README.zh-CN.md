@@ -126,25 +126,59 @@ Git 管元数据与构建上下文，CDN/对象存储管二进制层，`pokerfac
  │                   │                    │                    │                    │                    │
 ```
 
-失败回退策略建议在实现中明确：Git 解析失败直接报错；Manifest 请求失败可回退到本地缓存；CDN 下载失败可按 Blob 重试并校验 Digest；导入运行时失败需清理临时文件。
+失败回退：Git 解析失败直接报错；Manifest 请求失败回退到经过校验的本地缓存；Blob 下载失败按 Blob 重试并校验 Digest；导入失败清理临时文件。已实现的行为见 [docs/spec/pull.md](docs/spec/pull.md)。
 
 ## 快速开始
 
-> 以下命令为规划中的 CLI 形态，随实现进度更新。
+> M1 客户端（`resolve`、`pull`、`cache`、`version`）已实现；`build` 属于后续里程碑。
 
 ```bash
-# 安装
-curl -fsSL https://pokerface.mindwork.cool/install.sh | sh
-
 # 拉取镜像（从 Git 元数据解析，经 CDN 下载，导入本地 Docker）
 pokerface pull github.com/you/app:latest
 
 # 查看解析结果（tag → Commit → Digest）
 pokerface resolve github.com/you/app:latest
 
-# 构建并推送（CI 中调用）
+# 构建并推送（后续里程碑）
 pokerface build --repo github.com/you/app --push
 ```
+
+### M1 客户端示例
+
+```console
+$ pokerface resolve github.com/acme/app:latest
+ref:     github.com/acme/app:latest
+commit:  c1e0a12d02ba5efbdd3d5ac6358ee1b7f12b079e
+image:   registry.example.com/acme/app
+digest:  sha256:720e8b95ef5c4ccb7b71101986481029202e7d5ecd9e644fdd089590ff9cf131
+tags:    latest
+
+$ pokerface pull github.com/acme/app:latest
+image:    registry.example.com/acme/app:latest
+digest:   sha256:720e8b95ef5c4ccb7b71101986481029202e7d5ecd9e644fdd089590ff9cf131
+commit:   c1e0a12d02ba5efbdd3d5ac6358ee1b7f12b079e
+platform: linux/amd64
+runtime:  docker (registry.example.com/acme/app:latest)
+
+$ pokerface cache ls
+cache: /Users/you/.cache/pokerface
+  git        1 entries  27.4 KiB
+  manifests  1 entries  805 B
+  blobs      2 entries  363 B
+  refs       1 entries  41 B
+  total      5 entries  28.6 KiB
+  limits     ttl=(unset) max_size=(unset)
+```
+
+首次在线拉取后，`pokerface pull <ref> --offline` 可完全从本地缓存重复拉取。`pokerface cache verify` 校验缓存并淘汰损坏条目；`pokerface cache rm` 清空缓存。M1 流程规范见 `docs/spec/pull.md` 与 `docs/spec/cache.md`。
+
+完全本地的验证（fixture Git 仓库 + Emo mock registry/CDN，不访问 Docker Hub）：
+
+```bash
+./scripts/e2e-m1.sh
+```
+
+脚本会构建 CLI，执行 resolve/pull、离线二次拉取与缓存命令，并在 skopeo 加 docker/podman/ctr 可用时导入检测到的运行时。设置 `KEEP_TMP=1` 可保留临时目录与日志。
 
 ## 设计要点
 
@@ -156,11 +190,11 @@ pokerface build --repo github.com/you/app --push
 
 ## 路线图
 
-- [ ] CLI 骨架与 `pokerface.yaml` 规范定义
-- [ ] Git 元数据解析（tag → Commit → Digest）
+- [x] CLI 骨架与 `pokerface.yaml` 规范定义
+- [x] Git 元数据解析（tag → Commit → Digest）
 - [ ] Registry/元数据服务最小实现（Manifest + 预签名 URL）
 - [ ] CDN/对象存储后端对接（S3/MinIO 兼容）
-- [ ] `skopeo` 集成与本地运行时导入
+- [x] `skopeo` 集成与本地运行时导入
 - [ ] 构建触发器与 CI 模板
 - [ ] 文档站与端到端示例
 
