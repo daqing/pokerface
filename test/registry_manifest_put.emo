@@ -459,8 +459,8 @@ def test_the_router_dispatches_manifest_put() {
         registry.config.RegistryStore.new("fs", "/tmp/pf-put-router/blobs", registry.config.default_s3()),
         registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
         "/tmp/pf-put-router/shutdown",
-        "<test>"
-      )
+        "<test>",
+    registry.config.default_auth())
       const links = FakeLinks.new([config_digest(), layer_digest()], "")
       const service = registry.router.Service.new(
         config,

@@ -24,6 +24,7 @@
 | [registry-manifests.md](registry-manifests.md) | Manifest GET/HEAD by tag or digest, Accept, integrity, 404s (M2/T2.8). | `registry/manifests.emo` |
 | [registry-blobs.md](registry-blobs.md) | Blob GET/HEAD, 307 presigned redirects, link checks (M2/T2.9). | `registry/blobs.emo` |
 | [registry-uploads.md](registry-uploads.md) | Blob upload: POST session, monolithic PUT with digest verification, session expiry, name grammar (M2/T2.10). | `registry/uploads.emo` |
+| [registry-auth.md](registry-auth.md) | Bearer tokens (HS256 JWT), scopes, the /token exchange, WWW-Authenticate challenges, auth config (M2/T2.14). | `registry/auth.emo`, `registry/config.emo` |
 
 ## M1 flow
 

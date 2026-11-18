@@ -359,7 +359,7 @@ Exit criteria:
 | [x] | T2.11 | Chunked upload and resumable transfers: PATCH / GET / DELETE | T2.10 | 3h |
 | [x] | T2.12 | Manifest PUT and tag updates | T2.3, T2.10, T2.11 | 2-3h |
 | [ ] | T2.13 | Resolve / metadata API | T2.8, T2.12 | 2h |
-| [ ] | T2.14 | Authentication and token service | T2.7 | 3-4h |
+| [x] | T2.14 | Authentication and token service | T2.7 | 3-4h |
 | [ ] | T2.15 | Cache headers, ETag, and CDN behavior | T2.8, T2.9 | 2h |
 | [ ] | T2.16 | Tag listing and pagination | T2.12 | 2h |
 | [ ] | T2.17 | Deployment: registry + MinIO + Caddy | T2.6, T2.14 | 3h |
@@ -539,6 +539,8 @@ Suggested tables:
 **Acceptance**: Anonymous pull is rejected (when auth is enabled); a pull-only scope cannot push; expired tokens return 401; cross-repository access is denied; passwords and signing keys never appear in logs; the v0.1 config-file flow works.
 
 **Depends on**: T2.7 · **Estimate**: 3-4h
+
+> **Notes** (2026-11-19, ~3.5h): Done. `registry/auth.emo` implements Docker's Bearer flow with HS256 JWTs: `GET /v2/` and every protected route answer 401 + `WWW-Authenticate: Bearer realm="…",service="…",scope="…"[,error="…"]` (realm defaults to `http://<listen>/token`); `/token` exchanges Basic auth for `{"token","expires_in","issued_at"}`; the token carries Docker-shaped `access` claims (`repository:<name>:pull,push`) and the stateless gate in the router verifies signature (constant-time), window (`expired_token`), issuer, and scope. Docker parity: auth failures are always 401 with a challenge (invalid_token / expired_token / insufficient_scope) so clients re-auth with the missing scope; unknown account and wrong password answer the identical 401 with a constant-time compare. Scopes parse space-separated with comma-joined actions; malformed ones (bad name, unknown action) are 400 and grant nothing — a pull-only token cannot push (401 insufficient_scope) and cross-repository tokens are denied. Config: `auth:` section (enabled, realm, service, issuer, token_ttl ≥ 60, users, signing_key or signing_key_file) with strict unknown-field checks, `POKERFACE_REGISTRY_AUTH_SIGNING_KEY` / `_AUTH_ENABLED` env overrides, secret files read once at load (trailing newline trimmed, both inline+file is an error), enabled-without-key-or-users is a start-up error, and a summary that prints `auth=enabled users=<n> signing_key=<set>` — no secret ever reaches the log (pinned by a test and grep on the live server). base64url rides the new `base64` dep. Tests: 25 new cases in `test/registry_auth.emo` (codec, mint/verify matrix, scope matching, challenge shape, the endpoint's 200/401/400/405, gate decisions incl. cross-repo and pull-only-push, router-level challenges with auth enabled, config section/defaults/env/redaction); `emo test` 450/450. **Manually verified: the full skopeo dance works** — `skopeo login --username alice …` then `skopeo copy` pushed a whole image through the challenge/token/push cycle; anonymous manifest GET is 401; the signing key does not appear in the server log. Gotchas: `(R.error, …)` tuples carry a String statically — the gate cannot hand a Response through the error slot, so `check_token` returns the reason and the router builds the 401 (the reason-to-error-word mapping lives in `error_class`); comma is an ACTION separator inside one scope, not a scope separator (caught live by the skopeo dance); negative `is()` guards do not narrow — the yaml/json parse helpers take the narrowed types through positive-branch wrappers.
 
 #### T2.15 Cache Headers, ETag, and CDN Behavior
 

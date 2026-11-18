@@ -19,6 +19,7 @@ package {
   // package binds in code under its short name.
   deps {
     "sqlite3" = "0.1.0"
+    "base64" = "0.1.0"
     // "json" = "0.1.0"       then:  require "json"       binds `json`
     // "acme/leaf" = "1.0.0"  then:  require "acme/leaf"  binds `leaf`
     "os" = "0.1.0"

@@ -38,8 +38,8 @@ def make_config(name String) registry.config.RegistryConfig {
     registry.config.RegistryStore.new("fs", data + "/blobs", registry.config.default_s3()),
     registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
     data + "/registry.shutdown",
-    "<test>"
-  )
+    "<test>",
+    registry.config.default_auth())
 }
 
 class ApiFakeDb {

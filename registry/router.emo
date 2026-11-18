@@ -26,6 +26,27 @@ def handle(req httpd.Request, service Service) httpd.Response {
 }
 
 def route(req httpd.Request, service Service) httpd.Response {
+  // The token endpoint is public and the gate skips it; everything else
+  // under an enabled auth config passes through it first.
+  if req.path == "/token" {
+    return registry.auth.handle_token(req, service.config.auth, registry.db.now_seconds())
+  }
+  if service.config.auth.enabled {
+    const access = registry.auth.required_access(req.path, req.method)
+    const (kind, repository, action) = access
+    if kind != "public" {
+      var scope = ""
+      if kind == "repository" {
+        scope = "repository:" + repository + ":" + action
+      }
+      case registry.auth.check_token(req, service.config.auth, kind, repository, action, registry.db.now_seconds()) {
+        (R.error, why) then {
+          return registry.auth.unauthorized(service.config.auth, scope, registry.auth.error_class(why), why)
+        }
+        (R.ok, _) then { }
+      }
+    }
+  }
   // The upload family shares the "/blobs/" prefix with the blob GET route and
   // must be checked first.
   if registry.uploads.is_route(req.path) {

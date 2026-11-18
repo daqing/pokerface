@@ -1205,8 +1205,8 @@ def test_the_router_dispatches_the_upload_methods() {
         registry.config.RegistryStore.new("fs", "/tmp/pf-uploads-router/blobs", registry.config.default_s3()),
         registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
         "/tmp/pf-uploads-router/shutdown",
-        "<test>"
-      )
+        "<test>",
+    registry.config.default_auth())
       const sessions = FakeSessions.new()
       sessions.use_files(tmp_root("router-parts"))
       const links = UploadFakeLinks.new()

@@ -1,0 +1,546 @@
+// T2.14: Bearer-token authentication for the distribution API. `GET /v2/`
+// challenges with WWW-Authenticate pointing at the token realm; `/token`
+// exchanges Basic auth for a short-lived HS256 JWT whose `access` claims
+// carry `repository:<name>:pull|push` scopes; a stateless gate in front of
+// the routes checks the token's signature, window, and scope against what
+// the request needs.
+//
+// Everything rides the configuration file's `auth` section (D6: pre-shared
+// accounts, no OAuth): users and the signing key never leave the config —
+// the summary prints `<set>` markers, error messages carry no secrets, and
+// a wrong password answers the same 401 as an unknown user.
+//
+// Docker parity notes: auth failures on /v2 routes always answer 401 with a
+// challenge (error=invalid_token / expired_token / insufficient_scope) so a
+// client can re-auth with a fresh scope; the token response is
+// {"token","expires_in","issued_at"}; scopes parse as
+// `repository:<name>:pull[,push]` (spaces and commas both separate), and a
+// token without access claims is still valid for the /v2/ probe.
+// Spec: docs/spec/registry-auth.md.
+
+require "httpd"
+require "json"
+require "os"
+require "time"
+require "crypto"
+require "base64"
+
+const bearer_scheme = "Bearer "
+const jwt_header_b64 = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+const jwt_header_text = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}"
+
+class VerifiedToken {
+  def init(subject String, scopes Array[String]) {
+    self.subject = subject
+    self.scopes = scopes
+  }
+}
+
+// ---------------------------------------------------------------------------
+// base64url (RFC 4648 §5): the JWT alphabet, no padding.
+
+def base64url_encode(data String) String {
+  const text = base64.encode(data)
+  var out = ""
+  var i = 0
+  while i < text.length() {
+    const c = text.substring(i, 1)
+    if c == "+" {
+      out = out + "-"
+    } else {
+      if c == "/" {
+        out = out + "_"
+      } else {
+        if c != "=" {
+          out = out + c
+        }
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+def base64url_decode(text String) (R, String) {
+  var padded = ""
+  var i = 0
+  while i < text.length() {
+    const c = text.substring(i, 1)
+    if c == "-" {
+      padded = padded + "+"
+    } else {
+      if c == "_" {
+        padded = padded + "/"
+      } else {
+        padded = padded + c
+      }
+    }
+    i = i + 1
+  }
+  const rem = padded.length() % 4
+  if rem == 1 {
+    return (R.error, "registry: auth: token segment is not valid base64url")
+  }
+  if rem == 2 {
+    padded = padded + "=="
+  } else {
+    if rem == 3 {
+      padded = padded + "="
+    }
+  }
+  case base64.decode(padded) {
+    (R.error, why) then { return (R.error, "registry: auth: token segment is not valid base64url: " + why) }
+    (R.ok, data) then { return (R.ok, data) }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scopes.
+
+// Reads `repository:<name>:pull[,push]`; anything else is not a repository
+// scope (a token carrying no repository scopes is still valid for the /v2/
+// probe, which requires only a verified token).
+def scope_names_repository(scope String) String {
+  if !scope.starts_with("repository:") {
+    return ""
+  }
+  const rest = scope.substring("repository:".length(), scope.length() - "repository:".length())
+  const second = rest.index_of(":")
+  if second <= 0 {
+    return ""
+  }
+  return rest.substring(0, second)
+}
+
+def scope_actions_of(scope String) String {
+  if !scope.starts_with("repository:") {
+    return ""
+  }
+  const rest = scope.substring("repository:".length(), scope.length() - "repository:".length())
+  const second = rest.index_of(":")
+  if second <= 0 || second >= rest.length() - 1 {
+    return ""
+  }
+  return rest.substring(second + 1, rest.length() - second - 1)
+}
+
+def scope_allows(scopes Array[String], repository String, action String) Bool {
+  var i = 0
+  while i < scopes.length() {
+    if scope_names_repository(scopes[i]) == repository {
+      const actions = scope_actions_of(scopes[i]).lower()
+      var start = 0
+      var j = 0
+      while j <= actions.length() {
+        if j == actions.length() || actions.substring(j, 1) == "," {
+          if actions.substring(start, j - start) == action {
+            return true
+          }
+          start = j + 1
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// Tokens.
+
+def sign(key String, payload String) String {
+  const mac = crypto.hash.hmac_sha256(key.to_bytes(), payload.to_bytes())
+  return crypto.hex_encode(mac)
+}
+
+// Mints an HS256 JWT: base64url(header).base64url(claims).base64url(hmac).
+// The scopes arrive as the client-requested scope strings.
+def mint_token(settings registry.config.RegistryAuth, subject String, scopes Array[String], now Int64) (R, String) {
+  const claims = json.encode(json.object([
+    ("exp", json.int64(now + settings.token_ttl)),
+    ("nbf", json.int64(now)),
+    ("iat", json.int64(now)),
+    ("iss", json.string(settings.issuer)),
+    ("sub", json.string(subject)),
+    ("access", json.array(access_entries(scopes)))
+  ]))
+  const payload = base64url_encode(claims)
+  const signed = sign(settings.signing_key, jwt_header_b64 + "." + payload)
+  return (R.ok, jwt_header_b64 + "." + payload + "." + base64url_encode(signed))
+}
+
+def access_entries(scopes Array[String]) Array[json.Json] {
+  var out = []
+  var i = 0
+  while i < scopes.length() {
+    const name = scope_names_repository(scopes[i])
+    if name != "" {
+      out = out.append(json.object([
+        ("type", json.string("repository")),
+        ("name", json.string(name)),
+        ("actions", json.string(scope_actions_of(scopes[i])))
+      ]))
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Verifies the signature, the window, and the issuer; answers the claims.
+def verify_token(settings registry.config.RegistryAuth, token String, now Int64) (R, VerifiedToken) {
+  const parts = token.split(".")
+  if parts.length() != 3 {
+    return (R.error, "registry: auth: malformed token")
+  }
+  case base64url_decode(parts[0]) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, header) then {
+      if header != jwt_header_text {
+        return (R.error, "registry: auth: unsupported token header")
+      }
+    }
+  }
+  case base64url_decode(parts[2]) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, given) then {
+      const expected = sign(settings.signing_key, parts[0] + "." + parts[1])
+      if !crypto.constant_time_compare(given.to_bytes(), expected.to_bytes()) {
+        return (R.error, "registry: auth: token signature mismatch")
+      }
+    }
+  }
+  case base64url_decode(parts[1]) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, claims) then {
+      case json.decode(claims) {
+        (R.error, why) then { return (R.error, "registry: auth: token claims are not JSON: " + why) }
+        (R.ok, doc) then {
+          if doc.is(json.JsonObject) {
+            return read_claims(settings, doc, now)
+          }
+          return (R.error, "registry: auth: token claims are not an object")
+        }
+      }
+    }
+  }
+}
+
+def read_claims(settings registry.config.RegistryAuth, doc json.JsonObject, now Int64) (R, VerifiedToken) {
+  const entries = doc.entries()
+    var exp = 0
+    var nbf = 0
+    var issuer = ""
+    var subject = ""
+    var scopes = []
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == "exp" || key == "nbf" {
+        if value.is(json.JsonInt) {
+          if key == "exp" {
+            exp = value.as_int()
+          } else {
+            nbf = value.as_int()
+          }
+        }
+      } else {
+        if key == "iss" {
+          if value.is(json.JsonString) {
+            issuer = value.as_string()
+          }
+        } else {
+          if key == "sub" {
+            if value.is(json.JsonString) {
+              subject = value.as_string()
+            }
+          } else {
+            if key == "access" {
+              if value.is(json.JsonArray) {
+                scopes = read_access(value)
+              }
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+    if exp == 0 {
+      return (R.error, "registry: auth: token has no exp")
+    }
+    if now >= exp {
+      return (R.error, "registry: auth: token expired")
+    }
+    if nbf > now {
+      return (R.error, "registry: auth: token not valid yet")
+    }
+  if settings.issuer != "" && issuer != settings.issuer {
+    return (R.error, "registry: auth: token issuer mismatch")
+  }
+  return (R.ok, VerifiedToken.new(subject, scopes))
+}
+
+// The access entries carry actions as a comma-joined string (Docker's
+// shape); they read back into the scope strings the gate matches against.
+def read_access(items json.JsonArray) Array[String] {
+  var out = []
+  const entries_items = items.items()
+  var i = 0
+  while i < entries_items.length() {
+    const item = entries_items[i]
+    if item.is(json.JsonObject) {
+      const fields = item.entries()
+      var name = ""
+      var actions = ""
+      var j = 0
+      while j < fields.length() {
+        const (key, v) = fields[j]
+        if key == "name" && v.is(json.JsonString) {
+          name = v.as_string()
+        } else {
+          if key == "actions" && v.is(json.JsonString) {
+            actions = v.as_string()
+          }
+        }
+        j = j + 1
+      }
+      if name != "" && actions != "" {
+        out = out.append("repository:" + name + ":" + actions)
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// The gate.
+
+// What the request needs: ("public", "", "") skips auth, ("probe", "", "")
+// wants any verified token, ("repository", name, action) wants a scope.
+def required_access(path String, method String) (String, String, String) {
+  if path == "/healthz" || path == "/readyz" || path == "/token" {
+    return ("public", "", "")
+  }
+  if path == "/v2" || path == "/v2/" {
+    return ("probe", "", "")
+  }
+  if registry.uploads.is_route(path) {
+    return ("repository", uploads_repository(path), "push")
+  }
+  if registry.manifests.is_route(path) {
+    if method == "PUT" {
+      return ("repository", manifests_repository(path), "push")
+    }
+    return ("repository", manifests_repository(path), "pull")
+  }
+  if registry.blobs.is_route(path) {
+    return ("repository", blobs_repository(path), "pull")
+  }
+  return ("public", "", "")
+}
+
+// The family splitters answer ("", "") for shapes that are not theirs; a
+// wrong shape still lands on the route's own 404 after the gate.
+def uploads_repository(path String) String {
+  const parts = registry.uploads.split(path)
+  return parts[0]
+}
+
+def manifests_repository(path String) String {
+  const parts = registry.manifests.split(path)
+  return parts[0]
+}
+
+def blobs_repository(path String) String {
+  const parts = registry.blobs.split(path)
+  return parts[0]
+}
+
+def bearer_token(req httpd.Request) String {
+  const header = req.header("Authorization")
+  if header.length() <= bearer_scheme.length() {
+    return ""
+  }
+  if header.substring(0, bearer_scheme.length()).lower() != bearer_scheme.lower() {
+    return ""
+  }
+  return header.substring(bearer_scheme.length(), header.length() - bearer_scheme.length())
+}
+
+// The WWW-Authenticate challenge: `Bearer realm="…",service="…"[,scope="…"]
+// [,error="…"]`. The realm and service are always quoted strings; a scope
+// and error join only when set.
+def challenge_header(settings registry.config.RegistryAuth, scope String, error String) String {
+  var out = "Bearer realm=\"" + settings.realm + "\",service=\"" + settings.service + "\""
+  if scope != "" {
+    out = out + ",scope=\"" + scope + "\""
+  }
+  if error != "" {
+    out = out + ",error=\"" + error + "\""
+  }
+  return out
+}
+
+// The 401 every protected route answers with — the envelope plus the
+// challenge, so a client can fetch a token and retry.
+def unauthorized(settings registry.config.RegistryAuth, scope String, error String, detail String) httpd.Response {
+  return httpd.response(401, [
+    ("WWW-Authenticate", challenge_header(settings, scope, error)),
+    ("Content-Type", "application/json; charset=utf-8")
+  ], registry.api.error_body(registry.api.code_unauthorized, "authentication required", detail))
+}
+
+// Verifies the token for what the request needs: any verified token passes
+// a probe; a repository access needs a matching scope. The error slot is the
+// reason (an (R, …) tuple's second slot is statically a String — the
+// response itself is built by the router, which owns the scope string).
+def check_token(req httpd.Request, settings registry.config.RegistryAuth, kind String, repository String, action String, now Int64) (R, VerifiedToken) {
+  const token = bearer_token(req)
+  if token == "" {
+    return (R.error, "registry: auth: no bearer token")
+  }
+  case verify_token(settings, token, now) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, verified) then {
+      if kind == "probe" {
+        return (R.ok, verified)
+      }
+      if !scope_allows(verified.scopes, repository, action) {
+        return (R.error, "registry: auth: the token does not grant " + repository + ":" + action)
+      }
+      return (R.ok, verified)
+    }
+  }
+}
+
+// The challenge's error= word for a failure reason.
+def error_class(reason String) String {
+  if reason.index_of("expired") >= 0 {
+    return "expired_token"
+  }
+  if reason.index_of("does not grant") >= 0 {
+    return "insufficient_scope"
+  }
+  return "invalid_token"
+}
+
+// ---------------------------------------------------------------------------
+// The token endpoint: Basic auth in, a scope-limited Bearer token out.
+
+def handle_token(req httpd.Request, settings registry.config.RegistryAuth, now Int64) httpd.Response {
+  if req.method != "GET" && req.method != "POST" {
+    return registry.api.method_not_allowed("GET, POST")
+  }
+  const header = req.header("Authorization")
+  if header.length() <= 6 || header.substring(0, 6).lower() != "basic " {
+    return unauthorized(settings, "", "", "the token endpoint takes Basic authentication")
+  }
+  const encoded = header.substring(6, header.length() - 6)
+  case base64.decode(encoded) {
+    (R.error, _) then { return unauthorized(settings, "", "", "malformed Basic credentials") }
+    (R.ok, decoded) then {
+      const colon = decoded.index_of(":")
+      if colon <= 0 {
+        return unauthorized(settings, "", "", "malformed Basic credentials")
+      }
+      const username = decoded.substring(0, colon)
+      const password = decoded.substring(colon + 1, decoded.length() - colon - 1)
+      if !account_matches(settings, username, password) {
+        return unauthorized(settings, "", "", "unknown account or wrong password")
+      }
+      return issue_for(req, settings, username, now)
+    }
+  }
+}
+
+// Constant-time per account, and the same 401 for unknown users and wrong
+// passwords — the answer never distinguishes the two.
+def account_matches(settings registry.config.RegistryAuth, username String, password String) Bool {
+  const users = settings.users
+  var i = 0
+  while i < users.length() {
+    if users[i].username == username {
+      return crypto.constant_time_compare(users[i].password.to_bytes(), password.to_bytes())
+    }
+    i = i + 1
+  }
+  crypto.constant_time_compare("no such account".to_bytes(), password.to_bytes())
+  return false
+}
+
+// The scopes the client asked for, as `repository:<name>:<actions>` strings.
+// Whitespace separates scopes; a comma inside one joins its actions
+// (`repository:a:pull,push` is one scope with two actions). Malformed scopes
+// are refused: the token never grants something the request did not name.
+def requested_scopes(req httpd.Request) (R, Array[String]) {
+  if !req.query.has("scope") {
+    return (R.ok, [])
+  }
+  const raw = req.query.get("scope")
+  var scopes = []
+  var start = 0
+  var i = 0
+  while i <= raw.length() {
+    if i == raw.length() || raw.substring(i, 1) == " " {
+      const piece = raw.substring(start, i - start)
+      if piece != "" {
+        if !valid_scope(piece) {
+          return (R.error, piece)
+        }
+        scopes = scopes.append(piece)
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return (R.ok, scopes)
+}
+
+def valid_scope(scope String) Bool {
+  if !scope.starts_with("repository:") {
+    return false
+  }
+  const name = scope_names_repository(scope)
+  if name == "" || !registry.uploads.valid_name(name) {
+    return false
+  }
+  const actions = scope_actions_of(scope)
+  if actions == "" {
+    return false
+  }
+  var start = 0
+  var i = 0
+  while i <= actions.length() {
+    if i == actions.length() || actions.substring(i, 1) == "," {
+      const action = actions.substring(start, i - start)
+      if action != "pull" && action != "push" {
+        return false
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return true
+}
+
+def issue_for(req httpd.Request, settings registry.config.RegistryAuth, username String, now Int64) httpd.Response {
+  case requested_scopes(req) {
+    (R.error, piece) then {
+      return registry.api.bad_request(registry.api.code_unauthorized, "invalid scope", piece)
+    }
+    (R.ok, scopes) then {
+      case mint_token(settings, username, scopes, now) {
+        (R.error, why) then { return registry.api.server_error("token minting failed", why) }
+        (R.ok, token) then {
+          const body = json.encode(json.object([
+            ("token", json.string(token)),
+            ("expires_in", json.int64(settings.token_ttl)),
+            ("issued_at", json.string(time.of_ms(now * 1000).format_iso()))
+          ]))
+          return httpd.response(200, [("Content-Type", "application/json; charset=utf-8")], body)
+        }
+      }
+    }
+  }
+}

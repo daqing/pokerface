@@ -1,0 +1,762 @@
+// T2.14 tests for authentication and the token service — run with `emo test`.
+//
+// The token layer (mint/verify/scope), the Basic exchange, the gate's
+// routing decisions, and the config section all run in the interpreter; the
+// router test pins the challenge headers and the pass/fail decisions at the
+// dispatch level with auth enabled.
+
+const auth = registry.auth
+const api = registry.api
+
+require "httpd"
+require "json"
+require "crypto"
+require "file"
+
+const test_key = "test-signing-key-0123456789abcdef"
+const test_realm = "http://127.0.0.1:5000/token"
+const test_service = "pokerface-registry"
+const test_issuer = "pokerface-registry"
+
+def auth_settings() registry.config.RegistryAuth {
+  return registry.config.RegistryAuth.new(true, test_realm, test_service, test_issuer, 3600,
+    [registry.config.AuthUser.new("alice", "wonderland")], test_key)
+}
+
+// ---------------------------------------------------------------------------
+// base64url.
+
+def test_base64url_round_trip() {
+  const encoded = auth.base64url_encode("hello world")
+  expect_true(encoded.index_of("+") < 0)
+  expect_true(encoded.index_of("/") < 0)
+  expect_true(encoded.index_of("=") < 0)
+  case auth.base64url_decode(encoded) {
+    (R.ok, data) then { expect_equal("hello world", data) }
+    (R.error, why) then { expect_fail(why) }
+  }
+}
+
+def test_base64url_rejects_broken_segments() {
+  case auth.base64url_decode("a") {
+    (R.error, _) then { expect_true(true) }
+    (R.ok, _) then { expect_fail("a one-character segment decoded") }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tokens.
+
+def test_mint_and_verify_round_trip() {
+  case auth.mint_token(auth_settings(), "alice", ["repository:acme/app:pull,push"], 1000) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, token) then {
+      case auth.verify_token(auth_settings(), token, 1500) {
+        (R.error, why) then { expect_fail(why) }
+        (R.ok, verified) then {
+          expect_equal("alice", verified.subject)
+          expect_equal(1, verified.scopes.length())
+          expect_true(auth.scope_allows(verified.scopes, "acme/app", "pull"))
+          expect_true(auth.scope_allows(verified.scopes, "acme/app", "push"))
+        }
+      }
+    }
+  }
+}
+
+def test_verify_rejects_a_foreign_key() {
+  case auth.mint_token(auth_settings(), "alice", [], 1000) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, token) then {
+      const stranger = registry.config.RegistryAuth.new(true, test_realm, test_service, test_issuer, 3600,
+        [registry.config.AuthUser.new("alice", "wonderland")], "another-key")
+      case auth.verify_token(stranger, token, 1500) {
+        (R.error, why) then { expect_true(why.index_of("signature") >= 0) }
+        (R.ok, _) then { expect_fail("a foreign key verified a token") }
+      }
+    }
+  }
+}
+
+def test_verify_rejects_an_expired_token() {
+  case auth.mint_token(auth_settings(), "alice", [], 1000) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, token) then {
+      case auth.verify_token(auth_settings(), token, 1000 + 3600) {
+        (R.error, why) then { expect_true(why.index_of("expired") >= 0) }
+        (R.ok, _) then { expect_fail("an expired token verified") }
+      }
+    }
+  }
+}
+
+def test_verify_rejects_a_token_before_its_window() {
+  case auth.mint_token(auth_settings(), "alice", [], 5000) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, token) then {
+      case auth.verify_token(auth_settings(), token, 4000) {
+        (R.error, why) then { expect_true(why.index_of("not valid yet") >= 0) }
+        (R.ok, _) then { expect_fail("a future token verified") }
+      }
+    }
+  }
+}
+
+def test_verify_rejects_a_tampered_payload() {
+  case auth.mint_token(auth_settings(), "alice", [], 1000) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, token) then {
+      const parts = token.split(".")
+      const forged = parts[0] + "." + parts[1] + "." + "Zm9yZWlnbg"
+      case auth.verify_token(auth_settings(), forged, 1500) {
+        (R.error, why) then { expect_true(why.index_of("signature") >= 0) }
+        (R.ok, _) then { expect_fail("a forged token verified") }
+      }
+    }
+  }
+}
+
+def test_verify_rejects_malformed_tokens() {
+  case auth.verify_token(auth_settings(), "nonsense", 1500) {
+    (R.error, why) then { expect_true(why.index_of("malformed") >= 0) }
+    (R.ok, _) then { expect_fail("nonsense verified") }
+  }
+  case auth.verify_token(auth_settings(), "a.b", 1500) {
+    (R.error, why) then { expect_true(why.index_of("malformed") >= 0) }
+    (R.ok, _) then { expect_fail("two segments verified") }
+  }
+}
+
+def test_verify_rejects_a_foreign_issuer() {
+  case auth.mint_token(auth_settings(), "alice", [], 1000) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, token) then {
+      const other = registry.config.RegistryAuth.new(true, test_realm, test_service, "someone-else", 3600,
+        [registry.config.AuthUser.new("alice", "wonderland")], test_key)
+      case auth.verify_token(other, token, 1500) {
+        (R.error, why) then { expect_true(why.index_of("issuer") >= 0) }
+        (R.ok, _) then { expect_fail("a foreign issuer verified") }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scopes.
+
+def test_scope_allows_actions_and_names() {
+  const scopes = ["repository:acme/app:pull,push", "repository:other/repo:pull"]
+  expect_true(auth.scope_allows(scopes, "acme/app", "pull"))
+  expect_true(auth.scope_allows(scopes, "acme/app", "push"))
+  expect_true(auth.scope_allows(scopes, "other/repo", "pull"))
+  expect_true(!auth.scope_allows(scopes, "other/repo", "push"))
+  expect_true(!auth.scope_allows(scopes, "acme/other", "pull"))
+  expect_true(!auth.scope_allows([], "acme/app", "pull"))
+}
+
+def test_scope_names_repository() {
+  expect_equal("acme/app", auth.scope_names_repository("repository:acme/app:pull,push"))
+  expect_equal("", auth.scope_names_repository("repository:nocolon"))
+  expect_equal("", auth.scope_names_repository("registry:catalog:*"))
+}
+
+// ---------------------------------------------------------------------------
+// The challenge and the 401.
+
+def test_challenge_header_shape() {
+  const settings = auth_settings()
+  expect_equal("Bearer realm=\"" + test_realm + "\",service=\"" + test_service + "\"",
+    auth.challenge_header(settings, "", ""))
+  expect_equal("Bearer realm=\"" + test_realm + "\",service=\"" + test_service
+    + "\",scope=\"repository:acme/app:pull\"",
+    auth.challenge_header(settings, "repository:acme/app:pull", ""))
+  expect_equal("Bearer realm=\"" + test_realm + "\",service=\"" + test_service
+    + "\",scope=\"repository:acme/app:pull\",error=\"expired_token\"",
+    auth.challenge_header(settings, "repository:acme/app:pull", "expired_token"))
+}
+
+// ---------------------------------------------------------------------------
+// The token endpoint.
+
+def basic_request(path String, query Map[String, String], credentials String) httpd.Request {
+  var headers = []
+  if credentials != "" {
+    headers = headers.append(("Authorization", "Basic " + base64_text(credentials)))
+  }
+  return httpd.Request.new(
+    method: "GET",
+    target: path,
+    path: path,
+    query: query,
+    proto: "HTTP/1.1",
+    headers: headers,
+    body: "",
+    params: Map.new()
+  )
+}
+
+def base64_text(text String) String {
+  return base64.encode(text)
+}
+
+def scope_query(scope String) Map[String, String] {
+  const query = Map.new()
+  query.set("scope", scope)
+  return query
+}
+
+def test_token_endpoint_issues_a_scoped_token() {
+  const response = auth.handle_token(basic_request("/token", scope_query("repository:acme/app:pull"), "alice:wonderland"), auth_settings(), 1000)
+  expect_equal(200, response.status)
+  case json.decode(response.body) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, doc) then {
+      if doc.is(json.JsonObject) {
+        const entries = doc.entries()
+        var token = ""
+        var expires_in = 0
+        var issued_at = ""
+        var i = 0
+        while i < entries.length() {
+          const (key, value) = entries[i]
+          if key == "token" && value.is(json.JsonString) {
+            token = value.as_string()
+          } else {
+            if key == "expires_in" && value.is(json.JsonInt) {
+              expires_in = value.as_int()
+            } else {
+              if key == "issued_at" && value.is(json.JsonString) {
+                issued_at = value.as_string()
+              }
+            }
+          }
+          i = i + 1
+        }
+        expect_true(token != "")
+        expect_equal(3600, expires_in)
+        expect_true(issued_at.index_of("T") >= 0)
+        case auth.verify_token(auth_settings(), token, 1500) {
+          (R.error, why) then { expect_fail(why) }
+          (R.ok, verified) then {
+            expect_true(auth.scope_allows(verified.scopes, "acme/app", "pull"))
+            expect_true(!auth.scope_allows(verified.scopes, "acme/app", "push"))
+          }
+        }
+      } else {
+        expect_fail("the token response is not an object")
+      }
+    }
+  }
+}
+
+def test_token_endpoint_rejects_bad_credentials() {
+  const wrong_password = auth.handle_token(basic_request("/token", Map.new(), "alice:nope"), auth_settings(), 1000)
+  expect_equal(401, wrong_password.status)
+  expect_equal(api.code_unauthorized, error_field(wrong_password.body, "code"))
+  const unknown_user = auth.handle_token(basic_request("/token", Map.new(), "bob:builder"), auth_settings(), 1000)
+  expect_equal(401, unknown_user.status)
+  const no_credentials = auth.handle_token(basic_request("/token", Map.new(), ""), auth_settings(), 1000)
+  expect_equal(401, no_credentials.status)
+  // The two failures never distinguish themselves.
+  expect_equal(error_field(wrong_password.body, "message"), error_field(unknown_user.body, "message"))
+}
+
+def test_token_endpoint_rejects_invalid_scopes() {
+  const response = auth.handle_token(basic_request("/token", scope_query("repository:ACME/app:pull"), "alice:wonderland"), auth_settings(), 1000)
+  expect_equal(400, response.status)
+  const action = auth.handle_token(basic_request("/token", scope_query("repository:acme/app:steal"), "alice:wonderland"), auth_settings(), 1000)
+  expect_equal(400, action.status)
+}
+
+def test_token_endpoint_methods() {
+  const delete_request = httpd.Request.new(
+    method: "DELETE",
+    target: "/token",
+    path: "/token",
+    query: Map.new(),
+    proto: "HTTP/1.1",
+    headers: [("Authorization", "Basic " + base64_text("alice:wonderland"))],
+    body: "",
+    params: Map.new()
+  )
+  const response = auth.handle_token(delete_request, auth_settings(), 1000)
+  expect_equal(405, response.status)
+  expect_equal("GET, POST", header_value(response.headers, "allow"))
+}
+
+// ---------------------------------------------------------------------------
+// The gate's routing decisions.
+
+def gate_request(method String, path String, token String) httpd.Request {
+  var headers = []
+  if token != "" {
+    headers = headers.append(("Authorization", "Bearer " + token))
+  }
+  return httpd.Request.new(
+    method: method,
+    target: path,
+    path: path,
+    query: Map.new(),
+    proto: "HTTP/1.1",
+    headers: headers,
+    body: "",
+    params: Map.new()
+  )
+}
+
+def probe_token() String {
+  case auth.mint_token(auth_settings(), "alice", [], 1000) {
+    (R.ok, token) then { return token }
+    (R.error, why) then { expect_fail(why) }
+  }
+  return ""
+}
+
+def pull_token() String {
+  case auth.mint_token(auth_settings(), "alice", ["repository:acme/app:pull"], 1000) {
+    (R.ok, token) then { return token }
+    (R.error, why) then { expect_fail(why) }
+  }
+  return ""
+}
+
+def push_token() String {
+  case auth.mint_token(auth_settings(), "alice", ["repository:acme/app:push,pull"], 1000) {
+    (R.ok, token) then { return token }
+    (R.error, why) then { expect_fail(why) }
+  }
+  return ""
+}
+
+def test_check_token_decisions() {
+  const settings = auth_settings()
+  // A probe passes with any token and fails without one.
+  case auth.check_token(gate_request("GET", "/v2/", probe_token()), settings, "probe", "", "", 1500) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case auth.check_token(gate_request("GET", "/v2/", ""), settings, "probe", "", "", 1500) {
+    (R.error, why) then { expect_true(why.index_of("no bearer token") >= 0) }
+    (R.ok, _) then { expect_fail("a probe passed without a token") }
+  }
+  // A pull token reads; it does not push.
+  case auth.check_token(gate_request("GET", "/v2/acme/app/manifests/latest", pull_token()), settings, "repository", "acme/app", "pull", 1500) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  case auth.check_token(gate_request("PUT", "/v2/acme/app/manifests/v1", pull_token()), settings, "repository", "acme/app", "push", 1500) {
+    (R.error, why) then { expect_true(why.index_of("does not grant") >= 0) }
+    (R.ok, _) then { expect_fail("a pull-only token pushed") }
+  }
+  // A push token uploads.
+  case auth.check_token(gate_request("POST", "/v2/acme/app/blobs/uploads/", push_token()), settings, "repository", "acme/app", "push", 1500) {
+    (R.ok, _) then { expect_true(true) }
+    (R.error, why) then { expect_fail(why) }
+  }
+  // Cross-repository access is denied.
+  case auth.check_token(gate_request("GET", "/v2/other/app/manifests/latest", pull_token()), settings, "repository", "other/app", "pull", 1500) {
+    (R.error, why) then { expect_true(why.index_of("does not grant") >= 0) }
+    (R.ok, _) then { expect_fail("a foreign repository pull passed") }
+  }
+  // An expired token fails.
+  case auth.check_token(gate_request("GET", "/v2/", probe_token()), settings, "probe", "", "", 10000) {
+    (R.error, why) then { expect_true(why.index_of("expired") >= 0) }
+    (R.ok, _) then { expect_fail("an expired token passed") }
+  }
+}
+
+def test_required_access_kinds() {
+  const (probe_kind, _, _) = auth.required_access("/v2/", "GET")
+  expect_equal("probe", probe_kind)
+  const (health_kind, _, _) = auth.required_access("/healthz", "GET")
+  expect_equal("public", health_kind)
+  const (token_kind, _, _) = auth.required_access("/token", "GET")
+  expect_equal("public", token_kind)
+  const (get_kind, get_repo, get_action) = auth.required_access("/v2/acme/app/manifests/latest", "GET")
+  expect_equal("repository", get_kind)
+  expect_equal("acme/app", get_repo)
+  expect_equal("pull", get_action)
+  const (put_kind, put_repo, put_action) = auth.required_access("/v2/acme/app/manifests/v1", "PUT")
+  expect_equal("push", put_action)
+  expect_equal("acme/app", put_repo)
+  const (post_kind, post_repo, post_action) = auth.required_access("/v2/acme/app/blobs/uploads/", "POST")
+  expect_equal("push", post_action)
+  expect_equal("acme/app", post_repo)
+  const (blob_kind, blob_repo, blob_action) = auth.required_access("/v2/acme/app/blobs/sha256:1111111111111111111111111111111111111111111111111111111111111111", "GET")
+  expect_equal("pull", blob_action)
+  expect_equal("acme/app", blob_repo)
+  const (patch_kind, _, patch_action) = auth.required_access("/v2/acme/app/blobs/uploads/sess-1", "PATCH")
+  expect_equal("repository", patch_kind)
+  expect_equal("push", patch_action)
+}
+
+// ---------------------------------------------------------------------------
+// The router with auth enabled.
+
+class AuthFakeDb {
+  def init() {
+  }
+
+  def ping() Bool {
+    return true
+  }
+
+  def path() String {
+    return "/tmp/fake.db"
+  }
+}
+
+class AuthFakeHealth {
+  def init() {
+  }
+
+  def probe() (R, String) {
+    return (R.ok, "fs:/tmp/fake")
+  }
+}
+
+class AuthFakeLinks {
+  def init() {
+  }
+
+  def linked(repository String, digest String) (R, registry.blobs.BlobLink) {
+    return (R.ok, registry.blobs.absent_link())
+  }
+}
+
+class AuthFakeManifests {
+  def init() {
+  }
+
+  def lookup(repository String, reference String) (R, registry.manifests.ManifestPayload) {
+    return (R.ok, registry.manifests.absent_payload())
+  }
+}
+
+class AuthFakeWriter {
+  def init() {
+  }
+
+  def put(repository String, media_type String, body String) (R, String) {
+    return (R.ok, "sha256:1111111111111111111111111111111111111111111111111111111111111111")
+  }
+
+  def tag(repository String, tag String, digest String) (R, Bool) {
+    return (R.ok, true)
+  }
+}
+
+class AuthFakeUploads {
+  def init() {
+  }
+
+  def start(repository String) (R, String) {
+    return (R.ok, "sess-1")
+  }
+
+  def lookup(id String) (R, registry.uploads.UploadSession) {
+    return (R.ok, registry.uploads.absent_session())
+  }
+
+  def append(id String, body String, start Int64, ranged Bool) (R, Int64) {
+    return (R.error, "fake: append")
+  }
+
+  def complete(id String, digest String, size Int64) (R, Bool) {
+    return (R.ok, true)
+  }
+
+  def cancel(id String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def part_path(id String) (R, String) {
+    return (R.ok, "/tmp/fake-part")
+  }
+}
+
+class AuthFakeStore {
+  def init() {
+  }
+
+  def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, 0, true))
+  }
+
+  def put_file(digest String, source String) (R, registry.blobstore.BlobInfo) {
+    return (R.error, "fake: put_file")
+  }
+
+  def get(digest String) (R, String) {
+    return (R.error, registry.blobstore.not_found(digest))
+  }
+
+  def read_range(digest String, offset Int64, length Int64) (R, String) {
+    return (R.error, "fake: range")
+  }
+
+  def head(digest String) (R, registry.blobstore.BlobInfo) {
+    return (R.ok, registry.blobstore.BlobInfo.new(digest, -1, false))
+  }
+
+  def delete(digest String) (R, Bool) {
+    return (R.ok, false)
+  }
+
+  def presign_get(digest String, ttl_seconds Int64) String {
+    return ""
+  }
+}
+
+def auth_config() registry.config.RegistryConfig {
+  return registry.config.RegistryConfig.new(
+    registry.config.RegistryListen.new("127.0.0.1", 5000),
+    "/tmp/pf-auth-router",
+    "/tmp/pf-auth-router/registry.db",
+    registry.config.RegistryStore.new("fs", "/tmp/pf-auth-router/blobs", registry.config.default_s3()),
+    registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
+    "/tmp/pf-auth-router/shutdown",
+    "<test>",
+    auth_settings()
+  )
+}
+
+def auth_service() registry.router.Service {
+  return registry.router.Service.new(auth_config(), AuthFakeDb.new(), AuthFakeHealth.new(), AuthFakeStore.new(), AuthFakeLinks.new(), AuthFakeManifests.new(), AuthFakeUploads.new(), AuthFakeWriter.new())
+}
+
+// The router gates with the real clock, so these mint at now.
+def probe_token_now() String {
+  case auth.mint_token(auth_settings(), "alice", [], registry.db.now_seconds()) {
+    (R.ok, token) then { return token }
+    (R.error, why) then { expect_fail(why) }
+  }
+  return ""
+}
+
+def pull_token_now() String {
+  case auth.mint_token(auth_settings(), "alice", ["repository:acme/app:pull"], registry.db.now_seconds()) {
+    (R.ok, token) then { return token }
+    (R.error, why) then { expect_fail(why) }
+  }
+  return ""
+}
+
+def push_token_now() String {
+  case auth.mint_token(auth_settings(), "alice", ["repository:acme/app:push,pull"], registry.db.now_seconds()) {
+    (R.ok, token) then { return token }
+    (R.error, why) then { expect_fail(why) }
+  }
+  return ""
+}
+
+def test_the_router_challenges_protected_routes() {
+  const service = auth_service()
+  const bare_probe = registry.router.handle(gate_request("GET", "/v2/", ""), service)
+  expect_equal(401, bare_probe.status)
+  expect_equal(api.code_unauthorized, error_field(bare_probe.body, "code"))
+  expect_true(header_value(bare_probe.headers, "www-authenticate").index_of("Bearer realm=\"http://127.0.0.1:5000/token\"") >= 0)
+  // A valid probe token passes.
+  const ok_probe = registry.router.handle(gate_request("GET", "/v2/", probe_token_now()), service)
+  expect_equal(200, ok_probe.status)
+  // A pull token reads a manifest (the fake store answers absent → 404 from
+  // the route, not 401 from the gate).
+  const read = registry.router.handle(gate_request("GET", "/v2/acme/app/manifests/latest", pull_token_now()), service)
+  expect_equal(404, read.status)
+  expect_equal(api.code_manifest_unknown, error_field(read.body, "code"))
+  // The same token without scope fails with insufficient_scope in the challenge.
+  const foreign = registry.router.handle(gate_request("GET", "/v2/other/app/manifests/latest", pull_token_now()), service)
+  expect_equal(401, foreign.status)
+  expect_true(header_value(foreign.headers, "www-authenticate").index_of("error=\"insufficient_scope\"") >= 0)
+  // A push token starts an upload.
+  const upload = registry.router.handle(gate_request("POST", "/v2/acme/app/blobs/uploads/", push_token_now()), service)
+  expect_equal(202, upload.status)
+  const pull_upload = registry.router.handle(gate_request("POST", "/v2/acme/app/blobs/uploads/", pull_token_now()), service)
+  expect_equal(401, pull_upload.status)
+  expect_true(header_value(pull_upload.headers, "www-authenticate").index_of("error=\"insufficient_scope\"") >= 0)
+}
+
+def test_health_and_token_stay_public_with_auth_enabled() {
+  const service = auth_service()
+  const health = registry.router.handle(gate_request("GET", "/healthz", ""), service)
+  expect_equal(200, health.status)
+  const ready = registry.router.handle(gate_request("GET", "/readyz", ""), service)
+  expect_equal(200, ready.status)
+  const token_response = registry.router.handle(basic_request("/token", scope_query("repository:acme/app:pull"), "alice:wonderland"), service)
+  expect_equal(200, token_response.status)
+}
+
+// ---------------------------------------------------------------------------
+// Config: the auth section.
+
+def auth_tmp_base() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base + "pokerface-registry-auth-cfg-" + os.getpid().to_string() + "-"
+}
+
+def write_file(path String, text String) {
+  case file.write(path, text) {
+    (R.error, why) then { expect_fail("cannot write " + path + ": " + why) }
+    (R.ok, _) then { expect_true(true) }
+  }
+}
+
+def load_config(path String, env Map[String, String]) (R, registry.config.RegistryConfig) {
+  return registry.config.load(RegEnv.new(env), path)
+}
+
+class RegEnv {
+  def init(values Map[String, String]) {
+    self.values = values
+  }
+
+  def getenv(name String) (R, String) {
+    if self.values.has(name) {
+      return (R.ok, self.values.get(name))
+    }
+    return (R.error, "not set")
+  }
+}
+
+def test_auth_config_parses_and_validates() {
+  const base = auth_tmp_base()
+  const path = base + "auth.yaml"
+  write_file(path, "listen:\n  host: 127.0.0.1\n  port: 5001\ndata_dir: " + base + "data\nauth:\n  enabled: true\n  realm: \"http://r/token\"\n  service: \"svc\"\n  issuer: \"iss\"\n  token_ttl: 120\n  signing_key: " + "\"topsecret\"\n  users:\n    - username: alice\n      password: wonderland\n    - username: bob\n      password_file: " + base + "bob-secret\n")
+  write_file(base + "bob-secret", "builder\n")
+  case load_config(path, Map.new()) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, config) then {
+      expect_true(config.auth.enabled)
+      expect_equal("http://r/token", config.auth.realm)
+      expect_equal("svc", config.auth.service)
+      expect_equal("iss", config.auth.issuer)
+      expect_equal(120, config.auth.token_ttl)
+      expect_equal("topsecret", config.auth.signing_key)
+      expect_equal(2, config.auth.users.length())
+      expect_equal("alice", config.auth.users[0].username)
+      expect_equal("wonderland", config.auth.users[0].password)
+      expect_equal("bob", config.auth.users[1].username)
+      expect_equal("builder", config.auth.users[1].password)
+    }
+  }
+}
+
+def test_auth_config_requires_a_key_when_enabled() {
+  const base = auth_tmp_base()
+  const path = base + "nokey.yaml"
+  write_file(path, "listen:\n  host: 127.0.0.1\n  port: 5001\ndata_dir: " + base + "data\nauth:\n  enabled: true\n  users:\n    - username: alice\n      password: wonderland\n")
+  case load_config(path, Map.new()) {
+    (R.error, why) then { expect_true(why.index_of("signing_key") >= 0) }
+    (R.ok, _) then { expect_fail("auth without a signing key loaded") }
+  }
+}
+
+def test_auth_config_env_key_override() {
+  const base = auth_tmp_base()
+  const path = base + "envkey.yaml"
+  write_file(path, "listen:\n  host: 127.0.0.1\n  port: 5001\ndata_dir: " + base + "data\nauth:\n  enabled: true\n  users:\n    - username: alice\n      password: wonderland\n")
+  const env = Map.new(("POKERFACE_REGISTRY_AUTH_SIGNING_KEY", "env-secret"))
+  case load_config(path, env) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, config) then {
+      expect_equal("env-secret", config.auth.signing_key)
+      expect_equal("http://127.0.0.1:5001/token", config.auth.realm)
+    }
+  }
+}
+
+def test_auth_config_unknown_field_is_refused() {
+  const base = auth_tmp_base()
+  const path = base + "unknown.yaml"
+  write_file(path, "listen:\n  host: 127.0.0.1\n  port: 5001\ndata_dir: " + base + "data\nauth:\n  enabled: false\n  magic: true\n")
+  case load_config(path, Map.new()) {
+    (R.error, why) then { expect_true(why.index_of("auth.magic") >= 0) }
+    (R.ok, _) then { expect_fail("an unknown auth field loaded") }
+  }
+}
+
+def test_the_summary_never_shows_secrets() {
+  const base = auth_tmp_base()
+  const path = base + "summary.yaml"
+  write_file(path, "listen:\n  host: 127.0.0.1\n  port: 5001\ndata_dir: " + base + "data\nauth:\n  enabled: true\n  signing_key: \"topsecret\"\n  users:\n    - username: alice\n      password: wonderland\n")
+  case load_config(path, Map.new()) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, config) then {
+      const text = registry.config.summary(config)
+      expect_true(text.index_of("topsecret") < 0)
+      expect_true(text.index_of("wonderland") < 0)
+      expect_true(text.index_of("auth=enabled") >= 0)
+      expect_true(text.index_of("signing_key=<set>") >= 0)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers shared with the endpoint tests.
+
+def error_field(body String, field String) String {
+  case json.decode(body) {
+    (R.error, _) then { return "" }
+    (R.ok, doc) then { return scan_errors(doc, field) }
+  }
+}
+
+def scan_errors(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == "errors" {
+        if value.is(json.JsonArray) {
+          const items = value.items()
+          if items.length() > 0 {
+            return scan_member(items[0], field)
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+def scan_member(doc json.Json, field String) String {
+  if doc.is(json.JsonObject) {
+    const entries = doc.entries()
+    var i = 0
+    while i < entries.length() {
+      const (key, value) = entries[i]
+      if key == field {
+        if value.is(json.JsonString) {
+          return value.as_string()
+        }
+      }
+      i = i + 1
+    }
+  }
+  return ""
+}
+
+def header_value(headers Array[(String, String)], name String) String {
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    if key.lower() == name.lower() {
+      return value
+    }
+    i = i + 1
+  }
+  return ""
+}

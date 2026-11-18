@@ -311,8 +311,8 @@ def test_the_router_dispatches_blob_routes() {
     registry.config.RegistryStore.new("fs", "/tmp/pf-blobs-router/blobs", registry.config.default_s3()),
     registry.config.RegistryLimits.new(16777216, 1048576, 30, 5),
     "/tmp/pf-blobs-router/shutdown",
-    "<test>"
-  )
+    "<test>",
+    registry.config.default_auth())
   const service = registry.router.Service.new(
     config,
     BlobFakeDb.new(),

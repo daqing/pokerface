@@ -359,7 +359,7 @@ images:
 | [x] | T2.11 | 分块上传与断点续传：PATCH / GET / DELETE | T2.10 | 3h |
 | [x] | T2.12 | Manifest PUT 与 tag 更新 | T2.3、T2.10、T2.11 | 2-3h |
 | [ ] | T2.13 | 解析 / 元数据 API | T2.8、T2.12 | 2h |
-| [ ] | T2.14 | 认证与 Token 服务 | T2.7 | 3-4h |
+| [x] | T2.14 | 认证与 Token 服务 | T2.7 | 3-4h |
 | [ ] | T2.15 | 缓存头、ETag 与 CDN 行为 | T2.8、T2.9 | 2h |
 | [ ] | T2.16 | Tag 列表与分页 | T2.12 | 2h |
 | [ ] | T2.17 | 部署编排：Registry + MinIO + Caddy | T2.6、T2.14 | 3h |
@@ -539,6 +539,8 @@ images:
 **验收**：匿名 pull 被拒绝（若开启认证）；只有 pull scope 不能 push；token 过期后 401；跨仓库访问被拒绝；密码与签名密钥不出现在日志；v0.1 配置文件方式可用。
 
 **依赖**：T2.7 · **预估**：3-4h
+
+> **备注**（2026-11-19，约 3.5h）：已完成。`registry/auth.emo` 实现 Docker 的 Bearer 流程（HS256 JWT）：`GET /v2/` 与所有受保护路由返回 401 + `WWW-Authenticate: Bearer realm="…",service="…",scope="…"[,error="…"]`（realm 默认 `http://<listen>/token`）；`/token` 用 Basic 换取 `{"token","expires_in","issued_at"}`；token 携带 Docker 形态的 `access` 声明（`repository:<name>:pull,push`），路由器里的无状态 gate 校验签名（常数时间）、时间窗（`expired_token`）、签发者与 scope。与 Docker 对齐：认证失败一律 401 带挑战（invalid_token / expired_token / insufficient_scope），客户端可补申请 scope 重试；未知账号与错误密码返回完全相同的 401，比较用常数时间。scope 按空白分隔、逗号连接动作；畸形 scope（坏仓库名、未知动作）返回 400 且不授予任何东西——pull-only token 无法推送（401 insufficient_scope），跨库 token 同样被拒。配置：`auth:` 段（enabled、realm、service、issuer、token_ttl ≥ 60、users、signing_key 或 signing_key_file），严格未知字段检查，`POKERFACE_REGISTRY_AUTH_SIGNING_KEY` / `_AUTH_ENABLED` 环境变量覆盖，密钥文件在加载时读取一次（去尾部换行，内联与文件同设报错），enabled 而缺 key 或 users 是启动错误，摘要打印 `auth=enabled users=<n> signing_key=<set>`——密钥与密码从不进日志（有测试钉死 + 实机 grep）。base64url 用新加的 `base64` 依赖。测试：`test/registry_auth.emo` 新增 25 例（编解码、mint/verify 矩阵、scope 匹配、挑战形态、端点 200/401/400/405、gate 决策含跨库与 pull-only-push、开启认证后的路由挑战、配置段/默认值/env/脱敏）；`emo test` 450/450。**实测：skopeo 全流程可用**——`skopeo login --username alice …` 后 `skopeo copy` 走完挑战/token/推送整个周期；匿名 manifest GET 是 401；签名密钥不出现在服务日志。踩坑：`(R.error, …)` 元组的错误槽静态为 String——gate 不能经错误槽传 Response，因此 `check_token` 返回原因字符串、401 由路由器构建（原因到错误词的映射在 `error_class`）；逗号是单个 scope 内的动作分隔符而非 scope 分隔符（skopeo 实测抓到）；负向 `is()` 守卫不收窄——yaml/json 解析辅助函数经正分支包装接收收窄后的类型。
 
 #### T2.15 缓存头、ETag 与 CDN 行为
 

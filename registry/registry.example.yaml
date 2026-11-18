@@ -38,3 +38,17 @@ limits:
 # Optional; defaults to <data_dir>/registry.shutdown. scripts/run-registry.sh
 # overrides it with POKERFACE_REGISTRY_SHUTDOWN_FILE.
 # shutdown_file: ./data/registry.shutdown
+
+# Bearer-token authentication (T2.14). Disabled by default; when enabled, a
+# signing key and at least one account are required. Secrets can come from
+# files (signing_key_file / password_file) instead of the YAML.
+# auth:
+#   enabled: true
+#   realm: "https://registry.example.com/token"   # default: http://<listen>/token
+#   service: "pokerface-registry"
+#   issuer: "pokerface-registry"
+#   token_ttl: 3600
+#   signing_key_file: /etc/pokerface/signing-key
+#   users:
+#     - username: alice
+#       password_file: /etc/pokerface/alice

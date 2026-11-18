@@ -14,6 +14,10 @@ const default_max_body_bytes = 16777216
 const default_max_header_bytes = 1048576
 const default_read_timeout = 30
 const default_idle_timeout = 5
+const default_token_ttl = 3600
+const min_token_ttl = 60
+const default_auth_service = "pokerface-registry"
+const default_auth_issuer = "pokerface-registry"
 const shutdown_file_name = "registry.shutdown"
 const db_file_name = "registry.db"
 const default_s3_region = "us-east-1"
@@ -67,7 +71,7 @@ def default_s3() S3Settings {
 }
 
 class RegistryConfig {
-  def init(listen RegistryListen, data_dir String, db_path String, store RegistryStore, limits RegistryLimits, shutdown_file String, config_path String) {
+  def init(listen RegistryListen, data_dir String, db_path String, store RegistryStore, limits RegistryLimits, shutdown_file String, config_path String, auth RegistryAuth) {
     self.listen = listen
     self.data_dir = data_dir
     self.db_path = db_path
@@ -75,7 +79,35 @@ class RegistryConfig {
     self.limits = limits
     self.shutdown_file = shutdown_file
     self.config_path = config_path
+    self.auth = auth
   }
+}
+
+// T2.14: Bearer-token authentication. Users and the signing key live in the
+// configuration (D6's pre-shared accounts); `signing_key_file` and a user's
+// `password_file` are read once at load, so the resolved value never names a
+// file and the summary prints only `<set>` markers.
+class AuthUser {
+  def init(username String, password String) {
+    self.username = username
+    self.password = password
+  }
+}
+
+class RegistryAuth {
+  def init(enabled Bool, realm String, service String, issuer String, token_ttl Int64, users Array[AuthUser], signing_key String) {
+    self.enabled = enabled
+    self.realm = realm
+    self.service = service
+    self.issuer = issuer
+    self.token_ttl = token_ttl
+    self.users = users
+    self.signing_key = signing_key
+  }
+}
+
+def default_auth() RegistryAuth {
+  return RegistryAuth.new(false, "", default_auth_service, default_auth_issuer, default_token_ttl, [], "")
 }
 
 def cfg_error(path String, message String) String {
@@ -90,7 +122,8 @@ def defaults(config_path String) RegistryConfig {
     RegistryStore.new(default_store_backend, default_store_root, default_s3()),
     RegistryLimits.new(default_max_body_bytes, default_max_header_bytes, default_read_timeout, default_idle_timeout),
     "",
-    config_path
+    config_path,
+    default_auth()
   )
 }
 
@@ -182,8 +215,14 @@ def from_yaml(doc yaml.Yaml, path String) (R, RegistryConfig) {
             (R.ok, text) then { config = with_shutdown_file(config, text) }
           }
         }
+        "auth" then {
+          case parse_auth(value, path) {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, auth) then { config = with_auth(config, auth) }
+          }
+        }
         _ then {
-          return (R.error, cfg_error(path, key + ": unknown field (known: listen, data_dir, db_path, store, limits, shutdown_file)"))
+          return (R.error, cfg_error(path, key + ": unknown field (known: listen, data_dir, db_path, store, limits, shutdown_file, auth)"))
         }
       }
       i = i + 1
@@ -628,7 +667,27 @@ def apply_env(config RegistryConfig, env src.settings.EnvSource) (R, RegistryCon
     }
     (R.error, _) then { }
   }
-  const merged = RegistryConfig.new(listen, data_dir, db_path, store, limits, shutdown_file, config.config_path)
+  var auth = config.auth
+  case env.getenv("POKERFACE_REGISTRY_AUTH_SIGNING_KEY") {
+    (R.ok, v) then {
+      if v != "" {
+        auth = RegistryAuth.new(auth.enabled, auth.realm, auth.service, auth.issuer, auth.token_ttl, auth.users, v)
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_AUTH_ENABLED") {
+    (R.ok, v) then {
+      if v != "" {
+        case parse_bool_env("POKERFACE_REGISTRY_AUTH_ENABLED", v) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, b) then { auth = RegistryAuth.new(b, auth.realm, auth.service, auth.issuer, auth.token_ttl, auth.users, auth.signing_key) }
+        }
+      }
+    }
+    (R.error, _) then { }
+  }
+  const merged = RegistryConfig.new(listen, data_dir, db_path, store, limits, shutdown_file, config.config_path, auth)
   return validate(merged)
 }
 
@@ -715,6 +774,21 @@ def validate(config RegistryConfig) (R, RegistryConfig) {
   if config.limits.idle_timeout < 0 {
     return (R.error, cfg_error(config.config_path, "limits.idle_timeout: must not be negative"))
   }
+  if config.auth.enabled {
+    if config.auth.signing_key == "" {
+      return (R.error, cfg_error(config.config_path, "auth.signing_key: must not be empty when auth is enabled (set auth.signing_key, auth.signing_key_file, or POKERFACE_REGISTRY_AUTH_SIGNING_KEY)"))
+    }
+    if config.auth.users.length() == 0 {
+      return (R.error, cfg_error(config.config_path, "auth.users: at least one account is required when auth is enabled"))
+    }
+    if config.auth.token_ttl < min_token_ttl {
+      return (R.error, cfg_error(config.config_path, "auth.token_ttl: must be at least " + min_token_ttl.to_string() + " seconds"))
+    }
+  }
+  var realm = config.auth.realm
+  if realm == "" {
+    realm = "http://" + config.listen.host + ":" + config.listen.port.to_string() + "/token"
+  }
   var shutdown_file = config.shutdown_file
   if shutdown_file == "" {
     shutdown_file = config.data_dir + "/" + shutdown_file_name
@@ -723,7 +797,196 @@ def validate(config RegistryConfig) (R, RegistryConfig) {
   if db_path == "" {
     db_path = config.data_dir + "/" + db_file_name
   }
-  return (R.ok, RegistryConfig.new(config.listen, config.data_dir, db_path, config.store, config.limits, shutdown_file, config.config_path))
+  var auth = config.auth
+  if realm != config.auth.realm {
+    auth = RegistryAuth.new(config.auth.enabled, realm, config.auth.service, config.auth.issuer, config.auth.token_ttl, config.auth.users, config.auth.signing_key)
+  }
+  return (R.ok, RegistryConfig.new(config.listen, config.data_dir, db_path, config.store, config.limits, shutdown_file, config.config_path, auth))
+}
+
+// The auth section: strict fields, the users list, and secret-file reads.
+// Files are read here, once: the config the service carries holds resolved
+// secrets, and nothing re-reads a file per request.
+def parse_auth(value yaml.Yaml, path String) (R, RegistryAuth) {
+  if value.is(yaml.YamlObject) {
+    return parse_auth_object(value, path)
+  }
+  return (R.error, cfg_error(path, "auth: expected a mapping"))
+}
+
+def parse_auth_object(value yaml.YamlObject, path String) (R, RegistryAuth) {
+  var enabled = false
+  var realm = ""
+  var service = default_auth_service
+  var issuer = default_auth_issuer
+  var token_ttl = default_token_ttl
+  var users = []
+  var signing_key = ""
+  var signing_key_file = ""
+  const entries = value.entries()
+  var i = 0
+  while i < entries.length() {
+    const (key, v) = entries[i]
+    case key {
+      "enabled" then {
+        case bool_value(v, path, "auth.enabled") {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, b) then { enabled = b }
+        }
+      }
+      "realm" then {
+        case string_value(v, path, "auth.realm") {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, text) then { realm = text }
+        }
+      }
+      "service" then {
+        case string_value(v, path, "auth.service") {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, text) then { service = text }
+        }
+      }
+      "issuer" then {
+        case string_value(v, path, "auth.issuer") {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, text) then { issuer = text }
+        }
+      }
+      "token_ttl" then {
+        case int_value(v, path, "auth.token_ttl") {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, n) then { token_ttl = n }
+        }
+      }
+      "signing_key" then {
+        case string_value(v, path, "auth.signing_key") {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, text) then { signing_key = text }
+        }
+      }
+      "signing_key_file" then {
+        case string_value(v, path, "auth.signing_key_file") {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, p) then { signing_key_file = p }
+        }
+      }
+      "users" then {
+        case parse_auth_users(v, path) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, list) then { users = list }
+        }
+      }
+      _ then {
+        return (R.error, cfg_error(path, "auth." + key + ": unknown field (known: enabled, realm, service, issuer, token_ttl, users, signing_key, signing_key_file)"))
+      }
+    }
+    i = i + 1
+  }
+  if signing_key_file != "" {
+    if signing_key != "" {
+      return (R.error, cfg_error(path, "auth.signing_key and auth.signing_key_file: set one, not both"))
+    }
+    case file.read(signing_key_file) {
+      (R.error, why) then { return (R.error, cfg_error(path, "auth.signing_key_file: cannot read " + signing_key_file + ": " + why)) }
+      (R.ok, text) then { signing_key = trim_secret(text) }
+    }
+  }
+  return (R.ok, RegistryAuth.new(enabled, realm, service, issuer, token_ttl, users, signing_key))
+}
+
+def parse_auth_users(value yaml.Yaml, path String) (R, Array[AuthUser]) {
+  if value.is(yaml.YamlArray) {
+    return parse_auth_user_list(value, path)
+  }
+  return (R.error, cfg_error(path, "auth.users: expected a list"))
+}
+
+def parse_auth_user_list(value yaml.YamlArray, path String) (R, Array[AuthUser]) {
+  var users = []
+  const items = value.items()
+  var i = 0
+  while i < items.length() {
+    const item = items[i]
+    if item.is(yaml.YamlObject) {
+      case parse_auth_user(item, path, i) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, user) then { users = users.append(user) }
+      }
+    } else {
+      return (R.error, cfg_error(path, "auth.users[" + i.to_string() + "]: expected a mapping"))
+    }
+    i = i + 1
+  }
+  return (R.ok, users)
+}
+
+def parse_auth_user(item yaml.YamlObject, path String, index Int64) (R, AuthUser) {
+  var username = ""
+  var password = ""
+  var password_file = ""
+  const fields = item.entries()
+    var j = 0
+    while j < fields.length() {
+      const (key, v) = fields[j]
+      case key {
+        "username" then {
+          case string_value(v, path, "auth.users[" + index.to_string() + "].username") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { username = text }
+          }
+        }
+        "password" then {
+          case string_value(v, path, "auth.users[" + index.to_string() + "].password") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, text) then { password = text }
+          }
+        }
+        "password_file" then {
+          case string_value(v, path, "auth.users[" + index.to_string() + "].password_file") {
+            (R.error, why) then { return (R.error, why) }
+            (R.ok, p) then { password_file = p }
+          }
+        }
+        _ then {
+          return (R.error, cfg_error(path, "auth.users[" + index.to_string() + "]." + key + ": unknown field (known: username, password, password_file)"))
+        }
+      }
+      j = j + 1
+    }
+    if username == "" {
+      return (R.error, cfg_error(path, "auth.users[" + index.to_string() + "].username: must not be empty"))
+    }
+    if password != "" && password_file != "" {
+      return (R.error, cfg_error(path, "auth.users[" + index.to_string() + "]: password and password_file: set one, not both"))
+    }
+    if password_file != "" {
+      case file.read(password_file) {
+        (R.error, why) then { return (R.error, cfg_error(path, "auth.users[" + index.to_string() + "].password_file: cannot read " + password_file + ": " + why)) }
+        (R.ok, text) then { password = trim_secret(text) }
+      }
+    }
+  if password == "" {
+    return (R.error, cfg_error(path, "auth.users[" + index.to_string() + "]: password or password_file is required"))
+  }
+  return (R.ok, AuthUser.new(username, password))
+}
+
+// A secret file's trailing newline is never part of the secret.
+def trim_secret(text String) String {
+  var out = text
+  while out.length() > 0 {
+    const last = out.substring(out.length() - 1, 1)
+    if last == "\n" || last == "\r" {
+      out = out.substring(0, out.length() - 1)
+    } else {
+      return out
+    }
+  }
+  return out
+}
+
+def with_auth(config RegistryConfig, auth RegistryAuth) RegistryConfig {
+  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path, auth)
 }
 
 def validate_s3(s3 S3Settings, path String) (R, Bool) {
@@ -775,27 +1038,27 @@ def in_array(items Array[String], wanted String) Bool {
 
 // Small rebuilders keep RegistryConfig immutable without a mutable builder.
 def with_listen(config RegistryConfig, listen RegistryListen) RegistryConfig {
-  return RegistryConfig.new(listen, config.data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path)
+  return RegistryConfig.new(listen, config.data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path, config.auth)
 }
 
 def with_data_dir(config RegistryConfig, data_dir String) RegistryConfig {
-  return RegistryConfig.new(config.listen, data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path)
+  return RegistryConfig.new(config.listen, data_dir, config.db_path, config.store, config.limits, config.shutdown_file, config.config_path, config.auth)
 }
 
 def with_db_path(config RegistryConfig, db_path String) RegistryConfig {
-  return RegistryConfig.new(config.listen, config.data_dir, db_path, config.store, config.limits, config.shutdown_file, config.config_path)
+  return RegistryConfig.new(config.listen, config.data_dir, db_path, config.store, config.limits, config.shutdown_file, config.config_path, config.auth)
 }
 
 def with_store(config RegistryConfig, store RegistryStore) RegistryConfig {
-  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, store, config.limits, config.shutdown_file, config.config_path)
+  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, store, config.limits, config.shutdown_file, config.config_path, config.auth)
 }
 
 def with_limits(config RegistryConfig, limits RegistryLimits) RegistryConfig {
-  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, limits, config.shutdown_file, config.config_path)
+  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, limits, config.shutdown_file, config.config_path, config.auth)
 }
 
 def with_shutdown_file(config RegistryConfig, shutdown_file String) RegistryConfig {
-  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, config.limits, shutdown_file, config.config_path)
+  return RegistryConfig.new(config.listen, config.data_dir, config.db_path, config.store, config.limits, shutdown_file, config.config_path, config.auth)
 }
 
 // Never renders the S3 secret (or the access key id) — the summary goes to
@@ -811,6 +1074,20 @@ def store_summary(store RegistryStore) String {
   return "fs:" + store.root
 }
 
+// Never renders the S3 secret (or the access key id) — the summary goes to
+// the service log at start-up. The auth line names only whether auth is on
+// and how many accounts exist; passwords and the signing key never appear.
+def auth_summary(auth RegistryAuth) String {
+  if auth.enabled {
+    var users = "users=" + auth.users.length().to_string()
+    if auth.users.length() == 0 {
+      users = "users=none"
+    }
+    return "enabled " + users + " ttl=" + auth.token_ttl.to_string() + " signing_key=<set>"
+  }
+  return "disabled"
+}
+
 def summary(config RegistryConfig) String {
   return (
     "registry: listen=" + config.listen.host + ":" + config.listen.port.to_string()
@@ -822,5 +1099,6 @@ def summary(config RegistryConfig) String {
     + " read_timeout=" + config.limits.read_timeout.to_string()
     + " idle_timeout=" + config.limits.idle_timeout.to_string()
     + " shutdown_file=" + config.shutdown_file
+    + " auth=" + auth_summary(config.auth)
   )
 }
