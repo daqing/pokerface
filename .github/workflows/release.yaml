@@ -1,0 +1,91 @@
+# The release workflow (T4.7): a v* tag builds the CLI and the registry for
+# the four release platforms, publishes the tarballs with a checksums.txt,
+# and cuts the GitHub Release the install script (install.sh) downloads
+# from. Each platform builds natively on its runner — no cross-compilation,
+# no emulation.
+#
+# The Emo toolchain step is the heavy one (opam pins the compiler from the
+# emo-lang repository); when a published builder image lands, this step
+# becomes one `docker run` — the same caveat deploy/Dockerfile records
+# (T2.17).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # the release itself is the only write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, platform: linux-amd64 }
+          - { os: ubuntu-24.04-arm, platform: linux-arm64 }
+          - { os: macos-latest, platform: darwin-arm64 }
+          - { os: macos-13, platform: darwin-amd64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Emo toolchain
+        run: |
+          opam init --auto-setup --disable-sandboxing -y
+          opam pin add emo.dev git+https://github.com/emo-lang/emo.git#main --yes
+          opam install emo.dev --yes
+          opam exec -- emo version
+
+      - name: Install libsqlite3 (the registry links it)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - name: Install libsqlite3 (the registry links it)
+        if: runner.os == 'macOS'
+        run: |
+          brew install sqlite
+          echo "PKG_CONFIG_PATH=$(brew --prefix sqlite)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: opam exec -- sh -c 'emo build -o pokerface main.emo && emo build -o registry registry/main.emo'
+
+      - name: Package
+        run: |
+          tar -czf "pokerface-${{ matrix.platform }}.tar.gz" pokerface registry
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "pokerface-${{ matrix.platform }}.tar.gz" > "pokerface-${{ matrix.platform }}.sha256"
+          else
+            shasum -a 256 "pokerface-${{ matrix.platform }}.tar.gz" > "pokerface-${{ matrix.platform }}.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pokerface-${{ matrix.platform }}
+          path: |
+            pokerface-${{ matrix.platform }}.tar.gz
+            pokerface-${{ matrix.platform }}.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Combine the checksums
+        working-directory: dist
+        run: cat *.sha256 > checksums.txt
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "pokerface $GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag \
+            dist/*

@@ -628,7 +628,7 @@ Exit criteria:
 | [x] | T4.4 | Generate and write back the lock file | T4.3 | 2h |
 | [x] | T4.5 | Build trigger and versioning strategy ADR | none | 1h |
 | [x] | T4.6 | CI template: GitHub Actions first | T4.3, T4.4 | 3h |
-| [ ] | T4.7 | Install script and release workflow | T1.1 | 3h |
+| [x] | T4.7 | Install script and release workflow | T1.1 | 3h |
 | [ ] | T4.8 | Docs site skeleton and navigation | T4.5 | 2-3h |
 | [ ] | T4.9 | Quick start and installation guide | T4.7, T4.8 | 2h |
 | [ ] | T4.10 | CLI and configuration reference | T1.1, T1.8 | 2h |
@@ -723,6 +723,8 @@ Exit criteria:
 **Acceptance**: `curl ... | sh` installs successfully in a clean container; `pokerface version` matches the release; a checksum mismatch aborts installation; the script uses safe temp-file permissions.
 
 **Depends on**: T1.1 · **Estimate**: 3h
+
+> **Notes** (2026-11-20, ~2h): Done. `install.sh` (repo root, POSIX sh — the acceptance's `curl … | sh` runs under dash too): OS/arch detection maps to the release matrix (darwin/linux × amd64/arm64), downloads `pokerface-<platform>.tar.gz` + `checksums.txt` from the GitHub release (version = `POKERFACE_VERSION` pin or the latest-release redirect — no API, no rate limit), **verifies the sha256 before writing anything** (mismatch → exit 1, nothing installed), installs 0755 binaries into `~/.local/bin` (`POKERFACE_INSTALL_DIR` override), prints the PATH hint without ever touching shell config, and artifacts pass through a `mktemp -d` directory chmod'd 700 with an EXIT trap. Overrides: version, install dir, and `POKERFACE_DOWNLOAD_BASE` (mirrors — also how the script was tested without a release). `.github/workflows/release.yaml` cuts a release per `v*` tag: four runners build NATIVELY (ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-13 — no cross-compilation, no emulation), package `pokerface + registry` per platform with per-platform `.sha256` and a combined `checksums.txt`, and `gh release create --verify-tag --generate-notes` publishes them. The heavy step is the Emo toolchain (opam pin of the compiler repo) with the same honest caveat as deploy/Dockerfile: a published builder image will turn it into one `docker run`. macOS/Linux runners get libsqlite3 for the registry binary (the CLI links nothing beyond libc). Both workflows pass actionlint v1.7.7. **Verified on the host**: a fake release served over `file://` (real binaries, real tarball, real checksums) — the happy path installs both binaries 0755 and `pokerface version` answers `0.1.0`; a corrupted artifact against the ORIGINAL checksums aborts with exit 1 and installs nothing (the first mismatch test was self-defeating — I regenerated the checksums from the corrupted file — redone properly). `docs/install.md` covers the one-liner, the overrides table, manual verification, the release pipeline, and building from source. Version note for the record: the binary's `version` string is the T1.1 constant (`0.1.0`), so tag↔binary drift is possible until version injection lands — a follow-up candidate for T4.16's release checklist.
 
 #### T4.8 Docs Site Skeleton and Navigation
 

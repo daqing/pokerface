@@ -628,7 +628,7 @@ images:
 | [x] | T4.4 | lock 文件生成与写回 | T4.3 | 2h |
 | [x] | T4.5 | 构建触发与版本策略 ADR | 无 | 1h |
 | [x] | T4.6 | CI 模板：GitHub Actions 为主 | T4.3、T4.4 | 3h |
-| [ ] | T4.7 | 安装脚本与发布工作流 | T1.1 | 3h |
+| [x] | T4.7 | 安装脚本与发布工作流 | T1.1 | 3h |
 | [ ] | T4.8 | 文档站骨架与导航 | T4.5 | 2-3h |
 | [ ] | T4.9 | 快速开始与安装文档 | T4.7、T4.8 | 2h |
 | [ ] | T4.10 | CLI 与配置参考 | T1.1、T1.8 | 2h |
@@ -723,6 +723,8 @@ images:
 **验收**：干净容器中 `curl ... | sh` 安装成功；`pokerface version` 与发布版本一致；checksum 不匹配时拒绝安装；脚本不使用不安全的临时文件权限。
 
 **依赖**：T1.1 · **预估**：3h
+
+> **笔记**（2026-11-20，约 2h）：完成。`install.sh`（仓库根，POSIX sh——验收的 `curl … | sh` 在 dash 下也能跑）：OS/架构检测映射到发布矩阵（darwin/linux × amd64/arm64），从 GitHub release 下载 `pokerface-<platform>.tar.gz` + `checksums.txt`（版本 = `POKERFACE_VERSION` 钉住，或 latest-release 重定向——不走 API、无速率限制），**写任何东西之前先校验 sha256**（不符 → 退出码 1，什么都不安装），把 0755 的二进制装进 `~/.local/bin`（`POKERFACE_INSTALL_DIR` 可覆盖），打印 PATH 提示但绝不改 shell 配置，产物只经过一个 chmod 700 的 `mktemp -d` 目录并带 EXIT trap。可覆盖项：版本、安装目录、`POKERFACE_DOWNLOAD_BASE`（镜像站——也是没有真实 release 时测试脚本的入口）。`.github/workflows/release.yaml` 在每个 `v*` tag 上发版：四个 runner **原生**构建（ubuntu-latest、ubuntu-24.04-arm、macos-latest、macos-13——不交叉编译、不模拟），按平台打包 `pokerface + registry` 并附各平台 `.sha256` 与合并的 `checksums.txt`，`gh release create --verify-tag --generate-notes` 发布。最重的一步是 Emo 工具链（opam 钉编译器仓库），与 deploy/Dockerfile 同款如实注明：builder 镜像发布后会变成一条 `docker run`。macOS/Linux runner 为 registry 二进制装 libsqlite3（CLI 只链 libc）。两个工作流都过 actionlint v1.7.7。**主机上验证**：`file://` 供给的假 release（真实二进制、真实 tar、真实校验和）——快乐路径安装两个 0755 二进制且 `pokerface version` 回答 `0.1.0`；损坏的产物对原始校验和以退出码 1 中止且零安装（第一次失配测试是自证循环——我给损坏文件重新生成了校验和——已用正确方式重做）。`docs/install.md` 覆盖一行安装、覆盖项表、手工校验、发布管线与源码构建。版本备注：二进制的 `version` 字符串是 T1.1 的常量（`0.1.0`），tag↔二进制可能漂移——版本号注入是 T4.16 发布清单的候选跟进项。
 
 #### T4.8 文档站骨架与导航
 
