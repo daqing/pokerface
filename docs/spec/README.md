@@ -1,7 +1,9 @@
 # Specification Index
 
 > The client's v0.1 contracts (M1, complete), the server side (M2,
-> complete), and M4 (build and delivery) as it lands.
+> complete), and M4 (build and delivery) as it lands. Decision records live
+> in `docs/adr/` — [0001-build-trigger.md](../adr/0001-build-trigger.md)
+> records the v0.1 build triggers and the versioning policy (D7).
 
 | Spec | Covers | Implemented by |
 

@@ -626,7 +626,7 @@ Exit criteria:
 | [x] | T4.2 | BuildKit / podman build adapter | T4.1 | 3-4h |
 | [x] | T4.3 | Registry push: blobs + manifest | T1.10, T2.12, T4.2 | 3h |
 | [x] | T4.4 | Generate and write back the lock file | T4.3 | 2h |
-| [ ] | T4.5 | Build trigger and versioning strategy ADR | none | 1h |
+| [x] | T4.5 | Build trigger and versioning strategy ADR | none | 1h |
 | [ ] | T4.6 | CI template: GitHub Actions first | T4.3, T4.4 | 3h |
 | [ ] | T4.7 | Install script and release workflow | T1.1 | 3h |
 | [ ] | T4.8 | Docs site skeleton and navigation | T4.5 | 2-3h |
@@ -699,6 +699,8 @@ Exit criteria:
 **Acceptance**: The ADR records the context, alternatives, and trade-offs; CI templates follow the tag rules; the document explicitly defers polling / self-hosted webhooks to a later version.
 
 **Depends on**: none · **Estimate**: 1h
+
+> **Notes** (2026-11-20, ~1h): Done. `docs/adr/0001-build-trigger.md` records D7 with the standard ADR shape (context, decision, alternatives, consequences, deferred). **Triggers**: exactly three CI events — branch push, tag push, `workflow_dispatch`; each mapped to the Git facts the T4.1 renderer consumes. **Tag rules**: every build gets `sha-{{ commit.short }}`; the default branch gets `latest`; `{{ branch }}` only for branch names surviving the OCI charset (`feat/x` fails the renderer loudly — documented, not mangled); Git tags verbatim; `{{ version }}` derives from `git describe --tags --abbrev=0`. **Semver policy**: `vX.Y.Z` pushed verbatim; floating convenience tags (`1.2`, `1`, semver-driven `latest`) are explicitly DEFERRED — they are registry-mutation policy with real blast radius and deserve their own ADR. **Versioning policy** (a dedicated section): version = newest reachable tag, release discipline = tag → push → tag-triggered build → lock, the lock is the source of truth for what a tag meant at a commit, rebuilds are new builds (buildx stamps `created`). **Rejected**: the self-hosted webhook service (a second always-on service duplicating CI machinery — revisited only for sub-minute builds without CI) and polling (wasted builds, rate limits, latency, buys nothing). **Consequences stated**: no build queue/log/status in v0.1 — resolve answers *what was built*, never *what is building*; the contract is pure Git, so any CI that runs a binary on a checkout works with nothing installed server-side. The versioning policy lives as the ADR's dedicated section (T4.11 folds it into the spec set). Docs only — no code paths change; `emo test` 525/525 unchanged, spec index links the ADR.
 
 #### T4.6 CI Template: GitHub Actions First
 
