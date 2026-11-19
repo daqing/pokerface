@@ -636,7 +636,7 @@ Exit criteria:
 | [x] | T4.12 | Registry operations guide | T2.17 | 3h |
 | [x] | T4.13 | Example application | T4.2, T4.3 | 3h |
 | [x] | T4.14 | End-to-end demo script | T4.3, T4.13, T1.14 | 3h |
-| [ ] | T4.15 | Failure fallback and troubleshooting matrix | T1.14, T2.19 | 2h |
+| [x] | T4.15 | Failure fallback and troubleshooting matrix | T1.14, T2.19 | 2h |
 | [ ] | T4.16 | README, Chinese edition, and release checklist | T4.8-T4.15 | 2h |
 | [ ] | T4.17 | CI end-to-end regression | T4.14 | 3h |
 
@@ -819,6 +819,8 @@ Exit criteria:
 **Acceptance**: Every scenario has four sections: symptom / cause / handling / verification; documented behavior matches the implementation; offline mode and cache cleanup steps are included.
 
 **Depends on**: T1.14, T2.19 · **Estimate**: 2h
+
+> **Notes** (2026-11-20, ~1.5h): Done. `docs/troubleshooting.md` — thirteen scenarios, each with the required **symptom / cause / handling / verification** sections, headed by a symptom→exit→scenario table. Beyond the README fallbacks the task names (Git failure, manifest failure, CDN failure, digest mismatch, runtime import, cache corruption), it covers what M4 actually taught: no build tool (8), build failure surfacing buildx's log (1), tag rendering/collisions (4), the lock write-back rules (missing origin, unparseable existing lock), authentication with the scope dance and the Basic-credentials boundary, **large transfers** (the 64 KiB socket-write limitation with the window protocol and the honest note that plain GETs of big blobs stay broken for other clients until the runtime fix lands), and **stopping the registry** (the marker protocol; SIGTERM ignored by design; the orphaned-process SIGKILL case from T4.14's cleanup). Offline mode and cache cleanup get their own handling entries (`--offline` needs a complete cache; verify repairs by default, rm resets). Every verification line cites the pinning test or executed run — documented behavior matches the implementation by construction (each scenario was written from an observation made this session, not from imagination). Site nav gained Troubleshooting; rebuild 45 pages, links ok.
 
 #### T4.16 README, Chinese Edition, and Release Checklist
 

@@ -56,6 +56,7 @@ SECTIONS = [
         ("registry/deployment.md", "Deployment"),
     ]),
     ("Project", [
+        ("troubleshooting.md", "Troubleshooting"),
         ("adr/0001-build-trigger.md", "ADR 0001: build triggers"),
         ("ci/gitlab-ci.md", "GitLab CI"),
         ("ci/gitea-actions.md", "Gitea Actions"),
