@@ -364,7 +364,7 @@ Exit criteria:
 | [x] | T2.16 | Tag listing and pagination | T2.12 | 2h |
 | [x] | T2.17 | Deployment: registry + MinIO + Caddy | T2.6, T2.14 | 3h |
 | [x] | T2.18 | Observability and audit logging | T2.1 | 2-3h |
-| [ ] | T2.19 | Protocol smoke and conformance tests | T2.1-T2.18 | 3h |
+| [x] | T2.19 | Protocol smoke and conformance tests | T2.1-T2.18 | 3h |
 
 ### 5.3 Task Details
 
@@ -601,6 +601,8 @@ Suggested tables:
 **Acceptance**: The script starts compose from a clean environment, completes push / pull / verification, and cleans up; failures emit actionable logs; it does not contact Docker Hub; it covers 401, 404, and digest-mismatch paths.
 
 **Depends on**: T2.1-T2.18 · **Estimate**: 3h
+
+> **Notes** (2026-11-19, ~3h): Done. `scripts/e2e-m2.sh` drives the REAL registry service (fs backend, fresh temp dir per run, 127.0.0.1 only — nothing contacts Docker Hub): skopeo pushes an image assembled from `test/fixtures/oci`, the manifest read-back by tag compares `Docker-Content-Digest` AND the exact bytes, the tags list asserts the lexical order and the exact `Link` header, `/api/v1/resolve` answers digest + platform, blob caching asserts the digest ETag, the immutable policy, and the 304, the negative set covers unknown tag/blob (404) and a digest-mismatch push (400), the pokerface CLI resolves from a local Git lock and pulls into the detected container runtime, and the auth leg restarts the registry with auth enabled — anonymous reads challenged, `skopeo login` + push succeed, a pull-only token cannot push (`insufficient_scope` in the challenge). Verified twice consecutively (re-runnable), zero residual processes or temp dirs, and `e2e-m1.sh` still passes alongside. Gotchas that cost real time: the server ignores SIGTERM by design, so a stop-by-signal hangs the runner forever — stop through the shutdown marker (the entrypoint's protocol); `curl -f` turns the EXPECTED 401 challenges into exit 22 under `set -e` (capture headers without `-f`); wire headers end CRLF, so grep line anchors need a CR strip first; the c runtime's idle worker processes hold pipes open — run this script redirected to a file, never piped (documented in the header).
 
 ## 6. M4: Build, CI, and Delivery
 

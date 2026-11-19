@@ -364,7 +364,7 @@ images:
 | [x] | T2.16 | Tag 列表与分页 | T2.12 | 2h |
 | [x] | T2.17 | 部署编排：Registry + MinIO + Caddy | T2.6、T2.14 | 3h |
 | [ ] | T2.18 | 可观测性与审计 | T2.1 | 2-3h |
-| [ ] | T2.19 | 协议冒烟与一致性测试 | T2.1-T2.18 | 3h |
+| [x] | T2.19 | 协议冒烟与一致性测试 | T2.1-T2.18 | 3h |
 
 ### 5.3 任务详情
 
@@ -601,6 +601,8 @@ images:
 **验收**：脚本从干净环境启动 compose、完成 push / pull / 校验并清理；失败时输出可定位的日志；不访问 Docker Hub；覆盖 401、404、digest 不匹配等错误路径。
 
 **依赖**：T2.1-T2.18 · **预估**：3h
+
+> **备注**（2026-11-19，约 3h）：已完成。`scripts/e2e-m2.sh` 驱动**真实** registry 服务（fs 后端，每次运行全新临时目录，仅 127.0.0.1——不接触 Docker Hub）：skopeo 推送由 `test/fixtures/oci` 组装的镜像，按 tag 的 manifest 回读同时校验 `Docker-Content-Digest` 与**字节级一致**，tags list 断言字典序与精确的 `Link` 头，`/api/v1/resolve` 应答 digest + 平台，blob 缓存断言 digest ETag、immutable 策略与 304，负向集合覆盖未知 tag/blob（404）与 digest 不匹配推送（400），pokerface CLI 从本地 Git lock 解析并拉取导入到检测到的容器运行时，认证环节以开启认证的实例重启 registry——匿名读取被挑战、`skopeo login` + 推送成功、pull-only token 无法推送（挑战中带 `insufficient_scope`）。连续验证两遍（可重复），零残留进程与临时目录，`e2e-m1.sh` 并行通过。耗时较长的踩坑：服务器按设计忽略 SIGTERM，以信号停止会让运行器永远挂起——要走 shutdown 标记（entrypoint 的协议）；`curl -f` 把预期中的 401 挑战在 `set -e` 下变成 exit 22（抓响应头时不带 `-f`）；线上头以 CRLF 结尾，grep 行锚点需先去 CR；c 运行时的空闲 worker 进程持有管道——本脚本必须重定向到文件运行、绝不接管道（已写进文件头注释）。
 
 ## 6. M4：构建、CI 与交付
 

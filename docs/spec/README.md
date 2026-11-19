@@ -4,6 +4,9 @@
 > (M2, in progress).
 
 | Spec | Covers | Implemented by |
+
+> M2 (the Distribution MVP) is complete: T2.1–T2.19. The service starts from
+> `deploy/` with Compose, and `scripts/e2e-m2.sh` is the end-to-end smoke.
 | --- | --- | --- |
 | [pokerface-yaml.md](pokerface-yaml.md) | The build input committed with the app: image, tags, platforms, builder. | `src/config.emo` |
 | [pokerface-lock.md](pokerface-lock.md) | The metadata CI writes back: `commit → image → digest` chain. | `src/lockfile.emo` |
