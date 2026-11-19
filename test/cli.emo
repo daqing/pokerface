@@ -100,3 +100,32 @@ def test_help_text_names_all_global_flags() {
   expect_true(text.index_of("--verbose") >= 0)
   expect_true(text.index_of("--json") >= 0)
 }
+
+// T4.10: the help-text snapshot. These assertions pin the command and flag
+// surface that docs/reference/cli.md documents — when one fails, update the
+// reference page in the same change, so the docs cannot drift from --help.
+def test_help_text_snapshot_matches_the_reference() {
+  const text = cli.help_text()
+  // Every routed command, in the help's own order.
+  const commands = ["resolve", "pull", "build", "config", "cache", "version"]
+  var i = 0
+  var at = 0
+  while i < commands.length() {
+    const found = text.index_of("  " + commands[i] + " ")
+    expect_true(found >= at)
+    at = found
+    i = i + 1
+  }
+  // The build command's own option surface.
+  expect_true(text.index_of("Build and push the image described by pokerface.yaml") >= 0)
+  // The global flags, each present exactly once in the flag list.
+  const flags = ["--config <path>", "--verbose", "--json", "--help"]
+  i = 0
+  while i < flags.length() {
+    expect_true(text.index_of(flags[i]) >= 0)
+    i = i + 1
+  }
+  expect_true(text.index_of("-h, --help") >= 0)
+  // The help no longer promises unimplemented commands.
+  expect_true(text.index_of("not implemented yet") >= 0)
+}

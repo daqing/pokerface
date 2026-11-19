@@ -32,8 +32,9 @@ SECTIONS = [
         ("ci/github-actions.md", "Publishing with CI"),
     ]),
     ("Reference", [
-        ("cli.md", "CLI reference"),
-        ("spec/config.md", "Client configuration"),
+        ("reference/cli.md", "CLI reference"),
+        ("reference/config.md", "Client configuration"),
+        ("spec/config.md", "Config precedence spec"),
     ]),
     ("Specifications", [
         ("spec/README.md", "Spec index"),

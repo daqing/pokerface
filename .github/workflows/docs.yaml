@@ -9,7 +9,7 @@ name: docs
 on:
   push:
     branches: [main]
-    paths: ["docs/**", "docs-site/**"]
+    paths: ["docs/**", "docs-site/**", "src/cli.emo"]
   workflow_dispatch:
 
 permissions:
@@ -30,6 +30,16 @@ jobs:
           python-version: "3.12"
       - name: Install the renderer
         run: pip install markdown
+      - name: Warn when the routed commands drifted from the CLI reference
+        run: |
+          # The route table in src/cli.emo vs the reference's command list
+          # (test/cli.emo's snapshot pins the same surface for emo test).
+          routed="$(grep -oE '^    "[a-z]+" then \{ return' src/cli.emo | grep -oE '"[a-z]+"' | tr -d '"' | sort -u || true)"
+          documented="$(grep -E '^\| [a-z]+ \|' docs/reference/cli.md | awk -F'|' '{print $2}' | tr -d ' ' | sort -u || true)"
+          drift="$(comm -23 <(echo "$routed") <(echo "$documented") | tr '\n' ' ')"
+          if [ -n "$drift" ]; then
+            echo "::warning file=docs/reference/cli.md::routed commands missing from the CLI reference: $drift"
+          fi
       - name: Build the site (fails on dead links)
         run: python3 docs-site/build.py
       - uses: actions/upload-pages-artifact@v3

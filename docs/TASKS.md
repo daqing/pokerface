@@ -631,7 +631,7 @@ Exit criteria:
 | [x] | T4.7 | Install script and release workflow | T1.1 | 3h |
 | [x] | T4.8 | Docs site skeleton and navigation | T4.5 | 2-3h |
 | [x] | T4.9 | Quick start and installation guide | T4.7, T4.8 | 2h |
-| [ ] | T4.10 | CLI and configuration reference | T1.1, T1.8 | 2h |
+| [x] | T4.10 | CLI and configuration reference | T1.1, T1.8 | 2h |
 | [ ] | T4.11 | YAML / lock / metadata specification | T1.4, T1.5 | 3h |
 | [ ] | T4.12 | Registry operations guide | T2.17 | 3h |
 | [ ] | T4.13 | Example application | T4.2, T4.3 | 3h |
@@ -759,6 +759,8 @@ Exit criteria:
 **Acceptance**: Docs cover every command; defaults are accurate; exit codes match `docs/spec/errors.md`; CI warns when help text changes without a docs update.
 
 **Depends on**: T1.1, T1.8 · **Estimate**: 2h
+
+> **Notes** (2026-11-20, ~2h): Done. `docs/reference/cli.md` documents the whole surface — commands (build now IMPLEMENTED with its four options and the T4.1–T4.4 chain; config honestly a stub), global flags (with the --config-means-the-build-file warning for build), the exit-code table matching docs/spec/errors.md (build additions: runtime 8 covers "no build tool", integrity 7 covers served-digest mismatch), reference syntax, and per-command behavior with real output shapes. `docs/reference/config.md` covers precedence, the client config file (registry.url/token, cache_dir), and the six environment variables — verified against `grep POKERFACE_ src/settings.emo` (exactly those six, no more); the two families (client `POKERFACE_*` vs server `POKERFACE_REGISTRY_*`) are explicitly kept apart, secrets-redaction behavior recorded, and the "not configurable in v0.1" list is honest (no build-tool overrides, fixed timeouts). `docs/cli.md` is now a redirect stub so old links work. **Snapshot test**: `test_help_text_snapshot_matches_the_reference` pins the help text's command order, the build description line, every global flag, and the `-h, --help` pair — when it fails, the reference page updates in the same change (the test's comment says exactly that); emo test 526/526. **CI warning**: docs.yaml gained a drift check (grep the route table's command labels vs the reference's command list, `::warning` on undocumented commands) and src/cli.emo joined the workflow's paths filter so a help-text change actually runs it — verified locally (routed vs documented sets intersect cleanly). Site rebuilt: 43 pages, links ok; both workflows pass actionlint.
 
 #### T4.11 YAML / Lock / Metadata Specification
 

@@ -631,7 +631,7 @@ images:
 | [x] | T4.7 | 安装脚本与发布工作流 | T1.1 | 3h |
 | [x] | T4.8 | 文档站骨架与导航 | T4.5 | 2-3h |
 | [x] | T4.9 | 快速开始与安装文档 | T4.7、T4.8 | 2h |
-| [ ] | T4.10 | CLI 与配置参考 | T1.1、T1.8 | 2h |
+| [x] | T4.10 | CLI 与配置参考 | T1.1、T1.8 | 2h |
 | [ ] | T4.11 | YAML / lock / 元数据规范 | T1.4、T1.5 | 3h |
 | [ ] | T4.12 | Registry 运维指南 | T2.17 | 3h |
 | [ ] | T4.13 | 示例应用 | T4.2、T4.3 | 3h |
@@ -759,6 +759,8 @@ images:
 **验收**：文档覆盖所有命令；参数默认值准确；退出码与 `docs/spec/errors.md` 一致；CI 检查帮助文本变更时提醒更新文档。
 
 **依赖**：T1.1、T1.8 · **预估**：2h
+
+> **笔记**（2026-11-20，约 2h）：完成。`docs/reference/cli.md` 记录完整命令面——build 已是**实现状态**（四个选项与 T4.1–T4.4 的链路；config 如实标注 stub），全局旗标（附 build 场景下 --config 指**构建文件**的警告）、退出码表对齐 docs/spec/errors.md（build 新增：runtime 8 覆盖"无构建工具"，integrity 7 覆盖服务端 digest 不符）、引用语法、各命令行为与真实输出形状。`docs/reference/config.md` 覆盖优先级、客户端配置文件（registry.url/token、cache_dir）、六个环境变量——用 `grep POKERFACE_ src/settings.emo` 核对过（恰好六个，一个不多）；客户端 `POKERFACE_*` 与服务端 `POKERFACE_REGISTRY_*` 两族明确分家，密钥脱敏行为如实记录，"v0.1 不可配置项"清单不含糊（无构建工具覆盖项、超时固定）。`docs/cli.md` 改为重定向桩，旧链接不断。**快照测试**：`test_help_text_snapshot_matches_the_reference` 钉住 help 文本的命令顺序、build 描述行、每个全局旗标与 `-h, --help`——失败即表示参考页要同一次改动里更新（测试注释就写明了）；emo test 526/526。**CI 警告**：docs.yaml 增加漂移检查（grep 路由表的命令标签 vs 参考页的命令清单，未记录即 `::warning`），且 src/cli.emo 加入该工作流的 paths 过滤——help 文本变更真的会触发它；本机已验证（routed 与 documented 集合干净相交）。站点重建：43 页，链接全部通过；两个工作流过 actionlint。
 
 #### T4.11 YAML / lock / 元数据规范
 
