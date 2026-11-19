@@ -10,6 +10,8 @@ const src_build = src.build
 require "json"
 require "file"
 require "os"
+require "time"
+require "crypto"
 
 class FakeRunner {
   def init(outputs Map[String, String]) {
@@ -45,7 +47,11 @@ def join_args(argv Array[String]) String {
 }
 
 def metadata() src.build.GitMetadata {
-  return src.build.GitMetadata.new("0123abcd", "", "main", "1.4.2")
+  return src.build.GitMetadata.new(commit_full(), "0123abcd", "", "main", "1.4.2", "")
+}
+
+def commit_full() String {
+  return "0123abcd0123abcd0123abcd0123abcd0123abcd"
 }
 
 // ---------------------------------------------------------------------------
@@ -71,7 +77,7 @@ def test_render_literals_pass_through() {
 }
 
 def test_render_tag_triggered_placeholder() {
-  const tagged = src.build.GitMetadata.new("0123abcd", "v1.2.0", "main", "1.4.2")
+  const tagged = src.build.GitMetadata.new(commit_full(), "0123abcd", "v1.2.0", "main", "1.4.2", "")
   case src_build.render_tag("{{ git.tag }}", tagged) {
     (R.error, why) then { expect_fail(why) }
     (R.ok, tag) then { expect_equal("v1.2.0", tag) }
@@ -97,7 +103,7 @@ def test_render_rejects_unknown_and_unterminated() {
 
 def test_render_rejects_invalid_tag_characters() {
   // {{ branch }} on a feature branch renders a slash — not a valid tag.
-  const feature = src.build.GitMetadata.new("0123abcd", "", "feat/x", "1.4.2")
+  const feature = src.build.GitMetadata.new(commit_full(), "0123abcd", "", "feat/x", "1.4.2", "")
   case src_build.render_tag("{{ branch }}", feature) {
     (R.error, why) then { expect_true(why.index_of("not allowed") >= 0) }
     (R.ok, _) then { expect_fail("a slash tag rendered") }
@@ -108,7 +114,7 @@ def test_render_rejects_invalid_tag_characters() {
 // Collisions.
 
 def test_render_tags_rejects_collisions() {
-  const tagged_on_main = src.build.GitMetadata.new("0123abcd", "main", "main", "1.4.2")
+  const tagged_on_main = src.build.GitMetadata.new(commit_full(), "0123abcd", "main", "main", "1.4.2", "")
   case src_build.render_tags(["{{ branch }}", "{{ git.tag }}"], tagged_on_main) {
     (R.error, why) then {
       expect_true(why.index_of("collides with") >= 0)
@@ -134,11 +140,11 @@ def test_render_tags_allows_distinct_templates() {
 // Git metadata capture.
 
 def git_runner() FakeRunner {
-  // The describe --exact-match call is ABSENT on purpose: the fake answers
-  // (R.error, …) for missing keys, which is what a non-tag-triggered build's
-  // git does (non-zero exit).
+  // The describe --exact-match and remote get-url calls are ABSENT on
+  // purpose: the fake answers (R.error, …) for missing keys, which is what
+  // a non-tag-triggered build without an origin remote gets from git.
   return FakeRunner.new(Map.new(
-    ("git -C /repo rev-parse --short=8 HEAD", "0123abcd\n"),
+    ("git -C /repo rev-parse HEAD", commit_full() + "\n"),
     ("git -C /repo rev-parse --abbrev-ref HEAD", "main\n"),
     ("git -C /repo describe --tags --abbrev=0", "v1.4.2\n")
   ))
@@ -149,27 +155,31 @@ def test_git_metadata_captures_the_facts() {
   case src_build.git_metadata(runner, "/repo") {
     (R.error, why) then { expect_fail(why) }
     (R.ok, meta) then {
+      expect_equal(commit_full(), meta.commit)
       expect_equal("0123abcd", meta.commit_short)
       expect_equal("", meta.git_tag)
       expect_equal("main", meta.branch)
       expect_equal("v1.4.2", meta.version)
-      expect_equal(4, runner.call_count())
+      expect_equal("", meta.origin)
+      expect_equal(5, runner.call_count())
     }
   }
 }
 
 def test_git_metadata_captures_an_exact_tag() {
   const runner = FakeRunner.new(Map.new(
-    ("git -C /repo rev-parse --short=8 HEAD", "0123abcd\n"),
+    ("git -C /repo rev-parse HEAD", commit_full() + "\n"),
     ("git -C /repo describe --tags --exact-match HEAD", "v1.2.0\n"),
     ("git -C /repo rev-parse --abbrev-ref HEAD", "main\n"),
-    ("git -C /repo describe --tags --abbrev=0", "v1.2.0\n")
+    ("git -C /repo describe --tags --abbrev=0", "v1.2.0\n"),
+    ("git -C /repo remote get-url origin", "git@github.com:acme/app.git\n")
   ))
   case src_build.git_metadata(runner, "/repo") {
     (R.error, why) then { expect_fail(why) }
     (R.ok, meta) then {
       expect_equal("v1.2.0", meta.git_tag)
       expect_equal("v1.2.0", meta.version)
+      expect_equal("git@github.com:acme/app.git", meta.origin)
     }
   }
 }
@@ -263,8 +273,8 @@ def test_build_command_prints_the_plan() {
   // assertions run against plan_text, the exact lines print_plan printlns.
   case src.commands.build.compose_plan(root + "/pokerface.yaml", []) {
     (R.error, why) then { expect_fail(why) }
-    (R.ok, plan) then {
-      const output = src.commands.build.plan_text(plan)
+    (R.ok, prepared) then {
+      const output = src.commands.build.plan_text(prepared.plan)
       expect_true(output.index_of("image:      registry.example.com/acme/app") >= 0)
       expect_true(output.index_of("tags:       latest, sha-") >= 0)
       expect_true(output.index_of("target:     runtime") >= 0)
@@ -281,6 +291,224 @@ def test_build_command_rejects_a_missing_config() {
       expect_true(why.index_of("cannot read /nonexistent/pokerface.yaml") >= 0)
     }
     (R.ok, _) then { expect_fail("a missing config composed a plan") }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// T4.2: the build adapter.
+
+def test_detect_tool_prefers_buildx_docker() {
+  const runner = FakeRunner.new(Map.new(
+    ("docker buildx version", "github.com/docker/buildx v0.38.1\n")
+  ))
+  case src_build.detect_tool(runner) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, tool) then {
+      expect_equal("docker", tool)
+      expect_equal(1, runner.call_count())
+    }
+  }
+}
+
+def test_detect_tool_falls_back_to_podman() {
+  // docker is absent (the key is missing, so the fake errors), podman exists.
+  const runner = FakeRunner.new(Map.new(
+    ("podman --version", "podman version 5.2.0\n")
+  ))
+  case src_build.detect_tool(runner) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, tool) then {
+      expect_equal("podman", tool)
+      expect_equal(2, runner.call_count())
+    }
+  }
+}
+
+def test_detect_tool_without_a_build_tool_errors() {
+  const runner = FakeRunner.new(Map.new())
+  case src_build.detect_tool(runner) {
+    (R.error, why) then {
+      expect_true(why.starts_with("runtime: no build tool found"))
+      expect_true(why.index_of("podman") >= 0)
+    }
+    (R.ok, _) then { expect_fail("a toolless machine detected a tool") }
+  }
+}
+
+def test_rfc3339_renders_utc() {
+  expect_equal("2026-11-19T08:30:15Z", src_build.rfc3339(time.of(2026, 11, 19, 8, 30, 15, 123)))
+}
+
+def adapter_plan() src.build.BuildPlan {
+  case src_build.plan(sample_config(), metadata(), "/repo", []) {
+    (R.error, why) then {
+      expect_fail(why)
+      return sample_config_dummy_plan()
+    }
+    (R.ok, plan) then { return plan }
+  }
+}
+
+// Unreachable (expect_fail raises), but the checker wants a return on every
+// path.
+def sample_config_dummy_plan() src.build.BuildPlan {
+  return src.build.BuildPlan.new("", [], [], Map.new(), "", "", "")
+}
+
+def test_buildx_argv_carries_labels_tags_and_output() {
+  const created = "2026-11-19T00:00:00Z"
+  const dest = "/tmp/work/build.tar"
+  const argv = src_build.buildx_argv(adapter_plan(), metadata(), created, dest)
+  const joined = join_args(argv)
+  expect_equal("docker", argv[0])
+  expect_equal("buildx", argv[1])
+  expect_equal("build", argv[2])
+  expect_true(joined.index_of("--platform=linux/amd64") >= 0)
+  expect_true(joined.index_of("--provenance=false") >= 0)
+  expect_true(joined.index_of("--sbom=false") >= 0)
+  expect_true(joined.index_of("--label=org.opencontainers.image.revision=" + commit_full()) >= 0)
+  // No origin remote: the source label is omitted.
+  expect_true(joined.index_of("org.opencontainers.image.source=") < 0)
+  expect_true(joined.index_of("--label=org.opencontainers.image.version=1.4.2") >= 0)
+  expect_true(joined.index_of("--label=org.opencontainers.image.created=" + created) >= 0)
+  expect_true(joined.index_of("--tag=registry.example.com/acme/app:latest") >= 0)
+  expect_true(joined.index_of("--tag=registry.example.com/acme/app:sha-0123abcd") >= 0)
+  expect_true(joined.index_of("--build-arg=NODE_ENV=production") >= 0)
+  expect_true(joined.index_of("--target=runtime") >= 0)
+  expect_true(joined.index_of("--output=type=oci,dest=" + dest) >= 0)
+  expect_equal("/repo", argv[argv.length() - 1])
+  // The Dockerfile flag pairs with the path.
+  var i = 0
+  var paired = false
+  while i < argv.length() {
+    if argv[i] == "-f" && i + 1 < argv.length() && argv[i + 1] == "/repo/Dockerfile" {
+      paired = true
+    }
+    i = i + 1
+  }
+  expect_true(paired)
+}
+
+def test_buildx_argv_carries_the_source_label_from_origin() {
+  const origin = src.build.GitMetadata.new(commit_full(), "0123abcd", "", "main", "1.4.2", "git@github.com:acme/app.git")
+  const argv = src_build.buildx_argv(adapter_plan(), origin, "2026-11-19T00:00:00Z", "/tmp/work/build.tar")
+  expect_true(join_args(argv).index_of("--label=org.opencontainers.image.source=git@github.com:acme/app.git") >= 0)
+}
+
+def test_podman_argv_builds_and_saves_one_tag() {
+  const created = "2026-11-19T00:00:00Z"
+  const argv = src_build.podman_argv(adapter_plan(), metadata(), created)
+  const joined = join_args(argv)
+  expect_equal("podman", argv[0])
+  expect_equal("build", argv[1])
+  expect_true(joined.index_of("--format=oci") >= 0)
+  expect_true(joined.index_of("--platform=linux/amd64") >= 0)
+  expect_true(joined.index_of("--label=org.opencontainers.image.revision=" + commit_full()) >= 0)
+  expect_true(joined.index_of("--tag=registry.example.com/acme/app:latest") >= 0)
+  expect_true(joined.index_of("--target=runtime") >= 0)
+  expect_equal("/repo", argv[argv.length() - 1])
+}
+
+// Assembles a real OCI layout from the fixtures so execute()'s validation
+// step runs against a genuine layout; the fakes stand in for buildx/tar.
+def fixture_spec(tag String) src.oci.LayoutSpec {
+  const body = read_fixture("manifest.json")
+  const config = read_fixture("config.json")
+  const sources = [
+    src.oci.BlobSource.new(digest_of(config), config.length(), "test/fixtures/oci/config.json"),
+    src.oci.BlobSource.new(digest_of(read_fixture("layer-0.tar.gz")), read_fixture("layer-0.tar.gz").length(), "test/fixtures/oci/layer-0.tar.gz")
+  ]
+  return src.oci.LayoutSpec.new("application/vnd.oci.image.manifest.v1+json", body, digest_of(body), tag, sources)
+}
+
+def read_fixture(name String) String {
+  case file.read("test/fixtures/oci/" + name) {
+    (R.ok, text) then { return text }
+    (R.error, why) then {
+      expect_fail("cannot read fixture " + name + ": " + why)
+      return ""
+    }
+  }
+}
+
+def digest_of(body String) String {
+  return "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+def test_execute_docker_builds_into_a_validated_layout() {
+  const work = build_tmp_base() + "exec-docker-" + os.getpid().to_string()
+  os.mkdir(work)
+  const layout = work + "/layout"
+  // The fake tar step "unpacks" nothing; the layout is pre-assembled so the
+  // adapter's validation runs against real bytes.
+  case src.oci.assemble(layout, fixture_spec("v1")) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, _) then {
+      const created = "2026-11-19T00:00:00Z"
+      const dest_tar = work + "/build.tar"
+      const build_key = join_args(src_build.buildx_argv(adapter_plan(), metadata(), created, dest_tar))
+      const runner = FakeRunner.new(Map.new(
+        ("docker buildx version", "buildx v0.38.1\n"),
+        (build_key, ""),
+        ("tar -xf " + dest_tar + " -C " + layout, "")
+      ))
+      case src_build.execute(adapter_plan(), metadata(), runner, runner, work, "2026-11-19T00:00:00Z") {
+        (R.error, why) then { expect_fail(why) }
+        (R.ok, out) then {
+          expect_equal("docker", out.tool)
+          expect_equal(layout, out.layout)
+          expect_equal(1, out.entries.length())
+          const manifest = read_fixture("manifest.json")
+          expect_equal(digest_of(manifest), out.entries[0].digest)
+          expect_equal(3, runner.call_count())
+        }
+      }
+    }
+  }
+}
+
+def test_execute_podman_saves_the_layout() {
+  const work = build_tmp_base() + "exec-podman-" + os.getpid().to_string()
+  os.mkdir(work)
+  const layout = work + "/layout"
+  case src.oci.assemble(layout, fixture_spec("v1")) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, _) then {
+      const created = "2026-11-19T00:00:00Z"
+      const build_key = join_args(src_build.podman_argv(adapter_plan(), metadata(), created))
+      const save_key = "podman save --format=oci-dir --output=" + layout + " registry.example.com/acme/app:latest"
+      const runner = FakeRunner.new(Map.new(
+        ("podman --version", "podman version 5.2.0\n"),
+        (build_key, ""),
+        (save_key, "")
+      ))
+      case src_build.execute(adapter_plan(), metadata(), runner, runner, work, "2026-11-19T00:00:00Z") {
+        (R.error, why) then { expect_fail(why) }
+        (R.ok, out) then {
+          expect_equal("podman", out.tool)
+          expect_equal(1, out.entries.length())
+          // docker miss + podman hit + build + save.
+          expect_equal(4, runner.call_count())
+        }
+      }
+    }
+  }
+}
+
+def test_execute_surfaces_a_failed_build() {
+  const work = build_tmp_base() + "exec-fail-" + os.getpid().to_string()
+  os.mkdir(work)
+  // docker exists, but the build itself fails (the fake errors on the
+  // buildx invocation); the streamed log is already on the terminal, so the
+  // error carries the exit code story.
+  const runner = FakeRunner.new(Map.new(
+    ("docker buildx version", "buildx v0.38.1\n")
+  ))
+  case src_build.execute(adapter_plan(), metadata(), runner, runner, work, "2026-11-19T00:00:00Z") {
+    (R.error, why) then {
+      expect_true(why.index_of("unexpected call") >= 0)
+    }
+    (R.ok, _) then { expect_fail("a failed build produced a layout") }
   }
 }
 

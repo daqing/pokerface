@@ -623,7 +623,7 @@ images:
 | 状态 | ID | 任务 | 依赖 | 预估 |
 | --- | --- | --- | --- | --- |
 | [x] | T4.1 | `pokerface build` 命令与构建计划 | T1.4、T1.5 | 2h |
-| [ ] | T4.2 | BuildKit / podman 构建适配 | T4.1 | 3-4h |
+| [x] | T4.2 | BuildKit / podman 构建适配 | T4.1 | 3-4h |
 | [ ] | T4.3 | Registry 推送：Blob + Manifest | T1.10、T2.12、T4.2 | 3h |
 | [ ] | T4.4 | lock 文件生成与写回 | T4.3 | 2h |
 | [ ] | T4.5 | 构建触发与版本策略 ADR | 无 | 1h |
@@ -663,6 +663,8 @@ images:
 **验收**：示例 Dockerfile 可构建为 OCI Layout；镜像 inspect 能看到 commit / source 标签；构建失败返回原始日志与退出码；无 BuildKit 时给出清晰提示；多平台构建作为可选能力，失败不影响单平台。
 
 **依赖**：T4.1 · **预估**：3-4h
+
+> **笔记**（2026-11-20，约 3h）：完成。`src/build.emo` 扩展出适配器：`detect_tool`（优先 buildx docker——`docker buildx version`——其次 podman；都没有 → `runtime: no build tool found`，退出码 8）、`buildx_argv`（一次 `buildx build` 调用：平台一次传入、每个 tag 一个 `--tag` 使 index.json 每个标签一条描述符、`--provenance=false --sbom=false` 保持布局只含请求的 manifest、`--output=type=oci,dest=<work>/build.tar`、context 最后）、`podman_argv` + save（`podman build --format=oci`，再 `podman save --format=oci-dir`——只带第一个 tag，push 补齐其余），以及 `execute()`（docker：buildx tar + `tar -xf`；布局先经 `src.oci.validate` + `read_index` 校验再作答）。`RealStreamRunner` fork 时继承 stdout/stderr，构建日志实时流出（与 git 的 RealRunner 同款双 fork 看门狗；只回传退出码，`pokerface: build: 'docker' exited with code 1` 垫在原始日志下面）。`GitMetadata` 增加完整 SHA（rev-parse HEAD，short 派生——c target 拒绝在 init 里条件赋值字段，所以 commit_short 仍是 init 参数）和 origin URL（source 标签，无 origin 时省略）。`created` 注入 execute()（命令传 `rfc3339_now()`，测试传定值——保证 fake 的 argv 钉子确定）。工作目录：`<TMPDIR>/pokerface-build-<pid>/`。`pokerface build`（不带 --dry-run）现在会组合、检查、执行并报告 tool/layout/digests/tags。本机真机验证（docker buildx v0.38.1、daemon 29.9.3）：FROM scratch 仓库离线构建出通过校验的布局；`skopeo inspect --config` 显示 `revision` = 完整 SHA、`source` = origin、`created` = RFC3339；digest 与 CLI 报告一致；坏 Dockerfile 会先流出 buildx 的 ERROR 块再退出 1；`--platform linux/amd64,linux/arm64` 产出干净的 2-manifest 索引。Podman 路径仅 fake 测试——本机未装 podman（T2.17 同款保留项）。测试：新增 10 个（检测 ×3、argv 形状 ×3、rfc3339、execute docker/podman/失败——fake 背后用真实 fixture 组装的布局）；`emo test` 510/510，c target 编译通过。踩坑：e2e 管道挂起再次命中——CLI 的 stdout 接管道会因空闲调度 worker 卡死（重定向到文件，e2e-m2.sh 已有记载）；错误信息里出现 "timeout" 一词会被归类成 network（已改写成 "limit"）。规范：docs/spec/build-plan.md "Execution (T4.2)"。
 
 #### T4.3 Registry 推送：Blob + Manifest
 

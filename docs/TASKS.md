@@ -623,7 +623,7 @@ Exit criteria:
 | Status | ID | Task | Depends on | Estimate |
 | --- | --- | --- | --- | --- |
 | [x] | T4.1 | `pokerface build` command and build plan | T1.4, T1.5 | 2h |
-| [ ] | T4.2 | BuildKit / podman build adapter | T4.1 | 3-4h |
+| [x] | T4.2 | BuildKit / podman build adapter | T4.1 | 3-4h |
 | [ ] | T4.3 | Registry push: blobs + manifest | T1.10, T2.12, T4.2 | 3h |
 | [ ] | T4.4 | Generate and write back the lock file | T4.3 | 2h |
 | [ ] | T4.5 | Build trigger and versioning strategy ADR | none | 1h |
@@ -663,6 +663,8 @@ Exit criteria:
 **Acceptance**: The example Dockerfile builds into an OCI layout; `inspect` shows the commit / source labels; build failures surface the original log and exit code; missing BuildKit produces a clear message; multi-platform builds are optional and do not break single-platform builds.
 
 **Depends on**: T4.1 · **Estimate**: 3-4h
+
+> **Notes** (2026-11-20, ~3h): Done. `src/build.emo` grows the adapter: `detect_tool` (buildx docker first — `docker buildx version` — podman fallback; neither → `runtime: no build tool found`, exit 8), `buildx_argv` (one `buildx build` invocation: all platforms at once, every tag as `--tag` so index.json carries one descriptor per tag, `--provenance=false --sbom=false` to keep the layout to the requested manifests, `--output=type=oci,dest=<work>/build.tar`, context last), `podman_argv` + save (`podman build --format=oci`, then `podman save --format=oci-dir` — one tag, push applies the rest), and `execute()` (docker: buildx tar + `tar -xf`; layout validated via `src.oci.validate` + `read_index` before answering). `RealStreamRunner` forks with inherited stdout/stderr so the build log streams live (same double-fork watchdog as git's RealRunner; only the exit code crosses back, so `pokerface: build: 'docker' exited with code 1` rides under the original log). `GitMetadata` gains the full SHA (rev-parse HEAD, short derived — the c target REJECTS conditional field assignment in init, so commit_short stays an init parameter) and the origin URL (the source label, omitted when there is no origin). `created` is injected into execute() (`rfc3339_now()` at the command, fixed in tests — keeps the fakes' argv pins deterministic). Work dir: `<TMPDIR>/pokerface-build-<pid>/`. `pokerface build` (no --dry-run) now composes, checks, executes, and reports tool/layout/digests/tags. Verified on the host with the real docker (buildx v0.38.1, daemon 29.9.3): FROM-scratch repo builds offline into a validated layout; `skopeo inspect --config` shows `revision` = full SHA, `source` = origin, `created` = RFC3339; digest matches the CLI's report; a broken Dockerfile surfaces buildx's ERROR block and exits 1; `--platform linux/amd64,linux/arm64` produces a clean 2-manifest index. Podman path is fake-tested only — podman is not installed here (the T2.17 caveat pattern). Tests: 10 new (detection ×3, argv shapes ×3, rfc3339, execute docker/podman/failure with a REAL fixture-assembled layout behind the fakes); `emo test` 510/510, c target builds. Gotchas: the e2e pipe hang hit again — piping the CLI's stdout stalls on the idle scheduler workers (redirect to a file, documented in e2e-m2.sh); the "timeout" word in an error message classifies as network (reworded to "limit"). Spec: docs/spec/build-plan.md "Execution (T4.2)".
 
 #### T4.3 Registry Push: Blobs + Manifest
 

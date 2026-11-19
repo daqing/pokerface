@@ -2,8 +2,13 @@
 // flag names it, otherwise it lives in the current directory), capture the
 // Git metadata of the repository the context names, render the tag
 // templates, and answer a build plan. `--dry-run` prints the plan and
-// performs no build and no network requests; executing the plan is T4.2's
-// adapter, so running without --dry-run is a usage error for now.
+// performs no build and no network requests.
+//
+// T4.2: without --dry-run the plan executes: the build tool (buildx, or
+// podman as the fallback) runs with the log streamed to the terminal, and
+// the image lands as a validated OCI layout in a temp directory. Pushing
+// the layout to the registry arrives with T4.3.
+//
 // `--platform` overrides the configured platforms (repeatable: --platform
 // linux/amd64 --platform linux/arm64).
 //
@@ -45,10 +50,6 @@ def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) 
     }
     i = i + 1
   }
-  if !dry_run {
-    return src.errors.usage_report("build", "executing the plan is not implemented yet — pass --dry-run", flags.json)
-  }
-
   var config_path = flags.config
   if config_path == "" {
     config_path = os.getcwd() + "/pokerface.yaml"
@@ -56,26 +57,131 @@ def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) 
 
   case compose_plan(config_path, platforms) {
     (R.error, why) then { return src.errors.report("build", why, flags.json) }
-    (R.ok, plan) then {
-      case check_dockerfile(plan) {
+    (R.ok, prepared) then {
+      case check_dockerfile(prepared.plan) {
         (R.error, why) then { return src.errors.report("build", why, flags.json) }
         (R.ok, _) then {
-          if flags.json {
-            print_plan_json(plan)
-          } else {
-            print_plan(plan)
+          if dry_run {
+            if flags.json {
+              print_plan_json(prepared.plan)
+            } else {
+              print_plan(prepared.plan)
+            }
+            return src.common.exit_ok
           }
-          return src.common.exit_ok
+          return build_and_report(flags, prepared, platforms)
         }
       }
     }
   }
 }
 
+// The plan plus the Git facts it was rendered from — the dry run prints the
+// plan, the real build feeds both to the adapter (the labels come from the
+// metadata).
+class Prepared {
+  def init(metadata src.build.GitMetadata, plan src.build.BuildPlan) {
+    self.metadata = metadata
+    self.plan = plan
+  }
+}
+
+// The real build: execute the plan in a fresh temp directory, then report
+// the tool, the layout, and its digests. Push arrives with T4.3.
+def build_and_report(flags src.common.Flags, prepared Prepared, platforms Array[String]) Int64 {
+  const work_dir = work_base() + "pokerface-build-" + os.getpid().to_string()
+  case src.build.execute(prepared.plan, prepared.metadata, src.git.RealRunner.new(), src.build.RealStreamRunner.new(), work_dir, src.build.rfc3339_now()) {
+    (R.error, why) then { return src.errors.report("build", why, flags.json) }
+    (R.ok, out) then {
+      if flags.json {
+        print_build_json(out, prepared.plan)
+      } else {
+        print_build_text(out, prepared.plan)
+      }
+      return src.common.exit_ok
+    }
+  }
+}
+
+// The temp root for build work directories; a per-process name keeps
+// concurrent runs apart. The layout is transient — push (T4.3) consumes it
+// within the same invocation.
+def work_base() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+// The human build report: the tool, the layout, one line per unique digest,
+// and the tags the layout was built for.
+def print_build_text(out src.build.BuildOutput, plan src.build.BuildPlan) {
+  println("tool:       " + out.tool)
+  println("layout:     " + out.layout)
+  var seen = []
+  var i = 0
+  while i < out.entries.length() {
+    const digest = out.entries[i].digest
+    var printed = false
+    var j = 0
+    while j < seen.length() {
+      if seen[j] == digest {
+        printed = true
+      }
+      j = j + 1
+    }
+    if !printed {
+      println("digest:     " + digest + " (" + out.entries[i].media_type + ")")
+      seen = seen.append(digest)
+    }
+    i = i + 1
+  }
+  println("tags:       " + join(plan.tags, ", "))
+  println("(not pushed yet — push arrives with T4.3)")
+}
+
+// The machine build report: stable keys, script-friendly.
+def print_build_json(out src.build.BuildOutput, plan src.build.BuildPlan) {
+  var digests = []
+  var i = 0
+  while i < out.entries.length() {
+    digests = digests.append(json.string(out.entries[i].digest))
+    i = i + 1
+  }
+  var tags = []
+  i = 0
+  while i < plan.tags.length() {
+    tags = tags.append(json.string(plan.tags[i]))
+    i = i + 1
+  }
+  var platforms = []
+  i = 0
+  while i < plan.platforms.length() {
+    platforms = platforms.append(json.string(plan.platforms[i]))
+    i = i + 1
+  }
+  println(json.encode(json.object([
+    ("tool", json.string(out.tool)),
+    ("layout", json.string(out.layout)),
+    ("digests", json.array(digests)),
+    ("tags", json.array(tags)),
+    ("platforms", json.array(platforms))
+  ])))
+}
+
 // The composition without any output: read pokerface.yaml, parse it as the
 // build config, capture the Git facts from the context directory, and
 // assemble the plan. The command prints; the tests assert on the same plan.
-def compose_plan(config_path String, platforms Array[String]) (R, src.build.BuildPlan) {
+def compose_plan(config_path String, platforms Array[String]) (R, Prepared) {
   case file.read(config_path) {
     (R.error, why) then { return (R.error, "cannot read " + config_path + ": " + why) }
     (R.ok, text) then {
@@ -91,7 +197,10 @@ def compose_plan(config_path String, platforms Array[String]) (R, src.build.Buil
               case src.build.git_metadata(runner, repo_root) {
                 (R.error, why) then { return (R.error, why) }
                 (R.ok, metadata) then {
-                  return src.build.plan(config, metadata, config_dir, platforms)
+                  case src.build.plan(config, metadata, config_dir, platforms) {
+                    (R.error, why) then { return (R.error, why) }
+                    (R.ok, plan) then { return (R.ok, Prepared.new(metadata, plan)) }
+                  }
                 }
               }
             }

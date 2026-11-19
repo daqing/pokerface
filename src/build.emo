@@ -10,14 +10,33 @@
 // and the context/Dockerfile paths — everything `--dry-run` prints and the
 // T4.2 adapter consumes. Spec: docs/spec/pokerface-yaml.md (the placeholder
 // table) and docs/spec/build-plan.md.
+//
+// T4.2: the build adapter. Docker with buildx is preferred — one
+// `buildx build --output type=oci` invocation writes the whole OCI layout
+// (as a tar; tar(1) unpacks it), and every --tag lands as a descriptor in
+// index.json. Podman is the fallback: build into its store, then
+// `podman save --format oci-dir` exports the layout directory (one tag).
+// The image config carries the standard OCI labels (revision, source,
+// version, created). Detection runs through the capturing runner; the build
+// itself streams through RealStreamRunner, whose child inherits stdout so a
+// minutes-long build shows its log live.
 
-// The Git facts the renderer needs, captured once for the whole plan.
+require "os"
+require "time"
+
+// The Git facts the renderer and the OCI labels need, captured once for the
+// whole plan. `commit` is the full SHA (the revision label); `commit_short`
+// is its first 8 characters (the {{ commit.short }} template) — a plain
+// parameter, because the c target rejects conditional field assignment in
+// init.
 class GitMetadata {
-  def init(commit_short String, git_tag String, branch String, version String) {
+  def init(commit String, commit_short String, git_tag String, branch String, version String, origin String) {
+    self.commit = commit
     self.commit_short = commit_short
     self.git_tag = git_tag
     self.branch = branch
     self.version = version
+    self.origin = origin
   }
 }
 
@@ -142,17 +161,21 @@ def render_tags(templates Array[String], metadata GitMetadata) (R, Array[String]
   return (R.ok, out)
 }
 
-// Captures the Git facts from the repository the build runs in: the current
-// commit (short), the tag pointing exactly at HEAD ("" when the build is not
-// tag-triggered), and the current branch. The version comes from the
-// version file's VERSION field when present (the repo's own convention);
-// a missing file renders `{{ version }}` to "" — the tag then fails the
-// charset check with a clear message.
+// Captures the Git facts from the repository the build runs in: the full
+// commit SHA, the tag pointing exactly at HEAD ("" when the build is not
+// tag-triggered), the current branch, the newest reachable tag as the
+// version, and the origin remote URL ("" when there is none — the source
+// label is then omitted). A failed rev-parse is a hard error: every build
+// is built from a commit.
 def git_metadata(runner src.git.CommandRunner, repo_root String) (R, GitMetadata) {
-  case runner.run(["git", "-C", repo_root, "rev-parse", "--short=8", "HEAD"], 10.0) {
+  case runner.run(["git", "-C", repo_root, "rev-parse", "HEAD"], 10.0) {
     (R.error, why) then { return (R.error, "git: cannot read the commit: " + why) }
     (R.ok, commit) then {
-      var commit_short = commit.trim()
+      const full = commit.trim()
+      var short = full
+      if full.length() > 8 {
+        short = full.substring(0, 8)
+      }
       var tag = ""
       case runner.run(["git", "-C", repo_root, "describe", "--tags", "--exact-match", "HEAD"], 10.0) {
         (R.error, _) then { tag = "" }
@@ -168,7 +191,12 @@ def git_metadata(runner src.git.CommandRunner, repo_root String) (R, GitMetadata
         (R.error, _) then { version = "" }
         (R.ok, latest) then { version = latest.trim() }
       }
-      return (R.ok, GitMetadata.new(commit_short, tag, branch, version))
+      var origin = ""
+      case runner.run(["git", "-C", repo_root, "remote", "get-url", "origin"], 10.0) {
+        (R.error, _) then { origin = "" }
+        (R.ok, url) then { origin = url.trim() }
+      }
+      return (R.ok, GitMetadata.new(full, short, tag, branch, version, origin))
     }
   }
 }
@@ -209,4 +237,234 @@ def plan(config src.config.PokerfaceConfig, metadata GitMetadata, config_dir Str
       return (R.ok, BuildPlan.new(config.image, tags, platforms, config.build.args, context, dockerfile, config.build.target))
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// T4.2: the build adapter.
+
+// Builds are minutes long; 30 minutes is the watchdog, not a goal.
+const build_timeout = 1800.0
+
+// The build's answer: which tool ran, the validated layout directory, and
+// its index entries (unique digests for the display; tags ride in the
+// annotations).
+class BuildOutput {
+  def init(tool String, layout String, entries Array[src.oci.LayoutEntry]) {
+    self.tool = tool
+    self.layout = layout
+    self.entries = entries
+  }
+}
+
+// The build's runner: the child inherits stdout/stderr, so the build log
+// streams live — capturing a minutes-long build silently would look like a
+// hang. Only the exit code crosses back; on failure the log is already on
+// the terminal, so the error carries just the code. Same double-fork
+// watchdog as src.git.RealRunner: `os.waitpid` stalls the scheduler, so the
+// killer must be an independent OS process.
+class RealStreamRunner {
+  def init() {
+  }
+
+  def run(argv Array[String], timeout Float64) (R, String) {
+    if argv.length() == 0 {
+      return (R.error, "empty argv")
+    }
+    const (R.ok, pid) = os.fork()
+    if pid == 0 {
+      const my_pid = os.getpid()
+      if timeout > 0.0 {
+        const (R.ok, grand) = os.fork()
+        if grand == 0 {
+          time.sleep(timeout)
+          const (_, _) = os.kill(my_pid, os.sig_term)
+          os._exit(0)
+        }
+      }
+      os.execvp(argv[0], argv)
+      os._exit(127)
+    }
+    const w = os.waitpid(pid)
+    if os.wait_signaled(w[1]) {
+      return (R.error, "'" + argv[0] + "' was killed by signal " + os.wait_signal(w[1]).to_string() + " — it ran longer than the " + timeout.to_string() + "s limit")
+    }
+    const code = os.wait_exit_code(w[1])
+    if code != 0 {
+      return (R.error, "'" + argv[0] + "' exited with code " + code.to_string())
+    }
+    return (R.ok, "")
+  }
+}
+
+// Detection: buildx-capable docker first, podman as the fallback. The
+// "runtime:" prefix classifies the answer as a runtime problem, whose hint
+// names the tools to install.
+def detect_tool(runner src.git.CommandRunner) (R, String) {
+  case runner.run(["docker", "buildx", "version"], 15.0) {
+    (R.ok, _) then { return (R.ok, "docker") }
+    (R.error, _) then {
+      case runner.run(["podman", "--version"], 15.0) {
+        (R.ok, _) then { return (R.ok, "podman") }
+        (R.error, _) then {
+          return (R.error, "runtime: no build tool found — install docker (with buildx) or podman, and check PATH")
+        }
+      }
+    }
+  }
+}
+
+// RFC 3339 UTC for the created label; the time module is UTC always, so the
+// answer is the same on every target.
+def rfc3339(t time.Time) String {
+  return t.format("YYYY-MM-DDThh:mm:ssZ")
+}
+
+def rfc3339_now() String {
+  return rfc3339(time.now())
+}
+
+// One buildx invocation per plan: all platforms at once (buildx answers an
+// image index for several, a single manifest for one), every tag as a
+// --tag flag (index.json then carries one descriptor per tag), the OCI
+// labels on the image config, and the OCI output tar as the destination.
+// The context path is last, as the builders expect.
+def buildx_argv(plan BuildPlan, metadata GitMetadata, created String, dest_tar String) Array[String] {
+  var argv = ["docker", "buildx", "build"]
+  argv = argv.append("--platform=" + join_text(plan.platforms, ","))
+  // The SBOM/provenance attestation manifests buildx adds by default are
+  // noise for the distribution MVP: the layout carries exactly the image
+  // manifests the plan asked for.
+  argv = argv.append("--provenance=false")
+  argv = argv.append("--sbom=false")
+  argv = argv.append("--label=org.opencontainers.image.revision=" + metadata.commit)
+  if metadata.origin != "" {
+    argv = argv.append("--label=org.opencontainers.image.source=" + metadata.origin)
+  }
+  if metadata.version != "" {
+    argv = argv.append("--label=org.opencontainers.image.version=" + metadata.version)
+  }
+  argv = argv.append("--label=org.opencontainers.image.created=" + created)
+  var i = 0
+  while i < plan.tags.length() {
+    argv = argv.append("--tag=" + plan.image + ":" + plan.tags[i])
+    i = i + 1
+  }
+  const names = plan.args.keys()
+  i = 0
+  while i < names.length() {
+    argv = argv.append("--build-arg=" + names[i] + "=" + plan.args.get(names[i]))
+    i = i + 1
+  }
+  if plan.target != "" {
+    argv = argv.append("--target=" + plan.target)
+  }
+  argv = argv.append("-f")
+  argv = argv.append(plan.dockerfile)
+  argv = argv.append("--output=type=oci,dest=" + dest_tar)
+  argv = argv.append(plan.context)
+  return argv
+}
+
+// The podman fallback: build into podman's store (one invocation, same
+// labels and platforms), then export the layout directory. `podman save
+// --format oci-dir` takes one image, so the layout carries the first tag;
+// push applies the rest anyway.
+def podman_argv(plan BuildPlan, metadata GitMetadata, created String) Array[String] {
+  var argv = ["podman", "build", "--format=oci"]
+  argv = argv.append("--platform=" + join_text(plan.platforms, ","))
+  argv = argv.append("--label=org.opencontainers.image.revision=" + metadata.commit)
+  if metadata.origin != "" {
+    argv = argv.append("--label=org.opencontainers.image.source=" + metadata.origin)
+  }
+  if metadata.version != "" {
+    argv = argv.append("--label=org.opencontainers.image.version=" + metadata.version)
+  }
+  argv = argv.append("--label=org.opencontainers.image.created=" + created)
+  argv = argv.append("--tag=" + plan.image + ":" + plan.tags[0])
+  const names = plan.args.keys()
+  var i = 0
+  while i < names.length() {
+    argv = argv.append("--build-arg=" + names[i] + "=" + plan.args.get(names[i]))
+    i = i + 1
+  }
+  if plan.target != "" {
+    argv = argv.append("--target=" + plan.target)
+  }
+  argv = argv.append("-f")
+  argv = argv.append(plan.dockerfile)
+  argv = argv.append(plan.context)
+  return argv
+}
+
+// Builds the plan into an OCI layout at <work_dir>/layout, streaming the
+// build log through `build_runner`. `created` stamps the OCI created label
+// (the command passes rfc3339_now(); the tests pass a fixed value, which
+// keeps the fakes' argv pins deterministic). docker: buildx writes the
+// layout as a tar, tar(1) unpacks it. podman: `podman save --format
+// oci-dir` writes the directory directly. The layout is validated before
+// the answer, so a truncated build fails here and not at push time.
+def execute(plan BuildPlan, metadata GitMetadata, detect_runner src.git.CommandRunner, build_runner src.git.CommandRunner, work_dir String, created String) (R, BuildOutput) {
+  case detect_tool(detect_runner) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, tool) then {
+      const layout_dir = work_dir + "/layout"
+      case src.oci.ensure_dir(work_dir) {
+        (R.error, why) then { return (R.error, "build: " + why) }
+        (R.ok, _) then { }
+      }
+      case src.oci.ensure_dir(layout_dir) {
+        (R.error, why) then { return (R.error, "build: " + why) }
+        (R.ok, _) then {
+          if tool == "docker" {
+            const dest_tar = work_dir + "/build.tar"
+            case build_runner.run(buildx_argv(plan, metadata, created, dest_tar), build_timeout) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, _) then {
+                case build_runner.run(["tar", "-xf", dest_tar, "-C", layout_dir], 120.0) {
+                  (R.error, why) then { return (R.error, "unpacking the OCI layout failed: " + why) }
+                  (R.ok, _) then { return finish_build(layout_dir, tool) }
+                }
+              }
+            }
+          } else {
+            case build_runner.run(podman_argv(plan, metadata, created), build_timeout) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, _) then {
+                case build_runner.run(["podman", "save", "--format=oci-dir", "--output=" + layout_dir, plan.image + ":" + plan.tags[0]], 300.0) {
+                  (R.error, why) then { return (R.error, "exporting the OCI layout failed: " + why) }
+                  (R.ok, _) then { return finish_build(layout_dir, tool) }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// The shared tail: validate the layout and answer its entries.
+def finish_build(layout_dir String, tool String) (R, BuildOutput) {
+  case src.oci.validate(layout_dir) {
+    (R.error, why) then { return (R.error, "the OCI layout failed validation: " + why) }
+    (R.ok, _) then {
+      case src.oci.read_index(layout_dir) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, entries) then { return (R.ok, BuildOutput.new(tool, layout_dir, entries)) }
+      }
+    }
+  }
+}
+
+def join_text(items Array[String], sep String) String {
+  var out = ""
+  var i = 0
+  while i < items.length() {
+    if i > 0 {
+      out = out + sep
+    }
+    out = out + items[i]
+    i = i + 1
+  }
+  return out
 }
