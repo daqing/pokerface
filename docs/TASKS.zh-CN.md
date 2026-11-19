@@ -634,7 +634,7 @@ images:
 | [x] | T4.10 | CLI 与配置参考 | T1.1、T1.8 | 2h |
 | [x] | T4.11 | YAML / lock / 元数据规范 | T1.4、T1.5 | 3h |
 | [x] | T4.12 | Registry 运维指南 | T2.17 | 3h |
-| [ ] | T4.13 | 示例应用 | T4.2、T4.3 | 3h |
+| [x] | T4.13 | 示例应用 | T4.2、T4.3 | 3h |
 | [ ] | T4.14 | 端到端演示脚本 | T4.3、T4.13、T1.14 | 3h |
 | [ ] | T4.15 | 故障回退与排障矩阵 | T1.14、T2.19 | 2h |
 | [ ] | T4.16 | README、中文版与发布清单 | T4.8-T4.15 | 2h |
@@ -795,6 +795,8 @@ images:
 **验收**：`pokerface build --push --write-lock` 成功；`pokerface pull` 后容器返回 200；镜像不含构建缓存与密钥；示例可作为 CI 模板的输入。
 
 **依赖**：T4.2、T4.3 · **预估**：3h
+
+> **笔记**（2026-11-20，约 3h，含一个 P0 发现）：完成。`examples/hello/`：纯标准库的 Go 服务（`/` 返回 200 与消息、`/healthz` 返回 `ok`）、两个提交进仓库的静态 Linux 二进制（CGO off、`-trimpath -ldflags "-s -w"`——镜像是 `FROM scratch` + 一个二进制，无 shell、无构建缓存、无密钥）、使用 buildx 的 `ARG TARGETARCH` 的 Dockerfile（README 记录了重建命令），以及双平台 `pokerface.yaml`。**本任务挖出一个 P0 级 runtime 限制并交付了绕过方案**：c runtime 的 plain-TCP `send` 把 EAGAIN（socket 缓冲区满）当致命错误——任何超过约 64 KiB 的单个响应体都会中途断流，对所有客户端都一样（实测：curl 只取回 2,516,528 字节 blob 中的 326,812 字节；registry 的一次性 httpd 响应写和客户端的大 body 上传都会踩中）。绕过方案全部在本仓库内：push 以 64 KiB 的 PATCH 窗口上传；registry 的 blob GET 服务有界 206 窗口（`blob_range_window` 32 KiB，Content-Range 精确标注所发切片，越界 416、非法 Range 400）；pull 下载器走窗口（与声明大小的不足量从 `.meta` 偏移继续，直到达到大小再做 digest 校验；无进展的窗口报错）。根因与建议的 runtime 修复（EAGAIN 时等待可写，与 TLS 路径一致，改 emo_c_runtime.c + 解释器）记录在 `docs/notes/runtime-capabilities.md`，留给 emo-lang 项目——在它落地前，所有客户端对大 blob 的普通 200 GET 都会中途断流。**端到端验证**在形如 CI 目标的独立仓库（examples/hello 拷出、`git init`、origin 远端——决策 D2 把 lock 放在仓库**根目录**，所以子目录里的示例无法从父仓库解析）：`build --write-lock` 推出双平台 index（5 uploaded、2 skipped——相同二进制的 layer 被跳过）、`resolve` 回答推送的 digest、`pull` 走 206 窗口导入 docker、运行容器后 `curl` 返回 **HTTP/1.1 200 OK** 且 `/healthz` 为 `ok`；预期大小每平台 8.4 MB（静态 Go 二进制）。测试：新增 5 个 Range 窗口路由测试；emo test 531/531，c target 编译通过。客户端同步修复：`select_platform` 递归嵌套 index（registry 侧 resolve 修复的客户端孪生版），repo 参数贯穿。踩坑：`pokerface.yaml` 流式 `tags: [latest, sha-{{ … }}]` 解析失败（模板条目要加引号）；`ARG TARGETARCH` 必须先声明再使用；子目录里的 lock 对 resolve 不可见（D2 的根目录规则是真实契约）。
 
 #### T4.14 端到端演示脚本
 

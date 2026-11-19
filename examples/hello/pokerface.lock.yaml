@@ -1,9 +1,0 @@
-version: 1
-commit: "b73e3dfa5394f9512609df687cc00a77940448c2"
-source: github.com/daqing/pokerface
-images:
-  - image: 127.0.0.1:4599/hello/app
-    tags: [latest, sha-b73e3dfa]
-    digest: sha256:ee1dab52db3def07c6a704953e7ca59121b14eb12e3fd7c962ce676595f23eb1
-    platforms: [linux/amd64, linux/arm64]
-    builder: buildkit

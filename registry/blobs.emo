@@ -121,6 +121,12 @@ def handle(req httpd.Request, links BlobLinks, store registry.blobstore.BlobStor
           if url != "" {
             return httpd.response(307, [("Location", url), ("Cache-Control", registry.cache.redirect_cache_control), ("Docker-Content-Digest", digest)], "")
           }
+          case parse_range(req.header("Range")) {
+            (R.error, why) then { return registry.api.bad_request(registry.api.code_digest_invalid, "invalid Range", why) }
+            (R.ok, window) then {
+              return ranged_response(store, digest, info.size, window)
+            }
+          }
           case store.get(digest) {
             (R.error, why) then {
               if registry.blobstore.is_not_found(why) {
@@ -138,6 +144,107 @@ def handle(req httpd.Request, links BlobLinks, store registry.blobstore.BlobStor
           }
         }
       }
+    }
+  }
+}
+
+// ---- Range windows --------------------------------------------------------
+// A response body is written in one `send` and the runtime treats a full
+// socket buffer (EAGAIN) as fatal, so any single body above roughly 64 KiB
+// can die mid-transfer. The route therefore serves bounded windows: a
+// `Range: bytes=A-` (or a wider `bytes=A-B`) answers 206 with at most
+// `blob_range_window` bytes and a Content-Range naming exactly what was
+// sent — legal HTTP, and it lets a resuming client (the pokerface pull)
+// walk a multi-megabyte blob in safe slices. A request without Range keeps
+// the plain 200 full body (small blobs, and every client that does not
+// resume).
+
+const blob_range_window = 32768
+
+// (start, end) inclusive; start < 0 means "no Range header".
+def parse_range(header String) (R, (Int64, Int64)) {
+  const t = header.trim()
+  if t == "" {
+    return (R.ok, (-1, -1))
+  }
+  if !t.starts_with("bytes=") {
+    return (R.error, "only bytes= ranges are supported")
+  }
+  const spec = t.substring(6, t.length() - 6)
+  const dash = spec.index_of("-")
+  if dash < 0 {
+    return (R.error, "a range needs a dash")
+  }
+  const start_text = spec.substring(0, dash)
+  const end_text = spec.substring(dash + 1, spec.length() - dash - 1)
+  if start_text == "" {
+    return (R.error, "suffix ranges are not supported")
+  }
+  const start = start_text.to_int64()
+  if start < 0 {
+    return (R.error, "the range start must be a number")
+  }
+  var end = start + blob_range_window - 1
+  if end_text != "" {
+    const requested = end_text.to_int64()
+    if requested < start {
+      return (R.error, "the range end precedes its start")
+    }
+    if requested < end {
+      end = requested
+    }
+  }
+  return (R.ok, (start, end))
+}
+
+// The window's body from the store's range read; out-of-window starts and
+// zero-length windows are the RFC's 416.
+def ranged_response(store registry.blobstore.BlobStore, digest String, size Int64, window (Int64, Int64)) httpd.Response {
+  const start = window[0]
+  const end = window[1]
+  if start < 0 {
+    return full_response(store, digest)
+  }
+  if start >= size {
+    return httpd.response(416, [("Content-Range", "bytes */" + size.to_string())], "")
+  }
+  var stop = end
+  if stop >= size {
+    stop = size - 1
+  }
+  const length = stop - start + 1
+  case store.read_range(digest, start, length) {
+    (R.error, why) then {
+      if registry.blobstore.is_not_found(why) {
+        return registry.api.not_found(registry.api.code_blob_unknown, "blob unknown", digest)
+      }
+      return registry.api.server_error("blob read failed", why)
+    }
+    (R.ok, body) then {
+      return httpd.response(206, registry.cache.with_cache([
+        ("Content-Type", content_type),
+        ("Docker-Content-Digest", digest),
+        ("Content-Length", body.to_bytes().length().to_string()),
+        ("Content-Range", "bytes " + start.to_string() + "-" + stop.to_string() + "/" + size.to_string())
+      ], registry.cache.blob_headers(digest)), body)
+    }
+  }
+}
+
+def full_response(store registry.blobstore.BlobStore, digest String) httpd.Response {
+  case store.get(digest) {
+    (R.error, why) then {
+      if registry.blobstore.is_not_found(why) {
+        return registry.api.not_found(registry.api.code_blob_unknown, "blob unknown", digest)
+      }
+      return registry.api.server_error("blob read failed", why)
+    }
+    (R.ok, body) then {
+      return httpd.response(200, registry.cache.with_cache([
+        ("Content-Type", content_type),
+        ("Docker-Content-Digest", digest),
+        ("Content-Length", body.to_bytes().length().to_string())
+      ], registry.cache.blob_headers(digest)), body)
     }
   }
 }

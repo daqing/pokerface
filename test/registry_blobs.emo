@@ -73,7 +73,13 @@ class FakeBlobStore {
   }
 
   def read_range(digest String, offset Int64, length Int64) (R, String) {
-    return (R.error, "fake: range")
+    if !self.exists {
+      return (R.error, blobstore.not_found(digest))
+    }
+    if offset < 0 || offset + length > self.body.length() {
+      return (R.error, blobstore.not_found(digest))
+    }
+    return (R.ok, self.body.substring(offset, length))
   }
 
   def delete(digest String) (R, Bool) {
@@ -94,13 +100,17 @@ class FakeBlobStore {
 }
 
 def make_request(method String, path String) httpd.Request {
+  return make_request_with_headers(method, path, [])
+}
+
+def make_request_with_headers(method String, path String, headers Array[(String, String)]) httpd.Request {
   return httpd.Request.new(
     method: method,
     target: path,
     path: path,
     query: Map.new(),
     proto: "HTTP/1.1",
-    headers: [],
+    headers: headers,
     body: "",
     params: Map.new()
   )
@@ -423,4 +433,60 @@ class BlobFakeMetricsSink {
   def render() String {
     return "# TYPE pokerface_requests_total counter\npokerface_requests_total 0\n"
   }
+}
+
+// T4.13: the blob route serves bounded Range windows — one big response
+// body can die on a full socket buffer (the runtime's plain-TCP send has no
+// EAGAIN wait), so a resuming client walks a large blob in 206 slices.
+def test_a_range_window_answers_206() {
+  const store = local_store_exists()
+  const response = blobs.handle(make_request_with_headers("GET", "/v2/acme/team/app/blobs/" + digest_value, [("Range", "bytes=1-3")]), FakeLinks.new(true, 5, ""), store)
+  expect_equal(206, response.status)
+  expect_equal("ell", response.body)
+  expect_equal("bytes 1-3/5", header_value(response.headers, "content-range"))
+  expect_equal("3", header_value(response.headers, "content-length"))
+}
+
+def test_an_unbounded_range_is_capped_to_the_window() {
+  const store = FakeBlobStore.new(true, 200000, long_body(), "", "")
+  const response = blobs.handle(make_request_with_headers("GET", "/v2/acme/app/blobs/" + digest_value, [("Range", "bytes=100000-")]), FakeLinks.new(true, 200000, ""), store)
+  expect_equal(206, response.status)
+  expect_equal(blob_mod_range_window(), response.body.length())
+  expect_equal("bytes 100000-132767/200000", header_value(response.headers, "content-range"))
+}
+
+def blob_mod_range_window() Int64 {
+  return registry.blobs.blob_range_window
+}
+
+def long_body() String {
+  var out = ""
+  var i = 0
+  while i < 200000 {
+    out = out + "x"
+    i = i + 1
+  }
+  return out
+}
+
+def test_a_wide_range_is_capped_to_the_window() {
+  const store = FakeBlobStore.new(true, 200000, long_body(), "", "")
+  const response = blobs.handle(make_request_with_headers("GET", "/v2/acme/app/blobs/" + digest_value, [("Range", "bytes=0-199999")]), FakeLinks.new(true, 200000, ""), store)
+  expect_equal(206, response.status)
+  expect_equal(blob_mod_range_window(), response.body.length())
+  expect_equal("bytes 0-32767/200000", header_value(response.headers, "content-range"))
+}
+
+def test_invalid_ranges_are_400s() {
+  const store = local_store_exists()
+  const narrow = blobs.handle(make_request_with_headers("GET", "/v2/acme/app/blobs/" + digest_value, [("Range", "bytes=5-1")]), FakeLinks.new(true, 5, ""), store)
+  expect_equal(400, narrow.status)
+  const suffix = blobs.handle(make_request_with_headers("GET", "/v2/acme/app/blobs/" + digest_value, [("Range", "bytes=-5")]), FakeLinks.new(true, 5, ""), store)
+  expect_equal(400, suffix.status)
+}
+
+def test_a_range_past_the_end_is_416() {
+  const store = local_store_exists()
+  const response = blobs.handle(make_request_with_headers("GET", "/v2/acme/app/blobs/" + digest_value, [("Range", "bytes=10-20")]), FakeLinks.new(true, 5, ""), store)
+  expect_equal(416, response.status)
 }

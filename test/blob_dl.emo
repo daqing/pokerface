@@ -110,7 +110,10 @@ def test_corrupt_blob_rejected_and_never_committed() {
 def test_size_mismatch_rejected() {
   const final = blob_final("sizemismatch")
   const t = make_transport([make_route("blob-c", 200, blob_body, true, 0, -1)])
-  case blob_mod.download_blob_with(t, "https://cdn.example.com/blob-c", "sha256:" + sha_hex(blob_body), blob_body.length() + 5, final, 3, 0.01, 16, 5.0, false) {
+  // An over-run (more bytes than the digest's size promised) is corruption:
+  // an under-run is a Range window and the download walks (verified end to
+  // end against the registry's 206 windows).
+  case blob_mod.download_blob_with(t, "https://cdn.example.com/blob-c", "sha256:" + sha_hex(blob_body), blob_body.length() - 5, final, 3, 0.01, 16, 5.0, false) {
     (R.ok, _) then { expect_fail("expected a size mismatch") }
     (R.error, why) then { expect_true(why.index_of("size mismatch") >= 0) }
   }

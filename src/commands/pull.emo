@@ -527,7 +527,7 @@ def fetch_final_manifest(client src.registry.Client, repo String, reference Stri
           (R.error, why) then { return (R.error, why) }
           (R.ok, pair) then {
             const (platform_os, platform_arch) = pair
-            case client.select_platform(first.body, platform_os, platform_arch) {
+            case client.select_platform(repo, first.body, platform_os, platform_arch) {
               (R.error, why) then { return (R.error, why) }
               (R.ok, child_digest) then {
                 case client.fetch_manifest(repo, child_digest) {

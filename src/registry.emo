@@ -297,8 +297,19 @@ class Client {
   }
 
   // Select a child manifest from an OCI index (or Docker manifest list) by
-  // platform; answers the child's digest for the next fetch_manifest.
-  def select_platform(index_body String, os String, arch String) (R, String) {
+  // platform; answers the child's digest for the next fetch_manifest. A
+  // platformless index-type child (buildx's nested multi-platform wrapper)
+  // recurses — its bytes come from the same registry by digest (depth
+  // 4, like the registry's own resolve walk).
+  def select_platform(repo String, index_body String, os String, arch String) (R, String) {
+    return self.select_platform_depth(repo, index_body, os, arch, 0)
+  }
+
+  // The depth-carrying core of the platform walk.
+  def select_platform_depth(repo String, index_body String, os String, arch String, depth Int64) (R, String) {
+    if depth > 4 {
+      return (R.error, "registry: the index nests more than 4 levels deep")
+    }
     case json.decode(index_body) {
       (R.error, why) then { return (R.error, "registry: index is not valid JSON: " + why) }
       (R.ok, doc) then {
@@ -306,7 +317,7 @@ class Client {
           (R.error, why) then { return (R.error, "registry: index has no manifests array: " + why) }
           (R.ok, manifests) then {
             if manifests.is(json.JsonArray) {
-              return index_scan(manifests, os, arch)
+              return self.index_scan(repo, manifests, os, arch, depth)
             }
             return (R.error, "registry: index manifests is not an array")
           }
@@ -314,36 +325,56 @@ class Client {
       }
     }
   }
-}
 
-def index_scan(manifests json.JsonArray, os String, arch String) (R, String) {
-  const items = manifests.items()
-  var available = ""
-  var i = 0
-  while i < items.length() {
-    const item = items[i]
-    case json_member(item, "digest") {
-      (R.error, why) then { return (R.error, "registry: index entry " + i.to_string() + " has no digest: " + why) }
-      (R.ok, digest_value) then {
-        const digest = digest_value.as_string()
-        case json_member(item, "platform") {
-          (R.error, why) then {
-            available = available + " " + digest + " (no platform)"
-          }
-          (R.ok, platform) then {
-            const item_os = member_string_or(platform, "os", "?")
-            const item_arch = member_string_or(platform, "architecture", "?")
-            available = available + " " + item_os + "/" + item_arch
-            if item_os == os && item_arch == arch {
-              return (R.ok, digest)
+  // One scan level: a child with a matching platform wins; a platformless
+  // index-type child is fetched and recursed; anything else widens the
+  // "available" list the error carries.
+  def index_scan(repo String, manifests json.JsonArray, os String, arch String, depth Int64) (R, String) {
+    const items = manifests.items()
+    var available = ""
+    var i = 0
+    while i < items.length() {
+      const item = items[i]
+      case json_member(item, "digest") {
+        (R.error, why) then { return (R.error, "registry: index entry " + i.to_string() + " has no digest: " + why) }
+        (R.ok, digest_value) then {
+          const digest = digest_value.as_string()
+          case json_member(item, "platform") {
+            (R.error, why) then {
+              // No platform on the descriptor: an index-type child recurses
+              // into its bytes; anything else is listed as unusable.
+              const media = member_string_or(item, "mediaType", "")
+              if media == mt_oci_index || media == mt_docker_list {
+                case self.fetch_manifest(repo, digest) {
+                  (R.error, why) then { return (R.error, why) }
+                  (R.ok, nested) then {
+                    case self.select_platform_depth(repo, nested.body, os, arch, depth + 1) {
+                      (R.error, nested_why) then {
+                        available = available + " " + digest + " (nested: " + nested_why + ")"
+                      }
+                      (R.ok, found) then { return (R.ok, found) }
+                    }
+                  }
+                }
+              } else {
+                available = available + " " + digest + " (no platform)"
+              }
+            }
+            (R.ok, platform) then {
+              const item_os = member_string_or(platform, "os", "?")
+              const item_arch = member_string_or(platform, "architecture", "?")
+              available = available + " " + item_os + "/" + item_arch
+              if item_os == os && item_arch == arch {
+                return (R.ok, digest)
+              }
             }
           }
         }
       }
+      i = i + 1
     }
-    i = i + 1
+    return (R.error, "registry: index lists no " + os + "/" + arch + " manifest (available:" + available + ")")
   }
-  return (R.error, "registry: index lists no " + os + "/" + arch + " manifest (available:" + available + ")")
 }
 
 // Shared manifest finishing: status handling, digest verification, media

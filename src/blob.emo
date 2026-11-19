@@ -540,7 +540,7 @@ def download_blob_with(t BlobTransport, url String, expected_digest String, expe
         attempt = attempt + 1
         continue
       }
-      (R.ok, open) then {
+          (R.ok, open) then {
         var from = have
         if !open.resumed && have > 0 {
           // The server ignored Range; restart from zero.
@@ -563,9 +563,23 @@ def download_blob_with(t BlobTransport, url String, expected_digest String, expe
           (R.ok, downloaded) then {
             const (_, _) = open.stream.close()
             const total = from + downloaded
-            if expected_size >= 0 && total != expected_size {
+            if expected_size >= 0 && total > expected_size {
               cleanup_blob_temp(part, meta)
               return (R.error, "blob: size mismatch for " + url + " — expected " + expected_size.to_string() + " bytes, got " + total.to_string())
+            }
+            if expected_size >= 0 && total < expected_size {
+              // A Range window came back (the registry serves bounded 206
+              // slices because one big body can die on a full socket
+              // buffer). The .meta sidecar already records `total`; walk to
+              // the next window — a no-progress window is an error, a
+              // progressing one keeps the retry budget fresh.
+              if downloaded == 0 {
+                cleanup_blob_temp(part, meta)
+                return (R.error, "blob: the server returned an empty window at byte " + total.to_string() + " of " + url)
+              }
+              have = total
+              attempt = 0
+              continue
             }
             const prior = if open.resumed { have } else { 0 }
             const content_total = open.total + prior

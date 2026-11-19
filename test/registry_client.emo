@@ -240,11 +240,11 @@ def test_fetch_by_digest_reference() {
 def test_select_platform_matches_exact() {
   const client = make_client([])
   const index = index_json()
-  case client.select_platform(index, "linux", "arm64") {
+  case client.select_platform("acme/app", index, "linux", "arm64") {
     (R.ok, digest) then { expect_equal("sha256:" + hex_b, digest) }
     (R.error, why) then { expect_fail("select failed: " + why) }
   }
-  case client.select_platform(index, "linux", "amd64") {
+  case client.select_platform("acme/app", index, "linux", "amd64") {
     (R.ok, digest) then { expect_equal("sha256:" + hex_a, digest) }
     (R.error, why) then { expect_fail("select failed: " + why) }
   }
@@ -252,7 +252,7 @@ def test_select_platform_matches_exact() {
 
 def test_select_platform_no_match_lists_available() {
   const client = make_client([])
-  case client.select_platform(index_json(), "windows", "386") {
+  case client.select_platform("acme/app", index_json(), "windows", "386") {
     (R.ok, _) then { expect_fail("expected no match") }
     (R.error, why) then {
       expect_true(why.index_of("linux/amd64") >= 0)

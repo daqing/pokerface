@@ -1,3 +1,4 @@
 .emo-build/
 /main
 docs-site/site/
+examples/hello/pokerface.lock.yaml

@@ -92,3 +92,33 @@ Direct requires in `package.emo`: `os`, `file`, `crypto`, `http`, `yaml`,
 `json` — all `0.1.0`, locked in `package.lock` (transitive: `net`, `float`,
 `time` through `http`). Not pinned yet, by design: `slog`, `httpd`,
 `sqlite3` — they land with the tasks that first require them.
+
+## The socket write limit (T4.13, 2026-11-20)
+
+**A single `conn.write` above roughly 64 KiB can die with
+"Resource temporarily unavailable"** — the c runtime's plain-TCP
+`emo_net_write_once` calls `send` once and treats `EAGAIN` (socket buffer
+full) as a fatal error instead of waiting for writability; the TLS path
+already loops on `SSL_ERROR_WANT_WRITE`, the plain path does not. Partial
+writes are handled (the outer loop continues on a positive count), so the
+failure only fires when a `send` starts while the buffer is full — which
+for loopback is any multi-hundred-KiB body whose peer pauses between reads.
+
+Consequences and the workaround, both shipped in T4.13:
+
+- the **push** uploads blobs in 64 KiB PATCH windows (`src/push.emo`
+  `push_single_max`/`push_chunk_size`), never one giant body;
+- the **registry** serves blob GETs as bounded 206 windows
+  (`registry/blobs.emo`, `blob_range_window` = 32 KiB) for `Range:
+  bytes=A-` requests, with a Content-Range naming exactly what was sent;
+- the **pull** downloader walks those windows: an under-run against the
+  declared size continues the loop from the `.meta` offset until the size
+  is reached, then the digest verifies (`src/blob.emo`
+  `download_blob_with`).
+
+The root-cause fix belongs in the runtime (wait for writability on
+EAGAIN, mirroring the TLS path, in `emo_c_runtime.c` and the interpreter's
+write path) — recommended upstream follow-up; until it lands, a plain
+200 GET of a blob larger than the socket buffer dies mid-body for
+every client (curl included), which is why the pull always resumes
+through windows.

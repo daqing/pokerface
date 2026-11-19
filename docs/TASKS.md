@@ -634,7 +634,7 @@ Exit criteria:
 | [x] | T4.10 | CLI and configuration reference | T1.1, T1.8 | 2h |
 | [x] | T4.11 | YAML / lock / metadata specification | T1.4, T1.5 | 3h |
 | [x] | T4.12 | Registry operations guide | T2.17 | 3h |
-| [ ] | T4.13 | Example application | T4.2, T4.3 | 3h |
+| [x] | T4.13 | Example application | T4.2, T4.3 | 3h |
 | [ ] | T4.14 | End-to-end demo script | T4.3, T4.13, T1.14 | 3h |
 | [ ] | T4.15 | Failure fallback and troubleshooting matrix | T1.14, T2.19 | 2h |
 | [ ] | T4.16 | README, Chinese edition, and release checklist | T4.8-T4.15 | 2h |
@@ -795,6 +795,8 @@ Exit criteria:
 **Acceptance**: `pokerface build --push --write-lock` succeeds; `pokerface pull` followed by a container run returns 200; the image contains no build cache or secrets; the example can feed the CI template.
 
 **Depends on**: T4.2, T4.3 · **Estimate**: 3h
+
+> **Notes** (2026-11-20, ~3h, includes a P0 find): Done. `examples/hello/`: a pure-stdlib Go service (`/` answers 200 with a message, `/healthz` `ok`), two committed static Linux binaries (CGO off, `-trimpath -ldflags "-s -w"` — the image is `FROM scratch` + one binary, no shell, no cache, no secrets), a `Dockerfile` using buildx's `ARG TARGETARCH` (the example README documents the rebuild commands), and a two-platform `pokerface.yaml`. **This task surfaced a P0 runtime limitation and shipped the workaround**: the c runtime's plain-TCP `send` treats EAGAIN (a full socket buffer) as fatal — any single response body above ~64 KiB dies mid-transfer for EVERY client (verified: curl fetched 326,812 of a 2,516,528-byte blob; the registry's one-write httpd response path and the client's big-body upload both hit it). Workaround, all in-repo: push uploads 64 KiB PATCH windows; the registry's blob GET serves bounded 206 windows (`blob_range_window` 32 KiB, Content-Range naming exactly the slice, out-of-window 416, malformed Range 400); the pull downloader walks the windows (an under-run against the declared size continues from the `.meta` offset until the size is reached, then the digest verifies; a no-progress window is an error). Root cause + the recommended runtime fix (wait-for-writable on EAGAIN, mirroring the TLS path, in emo_c_runtime.c + the interpreter) recorded in `docs/notes/runtime-capabilities.md` and left for the emo-lang project — until it lands, a plain 200 GET of a large blob dies for every client. **Verified end to end** in a standalone repo shaped like the CI target (examples/hello copied out, `git init`, origin remote — decision D2 puts the lock at the repository ROOT, so a subdirectory example cannot be resolved from its parent): `build --write-lock` pushed a 2-platform index (5 uploaded, 2 skipped — the identical binary layers skipped), `resolve` answered the pushed digest, `pull` walked the 206 windows into docker, and `curl` answered **HTTP/1.1 200 OK** from the running container plus `ok` from `/healthz`; expected size 8.4 MB per platform (a static Go binary). Tests: 5 new Range-window route tests; emo test 531/531, c target builds. Client-side fix en route: `select_platform` now recurses nested indexes (the client-side twin of T4.13's registry resolve fix) with the repo threaded through. Gotchas: `pokerface.yaml` flow-style `tags: [latest, sha-{{ … }}]` breaks YAML (quote template entries); `ARG TARGETARCH` must be DECLARED before use; a subdirectory lock is invisible to resolve (D2's root rule is a real contract).
 
 #### T4.14 End-to-End Demo Script
 
