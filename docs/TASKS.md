@@ -629,7 +629,7 @@ Exit criteria:
 | [x] | T4.5 | Build trigger and versioning strategy ADR | none | 1h |
 | [x] | T4.6 | CI template: GitHub Actions first | T4.3, T4.4 | 3h |
 | [x] | T4.7 | Install script and release workflow | T1.1 | 3h |
-| [ ] | T4.8 | Docs site skeleton and navigation | T4.5 | 2-3h |
+| [x] | T4.8 | Docs site skeleton and navigation | T4.5 | 2-3h |
 | [ ] | T4.9 | Quick start and installation guide | T4.7, T4.8 | 2h |
 | [ ] | T4.10 | CLI and configuration reference | T1.1, T1.8 | 2h |
 | [ ] | T4.11 | YAML / lock / metadata specification | T1.4, T1.5 | 3h |
@@ -735,6 +735,8 @@ Exit criteria:
 **Acceptance**: Local preview works; navigation has no dead links; mobile layout is readable; deployment to GitHub Pages succeeds; source Markdown stays under `docs/` for review.
 
 **Depends on**: T4.5 · **Estimate**: 2-3h
+
+> **Notes** (2026-11-20, ~2h): Done, per decision D10 — plain Markdown on GitHub Pages, no framework, no node_modules. `docs-site/build.py` (python3 + the `markdown` package, the only dependency) renders EVERY .md under docs/ through one template into `docs-site/site/`: a fixed sidebar (Getting started / Reference / Specifications / Registry / Project), titles from each page's first heading, viewport meta + a ≤900px media query for mobile, and depth-relative nav URLs because project Pages serves under a subpath. **Dead links fail the build**: the builder resolves every relative markdown link (and every nav entry) against the docs tree and exits 1 with the offender list — navigation cannot rot silently (it earned its keep immediately: the nav named quick-start.md before that page existed and the build refused). Sibling `.md` links in the body are rewritten to `.html` at build time. `docs-site/preview.sh` builds and serves at 127.0.0.1:8080 — verified with real HTTP (the landing page and spec/push.html answer their titles, /install.html 200). `.github/workflows/docs.yaml` deploys on pushes touching docs/** (setup-python, pip install markdown, build, upload-pages-artifact + deploy-pages with `pages: write`/`id-token: write`, concurrency-canceled); actionlint passes. Source Markdown stays under docs/ untouched — the builder only reads. `docs-site/site/` is gitignored. "Deployment to GitHub Pages succeeds" is a live-GitHub check (recorded for T4.17). The nav's quick-start entry lands with T4.9.
 
 #### T4.9 Quick Start and Installation Guide
 

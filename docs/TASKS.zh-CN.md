@@ -629,7 +629,7 @@ images:
 | [x] | T4.5 | 构建触发与版本策略 ADR | 无 | 1h |
 | [x] | T4.6 | CI 模板：GitHub Actions 为主 | T4.3、T4.4 | 3h |
 | [x] | T4.7 | 安装脚本与发布工作流 | T1.1 | 3h |
-| [ ] | T4.8 | 文档站骨架与导航 | T4.5 | 2-3h |
+| [x] | T4.8 | 文档站骨架与导航 | T4.5 | 2-3h |
 | [ ] | T4.9 | 快速开始与安装文档 | T4.7、T4.8 | 2h |
 | [ ] | T4.10 | CLI 与配置参考 | T1.1、T1.8 | 2h |
 | [ ] | T4.11 | YAML / lock / 元数据规范 | T1.4、T1.5 | 3h |
@@ -735,6 +735,8 @@ images:
 **验收**：本地可预览；导航无死链；移动端可读；部署到 GitHub Pages 成功；文档源文件仍在 `docs/` 便于 review。
 
 **依赖**：T4.5 · **预估**：2-3h
+
+> **笔记**（2026-11-20，约 2h）：完成，按决策 D10——GitHub Pages 上的纯 Markdown，无框架、无 node_modules。`docs-site/build.py`（python3 + `markdown` 包，唯一依赖）把 docs/ 下所有 .md 经一个模板渲染进 `docs-site/site/`：固定侧栏（Getting started / Reference / Specifications / Registry / Project）、标题取每页首个一级标题、viewport meta 与 ≤900px 媒体查询保证移动端可读、导航 URL 按页面深度取相对路径（项目 Pages 挂在子路径下）。**死链会让构建失败**：构建器把每条相对 markdown 链接（和每个导航项）对着 docs 树解析，出错即退出 1 并列出问题——导航不会悄悄烂掉（立刻见效：导航先写了 quick-start.md 而该页还不存在，构建直接拒绝）。正文里兄弟页面的 `.md` 链接在构建时改写成 `.html`。`docs-site/preview.sh` 构建并在 127.0.0.1:8080 伺服——用真实 HTTP 验证（首页与 spec/push.html 的标题正确、/install.html 返回 200）。`.github/workflows/docs.yaml` 在触碰 docs/** 的推送上部署（setup-python、pip install markdown、构建、upload-pages-artifact + deploy-pages，权限 `pages: write`/`id-token: write`，concurrency 取消旧跑）；actionlint 通过。源 Markdown 留在 docs/ 原样可审——构建器只读。`docs-site/site/` 已 gitignore。"部署到 GitHub Pages 成功"是需要真实 GitHub 的检查（记给 T4.17）。导航的 quick-start 项随 T4.9 落地。
 
 #### T4.9 快速开始与安装文档
 

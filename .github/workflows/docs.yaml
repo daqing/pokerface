@@ -1,0 +1,47 @@
+# The docs site deployment (T4.8, decision D10): plain Markdown on GitHub
+# Pages — no site framework, no node_modules. Every push that touches the
+# docs rebuilds the site (the builder also fails the run on a dead link)
+# and deploys it. The source Markdown stays under docs/ for review; this
+# workflow only renders it.
+
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths: ["docs/**", "docs-site/**"]
+  workflow_dispatch:
+
+permissions:
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the renderer
+        run: pip install markdown
+      - name: Build the site (fails on dead links)
+        run: python3 docs-site/build.py
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs-site/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
