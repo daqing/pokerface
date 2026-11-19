@@ -637,7 +637,7 @@ Exit criteria:
 | [x] | T4.13 | Example application | T4.2, T4.3 | 3h |
 | [x] | T4.14 | End-to-end demo script | T4.3, T4.13, T1.14 | 3h |
 | [x] | T4.15 | Failure fallback and troubleshooting matrix | T1.14, T2.19 | 2h |
-| [ ] | T4.16 | README, Chinese edition, and release checklist | T4.8-T4.15 | 2h |
+| [x] | T4.16 | README, Chinese edition, and release checklist | T4.8-T4.15 | 2h |
 | [x] | T4.17 | CI end-to-end regression | T4.14 | 3h |
 
 ### 6.3 Task Details
@@ -831,6 +831,8 @@ Exit criteria:
 **Acceptance**: English and Chinese content correspond one-to-one; commands are copy-pasteable; Roadmap checkboxes match reality; the checklist covers versioning and tag rules; no stale screenshots or links.
 
 **Depends on**: T4.8-T4.15 · **Estimate**: 2h
+
+> **Notes** (2026-11-20, ~1.5h): Done. `README.md` / `README.zh-CN.md` updated one-to-one: the project-status paragraph (M1+M2+M4 implemented, dated, doc links), a Quick Start that matches the real CLI (`curl … | sh` install → local registry → `pokerface build --write-lock` + lock commit → `resolve`/`pull`/`docker run`), the one-command verification block (all three e2e scripts), and the Roadmap checkboxes made true (7 of 7 checked with task references; the post-v0.1 list carries the honest leftovers: floating semver tags, Basic→token exchange, a registry GC, the runtime socket-write fix). The stale "build lands in a later milestone" and the fictional `build --repo … --push` example are gone. `RELEASE.md` is the release checklist: version-bump-in-the-same-commit rule, changelog discipline, the pre-tag gates (full test suite, both builds, all three e2e scripts, docs-site build, actionlint), the annotated-`v*`-tag trigger and what release.yaml produces, post-release install verification against the real checksums, and rollback semantics (a corrected newest release is the rollback; the registry never rolls back through migrations). `CHANGELOG.md` covers 0.1.0 grouped by milestone with the two fixes called out (Range windows, nested-index recursion). EN/zh commands verified copy-pasteable against the real binaries during T4.9/T4.13/T4.14 runs; no screenshots to go stale; every link target exists (the docs-site dead-link checker passes).
 
 #### T4.17 CI End-to-End Regression
 

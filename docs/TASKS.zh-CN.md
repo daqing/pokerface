@@ -637,7 +637,7 @@ images:
 | [x] | T4.13 | 示例应用 | T4.2、T4.3 | 3h |
 | [x] | T4.14 | 端到端演示脚本 | T4.3、T4.13、T1.14 | 3h |
 | [x] | T4.15 | 故障回退与排障矩阵 | T1.14、T2.19 | 2h |
-| [ ] | T4.16 | README、中文版与发布清单 | T4.8-T4.15 | 2h |
+| [x] | T4.16 | README、中文版与发布清单 | T4.8-T4.15 | 2h |
 | [x] | T4.17 | CI 端到端回归 | T4.14 | 3h |
 
 ### 6.3 任务详情
@@ -831,6 +831,8 @@ images:
 **验收**：英文与中文内容一一对应；命令可复制执行；Roadmap 勾选与实际一致；发布清单覆盖版本号与 tag 规则；无过期截图或链接。
 
 **依赖**：T4.8-T4.15 · **预估**：2h
+
+> **笔记**（2026-11-20，约 1.5h）：完成。`README.md` / `README.zh-CN.md` 一一对应更新：项目状态段（M1+M2+M4 已实现，带日期与文档链接）、与真实 CLI 一致的快速开始（`curl … | sh` 安装 → 本地 registry → `pokerface build --write-lock` + lock 提交 → `resolve`/`pull`/`docker run`）、一条命令验证块（三个 e2e 脚本）、路线图复选框改为真实状态（7/7 打勾并带任务编号；v0.1 之后的诚实清单：浮动 semver tag、Basic 换 token、registry GC、runtime socket 写修复）。过时的"build 属于后续里程碑"与虚构的 `build --repo … --push` 示例已删除。`RELEASE.md` 是发布清单：版本号与改动同提交的规则、changelog 纪律、打 tag 前的门禁（全量测试、双构建、三个 e2e 脚本、文档站构建、actionlint）、annotated `v*` tag 触发与 release.yaml 的产物、发布后对真实校验和的安装验证、回滚语义（修正版最新发布即回滚；registry 绝不跨迁移回滚）。`CHANGELOG.md` 覆盖 0.1.0，按里程碑分组，并点名两个修复（Range 窗口、嵌套 index 递归）。中英命令在 T4.9/T4.13/T4.14 的真实运行中验证过可复制粘贴；无截图可过期；每个链接目标都存在（文档站死链检查器通过）。
 
 #### T4.17 CI 端到端回归
 
