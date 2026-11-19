@@ -635,7 +635,7 @@ Exit criteria:
 | [x] | T4.11 | YAML / lock / metadata specification | T1.4, T1.5 | 3h |
 | [x] | T4.12 | Registry operations guide | T2.17 | 3h |
 | [x] | T4.13 | Example application | T4.2, T4.3 | 3h |
-| [ ] | T4.14 | End-to-end demo script | T4.3, T4.13, T1.14 | 3h |
+| [x] | T4.14 | End-to-end demo script | T4.3, T4.13, T1.14 | 3h |
 | [ ] | T4.15 | Failure fallback and troubleshooting matrix | T1.14, T2.19 | 2h |
 | [ ] | T4.16 | README, Chinese edition, and release checklist | T4.8-T4.15 | 2h |
 | [ ] | T4.17 | CI end-to-end regression | T4.14 | 3h |
@@ -807,6 +807,8 @@ Exit criteria:
 **Acceptance**: One command succeeds on a clean machine; failures preserve diagnostic logs; no Docker Hub access; the run completes in reasonable time (target under 10 minutes); repeated runs leave no residue.
 
 **Depends on**: T4.3, T4.13, T1.14 · **Estimate**: 3h
+
+> **Notes** (2026-11-20, ~1.5h): Done. `scripts/e2e.sh` walks the whole M4 path in one command: emo builds both binaries → a local fs-backed registry on `127.0.0.1:$PORT` (`E2E_PORT`, default 4598) gated on `/healthz` → examples/hello copied into a fresh git repo **whose pokerface.yaml the script GENERATES** (the example's committed config points at the quick start's port — the first run pushed to a stale registry on 4599 while docker run asked 4598; generating the yaml makes image and registry agree) → `build --write-lock` with buildx streamed to a log → the lock committed → `resolve` asserted against the lock's digest → `pull` → the container run (docker, podman fallback) with `curl` asserting **200 + the hello body + /healthz ok** → a repeat build asserting identical layers are SKIPPED. `--ci` mode keeps every assertion but prints one `[e2e] step` line each. **Verified twice** (normal 14s, --ci 13s — far under the 10-minute target); failures keep the temp dir with per-step logs and print the path; successful runs leave no residue (the one failed run's directory was moved aside per the deletion rule). Docker-Hub-free by construction (FROM scratch + loopback). Harness gotcha re-confirmed: run it redirected to a file, never piped. The script also stops leftover registries by shutdown marker — and the marker protocol failed for a registry whose data_dir had been deleted (the marker cannot be created); that orphan needed SIGKILL, worth remembering for T4.15.
 
 #### T4.15 Failure Fallback and Troubleshooting Matrix
 
