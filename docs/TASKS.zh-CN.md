@@ -633,7 +633,7 @@ images:
 | [x] | T4.9 | 快速开始与安装文档 | T4.7、T4.8 | 2h |
 | [x] | T4.10 | CLI 与配置参考 | T1.1、T1.8 | 2h |
 | [x] | T4.11 | YAML / lock / 元数据规范 | T1.4、T1.5 | 3h |
-| [ ] | T4.12 | Registry 运维指南 | T2.17 | 3h |
+| [x] | T4.12 | Registry 运维指南 | T2.17 | 3h |
 | [ ] | T4.13 | 示例应用 | T4.2、T4.3 | 3h |
 | [ ] | T4.14 | 端到端演示脚本 | T4.3、T4.13、T1.14 | 3h |
 | [ ] | T4.15 | 故障回退与排障矩阵 | T1.14、T2.19 | 2h |
@@ -783,6 +783,8 @@ images:
 **验收**：按文档可从零部署；CDN 缓存策略与代码一致；备份 / 恢复步骤可执行；包含“不要暴露 MinIO 凭据”的安全提醒。
 
 **依赖**：T2.17 · **预估**：3h
+
+> **笔记**（2026-11-20，约 2h）：完成。`docs/registry/operations.md` 是运维手册，内容对着真实的配置面写（对照 registry/config.emo 的严格未知字段清单核实：listen/data_dir/db_path/store{fs,s3}/limits/shutdown_file/auth/observability；s3 有 presign_ttl 与 verify_tls；limits 有 max_body_bytes 默认 16 MiB）。小节：**拓扑**（compose 见 deployment.md；裸二进制与停机协议）、**存储**（fs 原子改名语义；S3 启动桶检查；presigned 307 重定向）、**认证**（D6 的预共享账号、signing key 轮换立即失效、反代头纪律保证 Bearer dance）、**TLS**（Caddy LE 与 localhost 内部 CA、Host 头透传）、**缓存**（CDN 表与 registry-cache.md 完全一致——blob 永久不可变、manifest 60 秒 must-revalidate、/token 与 /metrics 永不缓存、307 不可吞掉）、**备份/恢复**（可执行的停→拷→起，用停机标记文件、/readyz 门禁、SQLite+桶必须成对一致的警告、digest 比对式恢复验证）、**容量与清理**（上传会话过期自动清理；孤儿 blob 会累积——v0.1 没有 GC，如实写明——附一条只读 SQL 审计查询，已对着真实的 manifests/blobs 表结构核实，删除明确写成停机后的手动操作）、**监控**（/healthz 与 /readyz 的语义差别、指标序列、抓取片段、无泄漏的日志契约），以及**安全清单**——首条即验收要求的警告：MinIO 绝不对外暴露——拿到桶和密钥的人可以绕过 registry 做的一切认证检查。排障指向 T4.15。站点导航加入 runbook；重建 44 页，链接全部通过。
 
 #### T4.13 示例应用
 

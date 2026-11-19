@@ -633,7 +633,7 @@ Exit criteria:
 | [x] | T4.9 | Quick start and installation guide | T4.7, T4.8 | 2h |
 | [x] | T4.10 | CLI and configuration reference | T1.1, T1.8 | 2h |
 | [x] | T4.11 | YAML / lock / metadata specification | T1.4, T1.5 | 3h |
-| [ ] | T4.12 | Registry operations guide | T2.17 | 3h |
+| [x] | T4.12 | Registry operations guide | T2.17 | 3h |
 | [ ] | T4.13 | Example application | T4.2, T4.3 | 3h |
 | [ ] | T4.14 | End-to-end demo script | T4.3, T4.13, T1.14 | 3h |
 | [ ] | T4.15 | Failure fallback and troubleshooting matrix | T1.14, T2.19 | 2h |
@@ -783,6 +783,8 @@ Exit criteria:
 **Acceptance**: The guide enables a from-scratch deployment; CDN cache policy matches the code; backup / restore steps are executable; it includes a warning never to expose MinIO credentials.
 
 **Depends on**: T2.17 · **Estimate**: 3h
+
+> **Notes** (2026-11-20, ~2h): Done. `docs/registry/operations.md` is the runbook, written against the actual config surface (verified against registry/config.emo's strict unknown-field lists: listen/data_dir/db_path/store{fs,s3}/limits/shutdown_file/auth/observability; s3 carries presign_ttl and verify_tls; limits carry max_body_bytes 16 MiB default). Sections: **topologies** (compose per deployment.md; bare binary with the shutdown protocol), **storage** (fs atomic-rename semantics; S3 startup bucket check; presigned 307 redirects), **authentication** (pre-shared accounts per D6, signing-key rotation invalidating tokens immediately, reverse-proxy header discipline for the Bearer dance), **TLS** (Caddy LE vs localhost internal CA, Host-header passthrough), **caching** (the CDN table mirrors registry-cache.md exactly — blobs immutable forever, manifests 60s must-revalidate, /token and /metrics never cached, 307 not swallowed), **backup/restore** (executable stop→copy→start with the shutdown marker, /readyz gating, the paired-consistency warning for SQLite+bucket, and a digest-compared restore check), **capacity/cleanup** (upload expiry is automatic; orphaned blobs accumulate — v0.1 has no GC, an honest statement — with a read-only SQL audit query verified against the actual manifests/blobs schemas, deletion documented as a stopped-server manual act), **monitoring** (/healthz vs /readyz semantics, the metrics series, a scrape snippet, and the leak-proof log contract), and a **security checklist** whose first item is the acceptance-required warning: MinIO is never exposed — anyone reaching the bucket with its keys bypasses every auth check the registry performs. Troubleshooting defers to T4.15. Site nav gained the runbook; rebuild 44 pages, links ok.
 
 #### T4.13 Example Application
 

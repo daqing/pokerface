@@ -46,6 +46,7 @@ SECTIONS = [
         ("spec/errors.md", "Errors and exit codes"),
     ]),
     ("Registry", [
+        ("registry/operations.md", "Operations runbook"),
         ("spec/registry-config.md", "Configuration"),
         ("spec/registry-db.md", "Storage"),
         ("spec/registry-uploads.md", "Uploads"),
