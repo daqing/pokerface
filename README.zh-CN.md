@@ -4,6 +4,8 @@
 
 Git 管元数据与构建上下文，CDN/对象存储管二进制层，`pokerface` 负责把两者粘合起来，并提供**抗屏蔽的镜像拉取能力**——全程不向 `registry-1.docker.io` 发起 `docker pull`，从架构上规避 TLS timeout。
 
+**状态**（2026-11-20）：客户端链路（M1）、registry 服务（M2）与构建交付链路（M4）均已实现——`pokerface build` 用 buildx 或 podman 构建、推送并写回 lock；registry 提供 OCI distribution 子集、fs/S3(MinIO) 存储、Bearer 认证、指标与 compose 部署。文档：[快速开始](docs/getting-started.zh-CN.md) · [CLI 参考](docs/reference/cli.md) · [规范索引](docs/spec/README.md) · [排障矩阵](docs/troubleshooting.md)。
+
 
 
 ## 为什么做这个项目
@@ -130,55 +132,43 @@ Git 管元数据与构建上下文，CDN/对象存储管二进制层，`pokerfac
 
 ## 快速开始
 
-> M1 客户端（`resolve`、`pull`、`cache`、`version`）已实现；`build` 属于后续里程碑。
+安装（或从源码构建——见 `docs/install.md`）：
 
 ```bash
-# 拉取镜像（从 Git 元数据解析，经 CDN 下载，导入本地 Docker）
-pokerface pull github.com/you/app:latest
-
-# 查看解析结果（tag → Commit → Digest）
-pokerface resolve github.com/you/app:latest
-
-# 构建并推送（后续里程碑）
-pokerface build --repo github.com/you/app --push
+curl -fsSL https://raw.githubusercontent.com/daqing/pokerface/main/install.sh | sh
+pokerface version
 ```
 
-### M1 客户端示例
-
-```console
-$ pokerface resolve github.com/acme/app:latest
-ref:     github.com/acme/app:latest
-commit:  c1e0a12d02ba5efbdd3d5ac6358ee1b7f12b079e
-image:   registry.example.com/acme/app
-digest:  sha256:720e8b95ef5c4ccb7b71101986481029202e7d5ecd9e644fdd089590ff9cf131
-tags:    latest
-
-$ pokerface pull github.com/acme/app:latest
-image:    registry.example.com/acme/app:latest
-digest:   sha256:720e8b95ef5c4ccb7b71101986481029202e7d5ecd9e644fdd089590ff9cf131
-commit:   c1e0a12d02ba5efbdd3d5ac6358ee1b7f12b079e
-platform: linux/amd64
-runtime:  docker (registry.example.com/acme/app:latest)
-
-$ pokerface cache ls
-cache: /Users/you/.cache/pokerface
-  git        1 entries  27.4 KiB
-  manifests  1 entries  805 B
-  blobs      2 entries  363 B
-  refs       1 entries  41 B
-  total      5 entries  28.6 KiB
-  limits     ttl=(unset) max_size=(unset)
-```
-
-首次在线拉取后，`pokerface pull <ref> --offline` 可完全从本地缓存重复拉取。`pokerface cache verify` 校验缓存并淘汰损坏条目；`pokerface cache rm` 清空缓存。M1 流程规范见 `docs/spec/pull.md` 与 `docs/spec/cache.md`。
-
-完全本地的验证（fixture Git 仓库 + Emo mock registry/CDN，不访问 Docker Hub）：
+整条链路在本地即可跑通，不需要 Docker Hub——本机起 registry，镜像 `FROM scratch`：
 
 ```bash
-./scripts/e2e-m1.sh
+# 启动本地 registry（生产部署见 docs/registry/operations.md）
+registry --config registry.yaml &
+
+# 在应用仓库里（docs/getting-started.zh-CN.md 有完整 walkthrough）：
+pokerface build --write-lock     # buildx 构建、pokerface 推送、lock 记录 digest
+git add pokerface.lock.yaml && git commit -m "pokerface: update lock"
+
+# 任何地方消费：
+pokerface resolve github.com/you/app:main    # tag → commit → digest
+pokerface pull github.com/you/app:main       # 校验并导入 Docker/podman
+docker run --rm 127.0.0.1:4599/hello/app:latest
 ```
 
-脚本会构建 CLI，执行 resolve/pull、离线二次拉取与缓存命令，并在 skopeo 加 docker/podman/ctr 可用时导入检测到的运行时。设置 `KEEP_TMP=1` 可保留临时目录与日志。
+带预期输出的完整 walkthrough 在
+[docs/getting-started.zh-CN.md](docs/getting-started.zh-CN.md)（英文:
+[docs/getting-started.md](docs/getting-started.md)）；完整命令面在
+[docs/reference/cli.md](docs/reference/cli.md)。
+
+### 一条命令验证整条链路
+
+```bash
+./scripts/e2e.sh          # M4 演示：build → push → lock → resolve → pull → HTTP 200
+./scripts/e2e-m2.sh       # M2 registry：skopeo 推送、协议边界、认证
+./scripts/e2e-m1.sh       # M1 客户端：resolve/pull/离线/缓存
+```
+
+每个脚本都会构建二进制、对本地 registry 运行并断言各步骤；失败保留分步日志。`pokerface cache verify` 校验并修复缓存；`pokerface cache rm` 清空。各流程规范见 `docs/spec/pull.md`、`docs/spec/build-plan.md`、`docs/spec/push.md` 与 `docs/spec/cache.md`。
 
 ## 设计要点
 
@@ -190,13 +180,14 @@ cache: /Users/you/.cache/pokerface
 
 ## 路线图
 
-- [x] CLI 骨架与 `pokerface.yaml` 规范定义
-- [x] Git 元数据解析（tag → Commit → Digest）
-- [ ] Registry/元数据服务最小实现（Manifest + 预签名 URL）
-- [ ] CDN/对象存储后端对接（S3/MinIO 兼容）
-- [x] `skopeo` 集成与本地运行时导入
-- [ ] 构建触发器与 CI 模板
-- [ ] 文档站与端到端示例
+- [x] CLI 骨架与 `pokerface.yaml` 规范定义（T1.1、T1.4）
+- [x] Git 元数据解析（tag → Commit → Digest）（T1.6–T1.9）
+- [x] Registry/元数据服务最小实现（Manifest + 预签名 URL）（M2：T2.1–T2.19）
+- [x] CDN/对象存储后端对接（S3/MinIO 兼容）（T2.4–T2.6）
+- [x] `skopeo` 集成与本地运行时导入（T1.13）
+- [x] 构建触发器与 CI 模板（M4：T4.1–T4.7，ADR 0001）
+- [x] 文档站与端到端示例（T4.8–T4.15）
+- [ ] v0.1 之后：浮动 semver tag、Basic 凭据换 token、registry 垃圾回收、runtime socket 写修复（`docs/notes/runtime-capabilities.md`）
 
 ## 贡献
 

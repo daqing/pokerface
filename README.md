@@ -4,6 +4,16 @@ An open-source Docker alternative that distributes container images via Git remo
 
 Git manages metadata and build context, CDN/object storage manages binary layers, and `pokerface` glues them together. It provides **censorship-resistant image pulling**—no `docker pull` request ever hits `registry-1.docker.io`, eliminating TLS timeouts by design.
 
+**Status** (2026-11-20): the client loop (M1), the registry service (M2),
+and the build-and-delivery path (M4) are implemented — `pokerface build`
+builds with buildx or podman, pushes to the registry, and writes the lock
+CI consumes; the registry serves the OCI distribution subset with fs or
+S3/MinIO storage, Bearer auth, metrics, and a compose deployment. Docs:
+[getting started](docs/getting-started.md) ·
+[CLI reference](docs/reference/cli.md) ·
+[specs](docs/spec/README.md) ·
+[troubleshooting](docs/troubleshooting.md).
+
 
 
 ## Why PokerFace
@@ -132,62 +142,48 @@ Failure fallback: Git resolution failure → hard error; manifest request failur
 
 ## Quick Start
 
-> The M1 client (`resolve`, `pull`, `cache`, `version`) is implemented; `build` lands in a later milestone.
+Install (or build from source — `docs/install.md` has both):
 
 ```bash
-# Pull an image (resolve from Git metadata, download via CDN, import into local Docker)
-pokerface pull github.com/you/app:latest
-
-# Inspect resolution (tag → Commit → Digest)
-pokerface resolve github.com/you/app:latest
-
-# Build and push (planned for a later milestone)
-pokerface build --repo github.com/you/app --push
+curl -fsSL https://raw.githubusercontent.com/daqing/pokerface/main/install.sh | sh
+pokerface version
 ```
 
-### M1 client walkthrough
-
-```console
-$ pokerface resolve github.com/acme/app:latest
-ref:     github.com/acme/app:latest
-commit:  c1e0a12d02ba5efbdd3d5ac6358ee1b7f12b079e
-image:   registry.example.com/acme/app
-digest:  sha256:720e8b95ef5c4ccb7b71101986481029202e7d5ecd9e644fdd089590ff9cf131
-tags:    latest
-
-$ pokerface pull github.com/acme/app:latest
-image:    registry.example.com/acme/app:latest
-digest:   sha256:720e8b95ef5c4ccb7b71101986481029202e7d5ecd9e644fdd089590ff9cf131
-commit:   c1e0a12d02ba5efbdd3d5ac6358ee1b7f12b079e
-platform: linux/amd64
-runtime:  docker (registry.example.com/acme/app:latest)
-
-$ pokerface cache ls
-cache: /Users/you/.cache/pokerface
-  git        1 entries  27.4 KiB
-  manifests  1 entries  805 B
-  blobs      2 entries  363 B
-  refs       1 entries  41 B
-  total      5 entries  28.6 KiB
-  limits     ttl=(unset) max_size=(unset)
-```
-
-`pokerface pull <ref> --offline` repeats the pull from the local cache after
-one online run. `pokerface cache verify` checks the cache and evicts damaged
-entries; `pokerface cache rm` clears it. The M1 flow is specified in
-`docs/spec/pull.md` and `docs/spec/cache.md`.
-
-For a fully local check — a fixture Git repository plus an Emo mock
-registry/CDN, no Docker Hub — run:
+The whole loop works locally with no Docker Hub — a registry on your
+machine, an image built `FROM scratch`:
 
 ```bash
-./scripts/e2e-m1.sh
+# Start a local registry (docs/registry/operations.md has the real one)
+registry --config registry.yaml &
+
+# In your application repository (docs/getting-started.md walks this):
+pokerface build --write-lock     # buildx builds, pokerface pushes, lock records the digest
+git add pokerface.lock.yaml && git commit -m "pokerface: update lock"
+
+# Consume it anywhere:
+pokerface resolve github.com/you/app:main    # tag → commit → digest
+pokerface pull github.com/you/app:main       # verify + import into Docker/podman
+docker run --rm 127.0.0.1:4599/hello/app:latest
 ```
 
-It builds the CLI, resolves and pulls the fixture image, verifies the offline
-second pull and the cache commands, and imports into the detected runtime when
-skopeo plus docker/podman/ctr are available. Set `KEEP_TMP=1` to keep the
-temp directory and logs.
+The full walkthrough with expected output is
+[docs/getting-started.md](docs/getting-started.md) (中文:
+[docs/getting-started.zh-CN.md](docs/getting-started.zh-CN.md)); the
+complete command surface is [docs/reference/cli.md](docs/reference/cli.md).
+
+### Verify the whole path in one command
+
+```bash
+./scripts/e2e.sh          # the M4 demo: build → push → lock → resolve → pull → HTTP 200
+./scripts/e2e-m2.sh       # the M2 registry: skopeo push, protocol edges, auth
+./scripts/e2e-m1.sh       # the M1 client: resolve/pull/offline/cache
+```
+
+Each script builds the binaries, runs against a local registry, and asserts
+its steps; failures keep per-step logs. `pokerface cache verify` checks and
+repairs the cache; `pokerface cache rm` clears it. The flows are specified
+in `docs/spec/pull.md`, `docs/spec/build-plan.md`, `docs/spec/push.md`, and
+`docs/spec/cache.md`.
 
 ## Design Notes
 
@@ -199,13 +195,16 @@ temp directory and logs.
 
 ## Roadmap
 
-- [x] CLI skeleton and `pokerface.yaml` spec definition
-- [x] Git metadata resolution (tag → Commit → Digest)
-- [ ] Minimal Registry/metadata service (Manifest + presigned URLs)
-- [ ] CDN/object storage backend integration (S3/MinIO compatible)
-- [x] `skopeo` integration and local runtime import
-- [ ] Build trigger and CI templates
-- [ ] Docs site and end-to-end example
+- [x] CLI skeleton and `pokerface.yaml` spec definition (T1.1, T1.4)
+- [x] Git metadata resolution (tag → Commit → Digest) (T1.6–T1.9)
+- [x] Minimal Registry/metadata service (Manifest + presigned URLs) (M2: T2.1–T2.19)
+- [x] CDN/object storage backend integration (S3/MinIO compatible) (T2.4–T2.6)
+- [x] `skopeo` integration and local runtime import (T1.13)
+- [x] Build trigger and CI templates (M4: T4.1–T4.7, ADR 0001)
+- [x] Docs site and end-to-end example (T4.8–T4.15)
+- [ ] Post-v0.1: floating semver tags, Basic credentials → token exchange,
+      a registry garbage collector, and the runtime socket-write fix
+      (`docs/notes/runtime-capabilities.md`)
 
 ## Contributing
 
