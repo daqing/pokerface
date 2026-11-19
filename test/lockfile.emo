@@ -324,3 +324,105 @@ def invalid_locks() Array[(String, String)] {
     )
   ]
 }
+
+// ---------------------------------------------------------------------------
+// T4.4: the generation side — entry_for, merge, and the rebuild idempotency.
+
+def lock_commit() String {
+  return "0123abcd0123abcd0123abcd0123abcd0123abcd"
+}
+
+def platform_set() Array[String] {
+  return ["linux/arm64", "linux/amd64"]
+}
+
+def tag_set() Array[String] {
+  return ["sha-0123abcd", "latest"]
+}
+
+def test_entry_for_sorts_tags_and_platforms() {
+  case lock.entry_for("registry.example.com/acme/app", tag_set(), digest_a(), platform_set(), "buildkit") {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, entry) then {
+      expect_equal("latest", entry.tags[0])
+      expect_equal("sha-0123abcd", entry.tags[1])
+      expect_equal("linux/amd64", entry.platforms[0])
+      expect_equal("linux/arm64", entry.platforms[1])
+      expect_equal("", entry.manifest_digest)
+    }
+  }
+}
+
+def test_entry_for_rejects_a_bad_digest() {
+  case lock.entry_for("registry.example.com/acme/app", tag_set(), "sha256:short", platform_set(), "buildkit") {
+    (R.error, why) then { expect_true(why.index_of("digest:") >= 0) }
+    (R.ok, _) then { expect_fail("a malformed digest became a lock entry") }
+  }
+}
+
+def existing_doc() src.lockfile.LockDoc {
+  const other = src.lockfile.LockImage.new("registry.example.com/acme/other", ["stable"], digest_b(), "", ["linux/amd64"], "")
+  return src.lockfile.LockDoc.new(1, "9999999999999999999999999999999999999999", "github.com/acme/app", "", [other])
+}
+
+def test_merge_replaces_in_place_and_preserves_unrelated_entries() {
+  case lock.entry_for("registry.example.com/acme/app", tag_set(), digest_a(), platform_set(), "buildkit") {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, entry) then {
+      const doc = lock.merge(existing_doc(), entry, lock_commit(), "github.com/acme/app")
+      expect_equal(2, doc.images.length())
+      // The unrelated entry kept its position and content.
+      expect_equal("registry.example.com/acme/other", doc.images[0].image)
+      expect_equal(digest_b(), doc.images[0].digest)
+      // The fresh entry replaced nothing (appended, absent before).
+      expect_equal("registry.example.com/acme/app", doc.images[1].image)
+      expect_equal(digest_a(), doc.images[1].digest)
+      expect_equal(lock_commit(), doc.commit)
+      // generated_at stays empty: rebuilds must be byte-identical.
+      expect_equal("", doc.generated_at)
+    }
+  }
+}
+
+def test_merge_replaces_an_existing_entry_in_place() {
+  const old = src.lockfile.LockImage.new("registry.example.com/acme/app", ["old"], digest_b(), "", ["linux/amd64"], "")
+  const doc0 = src.lockfile.LockDoc.new(1, lock_commit(), "github.com/acme/app", "", [old])
+  case lock.entry_for("registry.example.com/acme/app", tag_set(), digest_a(), platform_set(), "buildkit") {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, entry) then {
+      const doc = lock.merge(doc0, entry, lock_commit(), "github.com/acme/app")
+      expect_equal(1, doc.images.length())
+      expect_equal(digest_a(), doc.images[0].digest)
+      expect_equal("buildkit", doc.images[0].builder)
+    }
+  }
+}
+
+// Rebuilding the same image produces a byte-identical lock: entry_for into
+// an existing doc, encoded, loaded, merged again, encoded again.
+def test_rebuild_is_idempotent() {
+  case lock.entry_for("registry.example.com/acme/app", tag_set(), digest_a(), platform_set(), "buildkit") {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, entry) then {
+      const first = lock.encode(lock.merge(existing_doc(), entry, lock_commit(), "github.com/acme/app"))
+      case lock.load(first) {
+        (R.error, why) then { expect_fail(why) }
+        (R.ok, reloaded) then {
+          const second = lock.encode(lock.merge(reloaded, entry, lock_commit(), "github.com/acme/app"))
+          expect_equal(first, second)
+        }
+      }
+    }
+  }
+}
+
+def test_source_comes_from_the_origin_remote() {
+  case lock.parse_source("git@github.com:acme/app.git") {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, normalized) then { expect_equal("github.com/acme/app", normalized) }
+  }
+  case lock.parse_source("https://github.com/acme/app.git") {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, normalized) then { expect_equal("github.com/acme/app", normalized) }
+  }
+}

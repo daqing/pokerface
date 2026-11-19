@@ -442,3 +442,102 @@ def join_strings(arr Array[String]) String {
   }
   return out
 }
+
+// ---------------------------------------------------------------------------
+// T4.4: the generation side — the entry a build+push produced, and its
+// merge into the lock the repository already carries.
+
+// The entry for a pushed image: tags and platforms are sorted so rebuilds
+// encode identically, and the digest is checked with the loader's own rule
+// (a malformed digest never reaches the file).
+def entry_for(image String, tags Array[String], digest String, platforms Array[String], builder String) (R, LockImage) {
+  case check_digest(digest) {
+    (R.error, why) then { return (R.error, "pokerface.lock.yaml: digest: " + why) }
+    (R.ok, checked) then {
+      return (R.ok, LockImage.new(image, sort_text(tags), checked, "", sort_text(platforms), builder))
+    }
+  }
+}
+
+// Replaces the entry with the same image name in place, appends the entry
+// when the lock does not carry it yet, and leaves every unrelated entry
+// untouched. The doc keeps the version and gains this build's commit and
+// source; generated_at stays empty — the file must be byte-identical across
+// rebuilds of the same image, so no timestamp is written.
+def merge(doc LockDoc, entry LockImage, commit String, source String) LockDoc {
+  var images = []
+  var replaced = false
+  var i = 0
+  while i < doc.images.length() {
+    if doc.images[i].image == entry.image {
+      images = images.append(entry)
+      replaced = true
+    } else {
+      images = images.append(doc.images[i])
+    }
+    i = i + 1
+  }
+  if !replaced {
+    images = images.append(entry)
+  }
+  return LockDoc.new(doc.version, commit, source, "", images)
+}
+
+// A fresh single-image lock for a repository that has none yet.
+def fresh_doc(entry LockImage, commit String, source String) LockDoc {
+  return LockDoc.new(1, commit, source, "", [entry])
+}
+
+// Lexical text order for tags and platforms (Emo strings have no order
+// operators; the comparison walks the bytes through the sort charset).
+const lock_sort_charset = "abcdefghijklmnopqrstuvwxyz0123456789.-_/"
+
+def text_less(a String, b String) Bool {
+  var i = 0
+  while i < a.length() && i < b.length() {
+    const ca = a.substring(i, 1)
+    const cb = b.substring(i, 1)
+    if ca != cb {
+      return lock_sort_charset.index_of(ca) < lock_sort_charset.index_of(cb)
+    }
+    i = i + 1
+  }
+  return a.length() < b.length()
+}
+
+def sort_text(items Array[String]) Array[String] {
+  var out = []
+  var i = 0
+  while i < items.length() {
+    var j = 0
+    var placed = false
+    while j < out.length() {
+      if !placed && text_less(items[i], out[j]) {
+        out = insert_text_at(out, j, items[i])
+        placed = true
+      }
+      j = j + 1
+    }
+    if !placed {
+      out = out.append(items[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+def insert_text_at(items Array[String], at Int64, item String) Array[String] {
+  var out = []
+  var i = 0
+  while i < items.length() {
+    if i == at {
+      out = out.append(item)
+    }
+    out = out.append(items[i])
+    i = i + 1
+  }
+  if at >= items.length() {
+    out = out.append(item)
+  }
+  return out
+}

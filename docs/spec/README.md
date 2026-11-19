@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | [pokerface-yaml.md](pokerface-yaml.md) | The build input committed with the app: image, tags, platforms, builder. | `src/config.emo` |
 | [build-plan.md](build-plan.md) | The build plan: config discovery, Git metadata capture, tag rendering/collisions, path resolution, dry-run output, and the buildx/podman execution adapter (M4/T4.1, T4.2). | `src/commands/build.emo`, `src/build.emo` |
-| [pokerface-lock.md](pokerface-lock.md) | The metadata CI writes back: `commit → image → digest` chain. | `src/lockfile.emo` |
+| [pokerface-lock.md](pokerface-lock.md) | The metadata CI writes back: `commit → image → digest` chain, generation and merge (M4/T4.4). | `src/lockfile.emo` |
 | [config.md](config.md) | Client config precedence, credentials, XDG paths, cache limits. | `src/settings.emo` |
 | [errors.md](errors.md) | Error kinds, fixed exit codes, remediation hints, JSON errors, verbose logging and redaction. | `src/errors.emo`, `src/common.emo` |
 | [registry-client.md](registry-client.md) | `/v2/` probe, Bearer auth, manifest/index fetch, media types. | `src/registry.emo` |

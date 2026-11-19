@@ -1,10 +1,10 @@
 # `pokerface.lock.yaml` v0.1 Specification
 
-> Status: v0.1, implemented by `src/lockfile.emo` (task T1.5). CI writes this
-> file back to the application repository after a successful build and push
-> (decision D2), so the pull side can resolve `tag → commit → digest` from
-> Git alone. The build-side input is `pokerface.yaml`
-> (`docs/spec/pokerface-yaml.md`).
+> Status: v0.1, implemented by `src/lockfile.emo` (tasks T1.5 and T4.4). CI
+> writes this file back to the application repository after a successful
+> build and push (decision D2), so the pull side can resolve
+> `tag → commit → digest` from Git alone. The build-side input is
+> `pokerface.yaml` (`docs/spec/pokerface-yaml.md`).
 
 ## Example
 
@@ -60,9 +60,39 @@ While `version` is `1`, unknown fields at the top level and inside an
 
 - fields always in the order `version, commit, source, generated_at, images`,
   and inside an entry `image, tags, digest, manifest_digest, platforms, builder`;
-- `tags` and `platforms` in flow style (`[latest, sha-01234567]`), in list order;
+- `tags` and `platforms` in flow style (`[latest, sha-01234567]`), sorted
+  lexically when generated;
 - `generated_at` quoted, and — like `manifest_digest` and `builder` — omitted
   entirely when empty.
+
+## Generation (T4.4)
+
+`pokerface build --write-lock` records the pushed image after a successful
+build and push:
+
+- the **entry** carries the rendered tags, the pushed digest, the plan's
+  platforms, and the builder (`buildkit` for the docker/buildx adapter,
+  `podman` for podman) — tags and platforms sorted lexically, the digest
+  checked with the loader's own rule;
+- the **document's** `commit` is the full SHA the image was built from, and
+  `source` is the context repository's origin remote normalized to
+  `<host>/<owner>/<repo>` (a repository without an origin is an error — the
+  source is required);
+- the lock is written **next to pokerface.yaml**; an existing lock is
+  **merged**: the entry with the same image name is replaced in place,
+  absent entries are appended, every unrelated entry is untouched, and a
+  lock that does not parse is an error rather than a silent clobber;
+- **no timestamp is written** — `generated_at` stays empty, so the same
+  build inputs encode to the same bytes (the digest itself changes per
+  build because buildx stamps `created`, but the file's shape never does);
+- **no secret-bearing fields exist** — the schema is commit, source, image,
+  tags, digests, platforms, builder;
+- `--commit` makes the write a **local Git commit** of the lock only
+  (`git add -- pokerface.lock.yaml` and
+  `git commit -- pokerface.lock.yaml` with the message
+  `pokerface: update pokerface.lock.yaml`); it never pushes and commits no
+  other staged or modified file. `pokerface resolve` consumes the lock from
+  that commit directly.
 
 ## Digest verification
 

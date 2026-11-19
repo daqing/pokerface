@@ -143,3 +143,13 @@ goes to that registry — the push pipeline is
 [push.md](push.md); without one the report says so and the image stays
 local. `--json` prints `tool`, `layout`, `digests`, `tags`, `platforms`,
 `pushed`, `digest`.
+
+## Lock write-back (T4.4)
+
+`--write-lock` records the pushed image in `pokerface.lock.yaml` next to
+`pokerface.yaml` (merge rules, source normalization, and the no-timestamp
+idempotency are [pokerface-lock.md](pokerface-lock.md)'s "Generation"
+section; it requires a registry section — the lock records the pushed
+digest). `--commit` makes the write a local Git commit of the lock file
+only; it never pushes. `--json` reports `lock` and `lock_commit` when
+written.

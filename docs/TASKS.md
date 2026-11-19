@@ -625,7 +625,7 @@ Exit criteria:
 | [x] | T4.1 | `pokerface build` command and build plan | T1.4, T1.5 | 2h |
 | [x] | T4.2 | BuildKit / podman build adapter | T4.1 | 3-4h |
 | [x] | T4.3 | Registry push: blobs + manifest | T1.10, T2.12, T4.2 | 3h |
-| [ ] | T4.4 | Generate and write back the lock file | T4.3 | 2h |
+| [x] | T4.4 | Generate and write back the lock file | T4.3 | 2h |
 | [ ] | T4.5 | Build trigger and versioning strategy ADR | none | 1h |
 | [ ] | T4.6 | CI template: GitHub Actions first | T4.3, T4.4 | 3h |
 | [ ] | T4.7 | Install script and release workflow | T1.1 | 3h |
@@ -687,6 +687,8 @@ Exit criteria:
 **Acceptance**: Rebuilding the same image produces an idempotent lock; multi-tag and multi-platform entries sort stably; unrelated entries are preserved; no real secrets are written; `pokerface resolve` consumes the generated lock directly.
 
 **Depends on**: T4.3 · **Estimate**: 2h
+
+> **Notes** (2026-11-20, ~2h): Done. `src/lockfile.emo` grows the generation side: `entry_for` (tags/platforms sorted lexically — strings have no order operators, so `text_less` walks bytes through a sort charset; the digest is checked with the loader's own rule), `merge` (same-image entry replaced IN PLACE, absent entries appended, unrelated entries untouched, `generated_at` forced empty so the same inputs encode byte-identically), and `fresh_doc`. `pokerface build --write-lock` writes `pokerface.lock.yaml` next to pokerface.yaml after the push (it requires a registry section — the lock records the pushed digest): `commit` = the full SHA the image was built from, `source` = the origin remote normalized via the loader's `parse_source` (a repository without an origin errors — the source is required), `builder` = buildkit/podman mapped from the adapter's tool. An existing lock merges; one that does not parse is an error, never a silent clobber. `--commit` stages and commits ONLY the lock (`git add --` + `git commit -- pokerface.lock.yaml`, message `pokerface: update pokerface.lock.yaml` — a pathspec commit, so no other staged or modified file rides along) and never pushes; `--commit` without `--write-lock` is a usage error. No secrets: the schema has no credential-bearing field. Verified end to end against the real registry: the written lock's shape (sorted tags/platforms, builder line, unrelated entry preserved, entry replaced in place on the second run), the lock commit touching only `pokerface.lock.yaml`, and `pokerface resolve <repo>:main` consuming the committed lock straight to image+digest. Idempotency nuance: the lock's SHAPE is stable across rebuilds (encode/load/merge cycle pinned by `test_rebuild_is_idempotent`), but the digest legitimately changes per build because buildx stamps `created` — noted in the spec rather than papered over. Tests: 6 new in `test/lockfile.emo`; `emo test` 525/525, c target builds. Spec: pokerface-lock.md "Generation (T4.4)" + build-plan.md "Lock write-back".
 
 #### T4.5 Build Trigger and Versioning Strategy ADR
 

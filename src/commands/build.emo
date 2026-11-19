@@ -28,6 +28,8 @@ require "json"
 
 def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) Int64 {
   var dry_run = false
+  var write_lock = false
+  var commit_lock = false
   var platforms = []
   var i = 0
   while i < rest.length() {
@@ -35,24 +37,35 @@ def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) 
     if arg == "--dry-run" {
       dry_run = true
     } else {
-      if arg.starts_with("--platform=") {
-        platforms = platforms.append(arg.substring(11, arg.length() - 11))
+      if arg == "--write-lock" {
+        write_lock = true
       } else {
-        if arg == "--platform" {
-          if i + 1 >= rest.length() {
-            return src.errors.usage_report("build", "--platform expects a value (e.g. linux/amd64)", flags.json)
-          }
-          i = i + 1
-          platforms = platforms.append(rest[i])
+        if arg == "--commit" {
+          commit_lock = true
         } else {
-          if arg.starts_with("-") {
-            return src.errors.usage_report("build", "unknown option '" + arg + "' (known: --dry-run, --platform)", flags.json)
+          if arg.starts_with("--platform=") {
+            platforms = platforms.append(arg.substring(11, arg.length() - 11))
+          } else {
+            if arg == "--platform" {
+              if i + 1 >= rest.length() {
+                return src.errors.usage_report("build", "--platform expects a value (e.g. linux/amd64)", flags.json)
+              }
+              i = i + 1
+              platforms = platforms.append(rest[i])
+            } else {
+              if arg.starts_with("-") {
+                return src.errors.usage_report("build", "unknown option '" + arg + "' (known: --dry-run, --platform, --write-lock, --commit)", flags.json)
+              }
+              return src.errors.usage_report("build", "unexpected argument '" + arg + "' (build takes no positional arguments)", flags.json)
+            }
           }
-          return src.errors.usage_report("build", "unexpected argument '" + arg + "' (build takes no positional arguments)", flags.json)
         }
       }
     }
     i = i + 1
+  }
+  if commit_lock && !write_lock {
+    return src.errors.usage_report("build", "--commit commits the generated lock — pass --write-lock too", flags.json)
   }
   var config_path = flags.config
   if config_path == "" {
@@ -73,7 +86,7 @@ def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) 
             }
             return src.common.exit_ok
           }
-          return build_and_report(flags, prepared, env)
+          return build_and_report(flags, prepared, env, config_path, write_lock, commit_lock)
         }
       }
     }
@@ -93,10 +106,10 @@ class Prepared {
 }
 
 // The real build: execute the plan in a fresh temp directory, then — when
-// pokerface.yaml has a registry section — push the layout and report.
-// Without the section the layout stops after the build (a pull-only
-// repository).
-def build_and_report(flags src.common.Flags, prepared Prepared, env src.settings.EnvSource) Int64 {
+// pokerface.yaml has a registry section — push the layout and report, and
+// with --write-lock record the pushed digest in pokerface.lock.yaml next to
+// pokerface.yaml (--commit makes that a local Git commit, never a push).
+def build_and_report(flags src.common.Flags, prepared Prepared, env src.settings.EnvSource, config_path String, write_lock Bool, commit_lock Bool) Int64 {
   const work_dir = work_base() + "pokerface-build-" + os.getpid().to_string()
   case src.build.execute(prepared.plan, prepared.metadata, src.git.RealRunner.new(), src.build.RealStreamRunner.new(), work_dir, src.build.rfc3339_now()) {
     (R.error, why) then { return src.errors.report("build", why, flags.json) }
@@ -112,10 +125,22 @@ def build_and_report(flags src.common.Flags, prepared Prepared, env src.settings
           }
         }
       }
+      var lock_path = ""
+      var lock_commit = ""
+      if write_lock {
+        case write_lock_file(flags, prepared, config_path, out.tool, report, commit_lock) {
+          (R.error, why) then { return src.errors.report("build", why, flags.json) }
+          (R.ok, done) then {
+            const (path, committed) = done
+            lock_path = path
+            lock_commit = committed
+          }
+        }
+      }
       if flags.json {
-        print_build_json(out, prepared.plan, pushed, report)
+        print_build_json(out, prepared.plan, pushed, report, lock_path, lock_commit)
       } else {
-        print_build_text(out, prepared.plan, pushed, report)
+        print_build_text(out, prepared.plan, pushed, report, lock_path, lock_commit)
       }
       return src.common.exit_ok
     }
@@ -135,6 +160,99 @@ def push_layout(flags src.common.Flags, prepared Prepared, env src.settings.EnvS
     return src.push.push_layout(layout, prepared.plan.image, prepared.plan.tags, token, src.registry.HttpTransport.new(), src.push.RealHeadTransport.new(), src.push.push_params(), src.push.SilentProgress.new())
   }
   return src.push.push_layout(layout, prepared.plan.image, prepared.plan.tags, token, src.registry.HttpTransport.new(), src.push.RealHeadTransport.new(), src.push.push_params(), src.push.StdoutProgress.new())
+}
+
+// Writes the lock next to pokerface.yaml: the fresh entry (or the merge
+// into the existing lock) carries this build's commit, the origin-derived
+// source, the pushed digest, and the builder. --commit then records the
+// file in the config's repository as a LOCAL commit — never a push.
+// Answers (path, committed-sha-or-"").
+def write_lock_file(flags src.common.Flags, prepared Prepared, config_path String, tool String, report src.push.PushReport, commit_lock Bool) (R, (String, String)) {
+  const path = dir_of(config_path) + "/pokerface.lock.yaml"
+  if report.digest == "" {
+    return (R.error, "the lock records the pushed digest — configure registry in pokerface.yaml (or drop --write-lock)")
+  }
+  var source = ""
+  if prepared.metadata.origin == "" {
+    return (R.error, "the lock's source names the origin remote, and the context repository has none (git remote add origin …)")
+  }
+  case src.lockfile.parse_source(prepared.metadata.origin) {
+    (R.error, why) then { return (R.error, "the lock's source cannot come from the origin remote '" + prepared.metadata.origin + "': " + why) }
+    (R.ok, normalized) then { source = normalized }
+  }
+  case src.lockfile.entry_for(prepared.plan.image, prepared.plan.tags, report.digest, prepared.plan.platforms, builder_name(tool)) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, entry) then {
+      var doc = src.lockfile.fresh_doc(entry, prepared.metadata.commit, source)
+      case has_lock(path) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, exists) then {
+          if exists {
+            case file.read(path) {
+              (R.error, why) then { return (R.error, "cannot read the existing " + path + ": " + why) }
+              (R.ok, text) then {
+                case src.lockfile.load(text) {
+                  (R.error, why) then { return (R.error, "the existing " + path + " does not parse — fix or remove it first: " + why) }
+                  (R.ok, existing) then { doc = src.lockfile.merge(existing, entry, prepared.metadata.commit, source) }
+                }
+              }
+            }
+          }
+        }
+      }
+      case file.write(path, src.lockfile.encode(doc)) {
+        (R.error, why) then { return (R.error, "cannot write " + path + ": " + why) }
+        (R.ok, _) then {
+          if !commit_lock {
+            return (R.ok, (path, ""))
+          }
+          const runner = src.git.RealRunner.new()
+          case runner.run(["git", "-C", dir_of(config_path), "add", "--", "pokerface.lock.yaml"], 30.0) {
+            (R.error, why) then { return (R.error, "git: cannot stage the lock: " + why) }
+            (R.ok, _) then {
+              case runner.run(["git", "-C", dir_of(config_path), "commit", "-m", "pokerface: update pokerface.lock.yaml", "--", "pokerface.lock.yaml"], 30.0) {
+                (R.error, why) then { return (R.error, "git: cannot commit the lock: " + why) }
+                (R.ok, _) then {
+                  case runner.run(["git", "-C", dir_of(config_path), "rev-parse", "--short=8", "HEAD"], 10.0) {
+                    (R.error, why) then { return (R.error, "git: cannot read the lock commit: " + why) }
+                    (R.ok, sha) then { return (R.ok, (path, sha.trim())) }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// The lock's builder field: the adapter's tool name mapped into the lock's
+// known set.
+def builder_name(tool String) String {
+  if tool == "podman" {
+    return "podman"
+  }
+  return "buildkit"
+}
+
+// The lock's existence, so a missing file means a fresh doc while an
+// unreadable one means an error (never a silent clobber).
+def has_lock(path String) (R, Bool) {
+  const dir = dir_of(path)
+  case os.list_dir(dir) {
+    (R.error, why) then { return (R.error, "cannot list " + dir + ": " + why) }
+    (R.ok, names) then {
+      var i = 0
+      while i < names.length() {
+        if names[i] == "pokerface.lock.yaml" {
+          return (R.ok, true)
+        }
+        i = i + 1
+      }
+      return (R.ok, false)
+    }
+  }
 }
 
 // The temp root for build work directories; a per-process name keeps
@@ -157,9 +275,9 @@ def work_base() String {
 }
 
 // The human build report: the tool, the layout, one line per unique digest,
-// the tags, and the push outcome. The per-blob/tag progress lines have
-// already streamed from the push itself.
-def print_build_text(out src.build.BuildOutput, plan src.build.BuildPlan, pushed Bool, report src.push.PushReport) {
+// the tags, the push outcome, and the lock when written. The per-blob/tag
+// progress lines have already streamed from the push itself.
+def print_build_text(out src.build.BuildOutput, plan src.build.BuildPlan, pushed Bool, report src.push.PushReport, lock_path String, lock_commit String) {
   println("tool:       " + out.tool)
   println("layout:     " + out.layout)
   var seen = []
@@ -186,11 +304,18 @@ def print_build_text(out src.build.BuildOutput, plan src.build.BuildPlan, pushed
   } else {
     println("(not pushed — pokerface.yaml has no registry section)")
   }
+  if lock_path != "" {
+    println("lock:       " + lock_path)
+    if lock_commit != "" {
+      println("lock commit: " + lock_commit)
+    }
+  }
 }
 
 // The machine build report: stable keys, script-friendly. `pushed` is false
-// when no registry is configured; `digest` is then empty.
-def print_build_json(out src.build.BuildOutput, plan src.build.BuildPlan, pushed Bool, report src.push.PushReport) {
+// when no registry is configured; `digest` is then empty. The `lock` keys
+// appear only with --write-lock.
+def print_build_json(out src.build.BuildOutput, plan src.build.BuildPlan, pushed Bool, report src.push.PushReport, lock_path String, lock_commit String) {
   var digests = []
   var i = 0
   while i < out.entries.length() {
@@ -218,6 +343,12 @@ def print_build_json(out src.build.BuildOutput, plan src.build.BuildPlan, pushed
     ("pushed", json.bool(pushed)),
     ("digest", json.string(report.digest))
   ]
+  if lock_path != "" {
+    fields = fields.append(("lock", json.string(lock_path)))
+    if lock_commit != "" {
+      fields = fields.append(("lock_commit", json.string(lock_commit)))
+    }
+  }
   println(json.encode(json.object(fields)))
 }
 

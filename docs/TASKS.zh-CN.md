@@ -625,7 +625,7 @@ images:
 | [x] | T4.1 | `pokerface build` 命令与构建计划 | T1.4、T1.5 | 2h |
 | [x] | T4.2 | BuildKit / podman 构建适配 | T4.1 | 3-4h |
 | [x] | T4.3 | Registry 推送：Blob + Manifest | T1.10、T2.12、T4.2 | 3h |
-| [ ] | T4.4 | lock 文件生成与写回 | T4.3 | 2h |
+| [x] | T4.4 | lock 文件生成与写回 | T4.3 | 2h |
 | [ ] | T4.5 | 构建触发与版本策略 ADR | 无 | 1h |
 | [ ] | T4.6 | CI 模板：GitHub Actions 为主 | T4.3、T4.4 | 3h |
 | [ ] | T4.7 | 安装脚本与发布工作流 | T1.1 | 3h |
@@ -687,6 +687,8 @@ images:
 **验收**：重复构建同一镜像时 lock 幂等；多 tag、多平台条目稳定排序；不覆盖无关条目；不写入真实密钥；`pokerface resolve` 能直接消费生成的 lock。
 
 **依赖**：T4.3 · **预估**：2h
+
+> **笔记**（2026-11-20，约 2h）：完成。`src/lockfile.emo` 长出生成侧：`entry_for`（tags/platforms 按字典序排序——Emo 字符串没有顺序运算符，`text_less` 经排序字符集逐字节比较；digest 用加载器自己的规则校验）、`merge`（同名 image 的条目**原位替换**，缺失的追加，无关条目原样保留，`generated_at` 强制为空使相同输入编码出相同字节），以及 `fresh_doc`。`pokerface build --write-lock` 在推送成功后把 `pokerface.lock.yaml` 写到 pokerface.yaml 旁边（必须有 registry 节——lock 记录的是推送后的 digest）：`commit` = 构建所用的完整 SHA，`source` = origin 远端经加载器 `parse_source` 归一化（无 origin 的仓库直接报错——source 是必填），`builder` = buildkit/podman 按适配器工具映射。已有 lock 走合并；解析不了的 lock 报错而不是静默覆盖。`--commit` 只把 lock 这一个文件做本地提交（`git add --` + `git commit -- pokerface.lock.yaml`，提交信息 `pokerface: update pokerface.lock.yaml`——pathspec 提交，其他已暂存/已修改文件绝不搭车）且从不推送；`--commit` 不带 `--write-lock` 是用法错误。无密钥：schema 里没有承载凭据的字段。对真实 registry 端到端验证：写出的 lock 形状（排序的 tags/platforms、builder 行、无关条目保留、第二次运行原位替换）、lock 提交只动 `pokerface.lock.yaml`，以及 `pokerface resolve <repo>:main` 直接从提交里消费 lock 得到镜像+digest。幂等性说明：lock 的**形状**跨重建稳定（`test_rebuild_is_idempotent` 钉住 encode/load/merge 循环），但 digest 每次构建都会变——buildx 会盖 `created` 时间戳，已在规范中如实注明而不是粉饰。测试：`test/lockfile.emo` 新增 6 个；`emo test` 525/525，c target 编译通过。规范：pokerface-lock.md "Generation (T4.4)" + build-plan.md "Lock write-back"。
 
 #### T4.5 构建触发与版本策略 ADR
 
