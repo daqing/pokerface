@@ -880,15 +880,17 @@ images:
 
 ## 9. MVP 验收清单
 
-- [ ] `pokerface resolve` 能输出 `tag -> commit -> digest`。
-- [ ] `pokerface pull` 能完成下载、校验、导入，`docker run` / `podman run` 正常。
-- [ ] 拉取过程不访问 `registry-1.docker.io`。
-- [ ] Registry 可通过 compose 一键启动，MinIO 数据持久化。
-- [ ] Manifest / Blob / Tag 的 OCI 必要接口可用，`oras` 或 `skopeo` 冒烟通过。
-- [ ] Blob 通过预签名 URL 下载，过期后失效。
-- [ ] pull / push scope 生效，越权请求被拒绝。
-- [ ] `pokerface build --push --write-lock` 可完成构建、推送与元数据写回。
-- [ ] CI 模板可用，且不会产生提交循环。
-- [ ] 示例应用可通过 `scripts/e2e.sh` 一键演示。
-- [ ] 文档站包含安装、快速开始、CLI、规范、Registry 运维与排障。
-- [ ] README 英文与中文版本同步，Roadmap 与实际状态一致。
+2026-11-20 按实现后的真实接口逐项核实（每行标注证据位置）；唯一未勾项是本机无法完成的 compose/MinIO 运行时声明（Docker Hub 不可达——恰是 pokerface 要绕开的问题；stack 定义与入口协议已验证，见 docs/registry/deployment.md）。
+
+- [x] `pokerface resolve` 能输出 `tag -> commit -> digest`。（e2e-m1/m2/m4 断言 digest 行）
+- [x] `pokerface pull` 能完成下载、校验、导入，`docker run` / `podman run` 正常。（T4.13/T4.14 实测：容器返回 HTTP 200）
+- [x] 拉取过程不访问 `registry-1.docker.io`。（结构使然——FROM scratch + loopback；e2e 脚本据此断言）
+- [ ] Registry 可通过 compose 一键启动，MinIO 数据持久化。*（等待有 registry 访问的机器——`docker compose config` 已验证 stack 定义、入口信号协议已在主机验证；见 docs/registry/deployment.md）*
+- [x] Manifest / Blob / Tag 的 OCI 必要接口可用，`oras` 或 `skopeo` 冒烟通过。（e2e-m2：真实 skopeo 推送、读回、auth 场景）
+- [x] Blob 通过预签名 URL 下载，过期后失效。（test/registry_s3.emo：预签名 GET 200，TTL 过期后 403；fs 后端直接供源）
+- [x] pull / push scope 生效，越权请求被拒绝。（e2e-m2 auth 场景：pull-only token 无法 push、`insufficient_scope` challenge）
+- [x] `pokerface build --write-lock` 可完成构建、推送与元数据写回。*（清单原文的 `--push` 旗标落地为配置的 `registry` 节——docs/spec/build-plan.md；e2e.sh 断言推送与 lock）*
+- [x] CI 模板可用，且不会产生提交循环。（T4.6：actionlint 通过、commit-back 步骤逐字仿真、paths-ignore + `[skip ci]`；真实 GitHub 运行归 T4.17）
+- [x] 示例应用可通过 `scripts/e2e.sh` 一键演示。（T4.14：13–14 秒，两次，零残留）
+- [x] 文档站包含安装、快速开始、CLI、规范、Registry 运维与排障。（45 页，死链使构建失败）
+- [x] README 英文与中文版本同步，Roadmap 与实际状态一致。（T4.16，一一对应）
