@@ -27,6 +27,8 @@ OUT = Path(__file__).resolve().parent / "site"
 SECTIONS = [
     ("Getting started", [
         ("install.md", "Installation"),
+        ("getting-started.md", "Quick start"),
+        ("getting-started.zh-CN.md", "快速开始"),
         ("ci/github-actions.md", "Publishing with CI"),
     ]),
     ("Reference", [

@@ -630,7 +630,7 @@ Exit criteria:
 | [x] | T4.6 | CI template: GitHub Actions first | T4.3, T4.4 | 3h |
 | [x] | T4.7 | Install script and release workflow | T1.1 | 3h |
 | [x] | T4.8 | Docs site skeleton and navigation | T4.5 | 2-3h |
-| [ ] | T4.9 | Quick start and installation guide | T4.7, T4.8 | 2h |
+| [x] | T4.9 | Quick start and installation guide | T4.7, T4.8 | 2h |
 | [ ] | T4.10 | CLI and configuration reference | T1.1, T1.8 | 2h |
 | [ ] | T4.11 | YAML / lock / metadata specification | T1.4, T1.5 | 3h |
 | [ ] | T4.12 | Registry operations guide | T2.17 | 3h |
@@ -747,6 +747,8 @@ Exit criteria:
 **Acceptance**: Following the guide works in a clean environment; commands match the current CLI; key sections are mirrored in Chinese; the guide explicitly says Docker Hub is not required.
 
 **Depends on**: T4.7, T4.8 · **Estimate**: 2h
+
+> **Notes** (2026-11-20, ~1.5h): Done. `docs/getting-started.md` + a Chinese mirror (`getting-started.zh-CN.md` — the acceptance's "key sections mirrored"), both wired into the site nav (the dead-link checker now enforces them). The flow: prerequisites table (Git / skopeo / Docker-or-podman, with what breaks without skopeo) → install → **local registry in five lines** (`registry.yaml` with `$HOME` paths — tildes don't expand in the server's config) → an app repository with pokerface.yaml + an origin remote (the lock's `source` needs it — a lesson from running the guide) → `pokerface build --write-lock` with the real output shape → commit the lock → `resolve .:main` → `pull` → `docker image inspect`. **"Docker Hub is not required"** is stated in the intro and structurally true: `FROM scratch`, a loopback registry, no external pulls. Common-failure hints are four one-liners pointing at T4.15's matrix. **Two corrections the guide run earned**: (1) the final check is `docker image inspect` — the original draft used `docker run … cat /hello.txt`, and a FROM-scratch image has no `cat` (verified the failure, then fixed the guide; the runnable version is deferred to examples/app, T4.13); (2) `resolve` only works AFTER the lock commit — the guide's ordering makes that explicit. Every command was executed verbatim against the real binaries (build wrote the lock with source `github.com/you/quick-app`, resolve answered the pushed digest, pull imported into docker); the only untestable piece here is the release-tarball install itself (T4.7's file:// simulation covers it). Harness note for the record: the verification script piped `pokerface build` to `tail` — the idle-scheduler pipe hang again, the guide's own text never pipes.
 
 #### T4.10 CLI and Configuration Reference
 

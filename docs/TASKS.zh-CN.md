@@ -630,7 +630,7 @@ images:
 | [x] | T4.6 | CI 模板：GitHub Actions 为主 | T4.3、T4.4 | 3h |
 | [x] | T4.7 | 安装脚本与发布工作流 | T1.1 | 3h |
 | [x] | T4.8 | 文档站骨架与导航 | T4.5 | 2-3h |
-| [ ] | T4.9 | 快速开始与安装文档 | T4.7、T4.8 | 2h |
+| [x] | T4.9 | 快速开始与安装文档 | T4.7、T4.8 | 2h |
 | [ ] | T4.10 | CLI 与配置参考 | T1.1、T1.8 | 2h |
 | [ ] | T4.11 | YAML / lock / 元数据规范 | T1.4、T1.5 | 3h |
 | [ ] | T4.12 | Registry 运维指南 | T2.17 | 3h |
@@ -747,6 +747,8 @@ images:
 **验收**：按文档在干净环境执行成功；命令与当前 CLI 一致；中文版关键段落同步；明确说明不依赖 Docker Hub。
 
 **依赖**：T4.7、T4.8 · **预估**：2h
+
+> **笔记**（2026-11-20，约 1.5h）：完成。`docs/getting-started.md` + 中文镜像（`getting-started.zh-CN.md`——验收要求的"关键节中文对照"），都已接入站点导航（死链检查器现在会守护它们）。流程：前置条件表（Git / skopeo / Docker-or-podman，注明没有 skopeo 时会怎样）→ 安装 → **五行启动本地 registry**（`registry.yaml` 用 `$HOME` 路径——服务端配置不展开波浪号）→ 带 pokerface.yaml 和 origin 远端的应用仓库（lock 的 `source` 需要它——跑指南时踩出来的）→ `pokerface build --write-lock` 附真实输出形状 → 提交 lock → `resolve .:main` → `pull` → `docker image inspect`。**开篇即声明"Docker Hub 不是必需"**，且结构上成立：`FROM scratch`、loopback registry、零外部拉取。常见错误提示是四条一行式并指向 T4.15 的矩阵。**跑指南跑出来的两处修正**：(1) 最终检查改为 `docker image inspect`——初稿用 `docker run … cat /hello.txt`，而 FROM scratch 镜像里没有 `cat`（实测失败后改稿；可运行版本留给 examples/app，T4.13）；(2) `resolve` 只有在 lock 提交之后才工作——指南的顺序把这一点写明了。每条命令都对真实二进制逐字执行过（build 以 source `github.com/you/quick-app` 写出 lock、resolve 回答推送的 digest、pull 导入 docker）；唯一没法在本机测的是发布包安装本身（T4.7 的 file:// 仿真覆盖了它）。工具链记录：验证脚本把 `pokerface build` 管道给了 `tail`——空闲调度器管道挂起再现，指南正文本身无管道。
 
 #### T4.10 CLI 与配置参考
 
