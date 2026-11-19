@@ -194,6 +194,32 @@ class Client {
   // from the realm, store it, and verify with a second probe. Answers a Bool
   // via (R, Bool); the token stays in the client for later calls.
   def authenticate() (R, Bool) {
+    case self.challenge() {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, challenge) then {
+        const (realm, service, scope) = challenge
+        return self.dance_token(realm, service, scope)
+      }
+    }
+  }
+
+  // The dance with an explicit scope: push needs repository:<repo>:pull,push,
+  // which no challenge on a read names (an insufficient_scope challenge on a
+  // push does, but asking for the union up front is one round trip either
+  // way and covers both reads and writes).
+  def authenticate_scope(scope String) (R, Bool) {
+    case self.challenge() {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, challenge) then {
+        const (realm, service, _) = challenge
+        return self.dance_token(realm, service, scope)
+      }
+    }
+  }
+
+  // The unauthenticated probe that hands back the challenge triple
+  // (realm, service, scope).
+  def challenge() (R, (String, String, String)) {
     case self.transport.request("GET", self.base + "/v2/", [], "", self.timeout) {
       (R.error, why) then { return (R.error, "registry: challenge failed: " + why) }
       (R.ok, resp) then {
@@ -202,33 +228,36 @@ class Client {
         }
         case parse_challenge(resp.header("WWW-Authenticate")) {
           (R.error, why) then { return (R.error, "registry: " + why) }
-          (R.ok, challenge) then {
-            const (realm, service, scope) = challenge
-            var token_url = realm + "?service=" + percent_encode(service)
-            if scope != "" {
-              token_url = token_url + "&scope=" + percent_encode(scope)
-            }
-            case self.transport.request("GET", token_url, [], "", self.timeout) {
-              (R.error, why) then { return (R.error, "registry: token request failed: " + why) }
-              (R.ok, token_resp) then {
-                if token_resp.status != 200 {
-                  return (R.error, "registry: token endpoint returned status " + token_resp.status.to_string())
+          (R.ok, challenge) then { return (R.ok, challenge) }
+        }
+      }
+    }
+  }
+
+  // The shared tail of both dances: fetch the token for the scope, store it,
+  // and verify with a second probe.
+  def dance_token(realm String, service String, scope String) (R, Bool) {
+    var token_url = realm + "?service=" + percent_encode(service)
+    if scope != "" {
+      token_url = token_url + "&scope=" + percent_encode(scope)
+    }
+    case self.transport.request("GET", token_url, [], "", self.timeout) {
+      (R.error, why) then { return (R.error, "registry: token request failed: " + why) }
+      (R.ok, token_resp) then {
+        if token_resp.status != 200 {
+          return (R.error, "registry: token endpoint returned status " + token_resp.status.to_string())
+        }
+        case extract_token(token_resp.body) {
+          (R.error, why) then { return (R.error, "registry: " + why) }
+          (R.ok, token) then {
+            self.token_box.replace(token)
+            case self.transport.request("GET", self.base + "/v2/", self.auth_headers(), "", self.timeout) {
+              (R.error, why) then { return (R.error, "registry: probe after token failed: " + why) }
+              (R.ok, check) then {
+                if check.status == 200 {
+                  return (R.ok, true)
                 }
-                case extract_token(token_resp.body) {
-                  (R.error, why) then { return (R.error, "registry: " + why) }
-                  (R.ok, token) then {
-                    self.token_box.replace(token)
-                    case self.transport.request("GET", self.base + "/v2/", self.auth_headers(), "", self.timeout) {
-                      (R.error, why) then { return (R.error, "registry: probe after token failed: " + why) }
-                      (R.ok, check) then {
-                        if check.status == 200 {
-                          return (R.ok, true)
-                        }
-                        return (R.error, "registry: probe after token returned status " + check.status.to_string() + " — the token was not accepted")
-                      }
-                    }
-                  }
-                }
+                return (R.error, "registry: probe after token returned status " + check.status.to_string() + " — the token was not accepted")
               }
             }
           }

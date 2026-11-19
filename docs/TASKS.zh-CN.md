@@ -624,7 +624,7 @@ images:
 | --- | --- | --- | --- | --- |
 | [x] | T4.1 | `pokerface build` 命令与构建计划 | T1.4、T1.5 | 2h |
 | [x] | T4.2 | BuildKit / podman 构建适配 | T4.1 | 3-4h |
-| [ ] | T4.3 | Registry 推送：Blob + Manifest | T1.10、T2.12、T4.2 | 3h |
+| [x] | T4.3 | Registry 推送：Blob + Manifest | T1.10、T2.12、T4.2 | 3h |
 | [ ] | T4.4 | lock 文件生成与写回 | T4.3 | 2h |
 | [ ] | T4.5 | 构建触发与版本策略 ADR | 无 | 1h |
 | [ ] | T4.6 | CI 模板：GitHub Actions 为主 | T4.3、T4.4 | 3h |
@@ -675,6 +675,8 @@ images:
 **验收**：推送到 M2 Registry 成功；返回的 digest 与本地一致；重复推送可跳过已存在 Blob；中途失败可重试且不破坏已有 tag；认证 scope 正确。
 
 **依赖**：T1.10、T2.12、T4.2 · **预估**：3h
+
+> **笔记**（2026-11-20，约 4h）：完成。`src/push.emo` 是完整管线：拆镜像（复用 pull 的 `split_image`——镜像 host 即端点，loopback 走 http、其余 https）→ 客户端 probe → blob HEAD（200 即跳过，一个字节都不读）→ 上传（4 MiB 以下单请求 `POST ?digest=`；以上走会话分块 PATCH，Content-Range 用规范的裸区间）→ 按 digest 推 manifest → 打 tag。两个发现决定了形状。**HEAD 缺口**：std http 客户端把 HEAD 响应声明的 Content-Length 当 body 读，直接死于 "closed after 0 of N bytes"——registry 的 HEAD 应答完全符合规范，于是 HEAD 走独立传输（`HeadTransport` + `RealHeadTransport`：基于 `net` 的 HTTP/1.1、只读到响应头，复用 blob.emo 的 URL 解析与响应头读取；可注入测试）。**子 manifest 是 manifest 而不只是 blob**：M2 的 index 校验对 MANIFESTS 表查子项，而真实客户端在推 index 之前会按 digest PUT 子 manifest——所以布局里每个描述符都以 `/manifests/<digest>` 推出（对 buildx 的嵌套多平台包装递归处理），buildx 每个 `--tag` 一条描述符的 index.json 按 digest 去重，tag 目标在单平台布局时指向 manifest、其余指向 index。registry 应答的 `Docker-Content-Digest` 必须等于推送字节的本地 sha256（不符即 integrity 退出码 7）；传输错误与 5xx 重试 3 次；401 以 `repository:<repo>:pull,push` 作用域重跳并重放一次。进度通过 `Progress` 接口实时流出（`--json` 用 `SilentProgress` 保持 stdout 只有一份报告）。`pokerface build` 在 pokerface.yaml 有 `registry` 节时自动推送（token 来自 `POKERFACE_REGISTRY_TOKEN`/配置——`--config` 指的是构建文件而非客户端配置，settings.load 不带 flag 加载）。registry 侧：`/api/v1/resolve` 的平台遍历递归嵌套 index（深度 4），无平台的 manifest 子项从其 config 取平台——buildx 包装层不再回答空平台。**对真实 registry 端到端验证**：单平台推送 digest == 服务端 `Docker-Content-Digest` == skopeo 读回；重复推送跳过确定性 layer；多平台推送服务端是干净的 2 平台 index 且 resolve 回答两个平台；auth 场景：铸造的 push 作用域 token 推送成功，pull-only token 被 registry 自己的错误信封拒绝（退出码 5），无 token 时 dance 失败清晰可读；`e2e-m2.sh` 依旧通过。测试：`test/push.emo` 新增 9 个（RecTransport + RecHeadTransport，规则带调用预算）+ resolve 嵌套 index 2 个；`emo test` 519/519，c target 编译通过。已知后续：客户端的 Basic 用户名密码换 token（当前 token 由外部提供）；解释器的六元组深嵌套与 manifest 的 `Subject` 字段未动。规范：docs/spec/push.md；build-plan.md 的执行节已更新。
 
 #### T4.4 lock 文件生成与写回
 

@@ -27,7 +27,11 @@
 
 - `platforms` comes from an index's own entries (`variant` joins when the
   index carries one) or, for an image manifest, from its **config blob**
-  (architecture/os). `revision` is the document's
+  (architecture/os). A child without a platform is not answered as an
+  empty platform: an index-type child (buildx's nested multi-platform
+  wrapper) recurses through its bytes from the blob store (depth-guarded
+  at 4), and a manifest-type child takes the platform from its own config
+  blob (T4.3). `revision` is the document's
   `org.opencontainers.image.revision` annotation, present only when set.
 - No storage credential ever appears in a response — the endpoint answers
   metadata only, never presigned URLs or store settings. The pokerface CLI

@@ -6,17 +6,21 @@
 //
 // T4.2: without --dry-run the plan executes: the build tool (buildx, or
 // podman as the fallback) runs with the log streamed to the terminal, and
-// the image lands as a validated OCI layout in a temp directory. Pushing
-// the layout to the registry arrives with T4.3.
+// the image lands as a validated OCI layout in a temp directory.
+//
+// T4.3: when pokerface.yaml has a registry section, the layout then goes to
+// that registry — blobs HEAD-checked and skipped when present, the manifest
+// PUT under every rendered tag — and the digest is reported.
 //
 // `--platform` overrides the configured platforms (repeatable: --platform
 // linux/amd64 --platform linux/arm64).
 //
 // pokerface.yaml is the BUILD config (src.config.load) — a different file
-// from the client's config.yaml (src.settings.load), so the settings loader
-// is not involved. Validation happens before anything prints: the config
-// must parse, the context directory and Dockerfile must exist on disk, and
-// the rendered tags must be collision-free. Spec: docs/spec/build-plan.md.
+// from the client's config.yaml (src.settings.load), which only supplies
+// the registry token here. Validation happens before anything prints: the
+// config must parse, the context directory and Dockerfile must exist on
+// disk, and the rendered tags must be collision-free. Spec:
+// docs/spec/build-plan.md.
 
 require "file"
 require "os"
@@ -69,38 +73,68 @@ def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) 
             }
             return src.common.exit_ok
           }
-          return build_and_report(flags, prepared, platforms)
+          return build_and_report(flags, prepared, env)
         }
       }
     }
   }
 }
 
-// The plan plus the Git facts it was rendered from — the dry run prints the
-// plan, the real build feeds both to the adapter (the labels come from the
-// metadata).
+// The config plus the plan and the Git facts it was rendered from — the dry
+// run prints the plan, the real build feeds everything to the adapter and
+// the push (the labels come from the metadata, the push switch from the
+// config's registry section).
 class Prepared {
-  def init(metadata src.build.GitMetadata, plan src.build.BuildPlan) {
+  def init(config src.config.PokerfaceConfig, metadata src.build.GitMetadata, plan src.build.BuildPlan) {
+    self.config = config
     self.metadata = metadata
     self.plan = plan
   }
 }
 
-// The real build: execute the plan in a fresh temp directory, then report
-// the tool, the layout, and its digests. Push arrives with T4.3.
-def build_and_report(flags src.common.Flags, prepared Prepared, platforms Array[String]) Int64 {
+// The real build: execute the plan in a fresh temp directory, then — when
+// pokerface.yaml has a registry section — push the layout and report.
+// Without the section the layout stops after the build (a pull-only
+// repository).
+def build_and_report(flags src.common.Flags, prepared Prepared, env src.settings.EnvSource) Int64 {
   const work_dir = work_base() + "pokerface-build-" + os.getpid().to_string()
   case src.build.execute(prepared.plan, prepared.metadata, src.git.RealRunner.new(), src.build.RealStreamRunner.new(), work_dir, src.build.rfc3339_now()) {
     (R.error, why) then { return src.errors.report("build", why, flags.json) }
     (R.ok, out) then {
+      var pushed = false
+      var report = src.push.PushReport.new("", "", [], 0, 0, 0)
+      if prepared.config.registry.url != "" {
+        case push_layout(flags, prepared, env, out.layout) {
+          (R.error, why) then { return src.errors.report("build", why, flags.json) }
+          (R.ok, rep) then {
+            pushed = true
+            report = rep
+          }
+        }
+      }
       if flags.json {
-        print_build_json(out, prepared.plan)
+        print_build_json(out, prepared.plan, pushed, report)
       } else {
-        print_build_text(out, prepared.plan)
+        print_build_text(out, prepared.plan, pushed, report)
       }
       return src.common.exit_ok
     }
   }
+}
+
+// The push stage: the token comes from the client settings (env or the
+// XDG config.yaml — the --config flag names the BUILD file here, never the
+// client config), the endpoint from the image's host.
+def push_layout(flags src.common.Flags, prepared Prepared, env src.settings.EnvSource, layout String) (R, src.push.PushReport) {
+  var token = ""
+  case src.settings.load(src.git.RealRunner.new(), env, "") {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, settings) then { token = settings.registry_token }
+  }
+  if flags.json {
+    return src.push.push_layout(layout, prepared.plan.image, prepared.plan.tags, token, src.registry.HttpTransport.new(), src.push.RealHeadTransport.new(), src.push.push_params(), src.push.SilentProgress.new())
+  }
+  return src.push.push_layout(layout, prepared.plan.image, prepared.plan.tags, token, src.registry.HttpTransport.new(), src.push.RealHeadTransport.new(), src.push.push_params(), src.push.StdoutProgress.new())
 }
 
 // The temp root for build work directories; a per-process name keeps
@@ -123,8 +157,9 @@ def work_base() String {
 }
 
 // The human build report: the tool, the layout, one line per unique digest,
-// and the tags the layout was built for.
-def print_build_text(out src.build.BuildOutput, plan src.build.BuildPlan) {
+// the tags, and the push outcome. The per-blob/tag progress lines have
+// already streamed from the push itself.
+def print_build_text(out src.build.BuildOutput, plan src.build.BuildPlan, pushed Bool, report src.push.PushReport) {
   println("tool:       " + out.tool)
   println("layout:     " + out.layout)
   var seen = []
@@ -146,11 +181,16 @@ def print_build_text(out src.build.BuildOutput, plan src.build.BuildPlan) {
     i = i + 1
   }
   println("tags:       " + join(plan.tags, ", "))
-  println("(not pushed yet — push arrives with T4.3)")
+  if pushed {
+    println("pushed:     " + plan.image + " (" + report.uploaded.to_string() + " uploaded, " + report.skipped.to_string() + " skipped)")
+  } else {
+    println("(not pushed — pokerface.yaml has no registry section)")
+  }
 }
 
-// The machine build report: stable keys, script-friendly.
-def print_build_json(out src.build.BuildOutput, plan src.build.BuildPlan) {
+// The machine build report: stable keys, script-friendly. `pushed` is false
+// when no registry is configured; `digest` is then empty.
+def print_build_json(out src.build.BuildOutput, plan src.build.BuildPlan, pushed Bool, report src.push.PushReport) {
   var digests = []
   var i = 0
   while i < out.entries.length() {
@@ -169,13 +209,16 @@ def print_build_json(out src.build.BuildOutput, plan src.build.BuildPlan) {
     platforms = platforms.append(json.string(plan.platforms[i]))
     i = i + 1
   }
-  println(json.encode(json.object([
+  var fields = [
     ("tool", json.string(out.tool)),
     ("layout", json.string(out.layout)),
     ("digests", json.array(digests)),
     ("tags", json.array(tags)),
-    ("platforms", json.array(platforms))
-  ])))
+    ("platforms", json.array(platforms)),
+    ("pushed", json.bool(pushed)),
+    ("digest", json.string(report.digest))
+  ]
+  println(json.encode(json.object(fields)))
 }
 
 // The composition without any output: read pokerface.yaml, parse it as the
@@ -199,7 +242,7 @@ def compose_plan(config_path String, platforms Array[String]) (R, Prepared) {
                 (R.ok, metadata) then {
                   case src.build.plan(config, metadata, config_dir, platforms) {
                     (R.error, why) then { return (R.error, why) }
-                    (R.ok, plan) then { return (R.ok, Prepared.new(metadata, plan)) }
+                    (R.ok, plan) then { return (R.ok, Prepared.new(config, metadata, plan)) }
                   }
                 }
               }

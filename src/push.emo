@@ -1,0 +1,684 @@
+// T4.3: the push pipeline — the layout a build produced goes to the
+// registry over the M1 client's transport: HEAD every blob first (existing
+// blobs are skipped, so a repeat push uploads nothing), upload the rest
+// (single-request POST?digest for small blobs, a session of PATCH chunks
+// for large ones), then PUT the index.json content once per tag and verify
+// the registry's Docker-Content-Digest against the local sha256. Transport
+// errors and 5xx retry; a 401 runs the Bearer dance with the push+pull
+// scope for the repository, then the request replays once. Progress streams
+// through the injectable Progress interface. Spec: docs/spec/build-plan.md
+// and docs/spec/registry-uploads.md.
+
+require "os"
+require "file"
+require "time"
+require "crypto"
+require "net"
+
+const push_single_max = 4194304
+const push_chunk_size = 4194304
+const push_attempts = 3
+const push_retry_seconds = 0.5
+const push_blob_timeout = 300.0
+const push_manifest_timeout = 60.0
+
+// The sizes and retry count are parameters so the tests can drive the
+// chunked path with tiny blobs; push_params() is the real shape.
+class PushParams {
+  def init(single_max Int64, chunk_size Int64, attempts Int64) {
+    self.single_max = single_max
+    self.chunk_size = chunk_size
+    self.attempts = attempts
+  }
+}
+
+def push_params() PushParams {
+  return PushParams.new(push_single_max, push_chunk_size, push_attempts)
+}
+
+// The auth scope every push request wants: pull (the HEAD checks) and push
+// (uploads, manifest PUTs) on the one repository.
+def push_scope(repo String) String {
+  return "repository:" + repo + ":pull,push"
+}
+
+// Push progress goes to the terminal as it happens; the tests collect the
+// lines instead.
+interface Progress {
+  def step(text String) Void
+}
+
+class StdoutProgress {
+  def init() {
+  }
+
+  def step(text String) Void {
+    println(text)
+  }
+}
+
+// The --json mode's progress: report lines would corrupt the one JSON
+// object, so the machine-readable run stays silent.
+class SilentProgress {
+  def init() {
+  }
+
+  def step(text String) Void {
+  }
+}
+
+// The push's answer for the caller (and T4.4's lock write-back): the digest
+// the tags now point at, its media type, the counts, and the bytes moved.
+class PushReport {
+  def init(digest String, media_type String, tags Array[String], uploaded Int64, skipped Int64, bytes Int64) {
+    self.digest = digest
+    self.media_type = media_type
+    self.tags = tags
+    self.uploaded = uploaded
+    self.skipped = skipped
+    self.bytes = bytes
+  }
+}
+
+// HEAD rides its own transport, headers only. The std http client reads a
+// HEAD response's declared Content-Length as a body — a body HEAD responses
+// never carry — and fails with "closed after 0 of N bytes"; speaking
+// HTTP/1.1 over net and stopping after the headers is the honest probe. The
+// registry's HEAD answers stay fully spec-compliant (Content-Length, the
+// digest headers). The tests inject a fake here.
+interface HeadTransport {
+  def head(url String, headers Array[(String, String)], timeout Float64) (R, src.registry.Response)
+}
+
+class RealHeadTransport {
+  def init() {
+  }
+
+  def head(url String, headers Array[(String, String)], timeout Float64) (R, src.registry.Response) {
+    case src.blob.parse_blob_url(url) {
+      (R.error, why) then { return (R.error, "push: " + why) }
+      (R.ok, parsed) then {
+        const (scheme, host, port, target) = parsed
+        var conn_result = net.connect(host, port, timeout)
+        if scheme == "https" {
+          conn_result = net.tls_connect(host, port, timeout)
+        }
+        case conn_result {
+          (R.error, why) then { return (R.error, "registry: cannot connect to " + host + ":" + port.to_string() + ": " + why) }
+          (R.ok, conn) then {
+            return head_on(conn, host, target, headers, timeout)
+          }
+        }
+      }
+    }
+  }
+}
+
+// One HEAD conversation over an open connection: request, status + headers,
+// close (Connection: close — the fork-per-connection registry closes
+// anyway).
+def head_on(conn TcpConn, host String, target String, headers Array[(String, String)], timeout Float64) (R, src.registry.Response) {
+  conn.set_timeout(timeout)
+  var request = "HEAD " + target + " HTTP/1.1\r\nHost: " + host + "\r\nUser-Agent: pokerface/0.1\r\nConnection: close\r\n"
+  var i = 0
+  while i < headers.length() {
+    const (key, value) = headers[i]
+    request = request + key + ": " + value + "\r\n"
+    i = i + 1
+  }
+  request = request + "\r\n"
+  case conn.write(request) {
+    (R.error, why) then {
+      const (_, _) = conn.close()
+      return (R.error, "registry: HEAD send failed: " + why)
+    }
+    (R.ok, _) then {
+      case src.blob.read_response_head(conn) {
+        (R.error, why) then {
+          const (_, _) = conn.close()
+          return (R.error, "registry: bad HEAD response: " + why)
+        }
+        (R.ok, head) then {
+          const (_, _) = conn.close()
+          const (status, resp_headers) = head
+          return (R.ok, src.registry.Response.new(status, resp_headers, ""))
+        }
+      }
+    }
+  }
+}
+
+// Pushes the validated layout: every blob under blobs/sha256, then the
+// index.json content under each tag. `image` is the full
+// <host>[:<port>]/<owner>/<repo> reference — its host is the push endpoint,
+// loopback over http, anything else over https.
+def push_layout(layout String, image String, tags Array[String], token String, transport src.registry.Transport, head_transport HeadTransport, params PushParams, progress Progress) (R, PushReport) {
+  case src.commands.pull.split_image(image, "") {
+    (R.error, why) then { return (R.error, "push: " + why) }
+    (R.ok, target) then {
+      const (base, repo) = target
+      const client = src.registry.Client.new(base, token, transport, push_manifest_timeout)
+      case client.probe() {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, _) then {
+          return push_with_client(client, base, repo, layout, tags, head_transport, params, progress)
+        }
+      }
+    }
+  }
+}
+
+// Blobs first, then the manifest under every tag.
+def push_with_client(client src.registry.Client, base String, repo String, layout String, tags Array[String], head_transport HeadTransport, params PushParams, progress Progress) (R, PushReport) {
+  case list_blobs(layout) {
+    (R.error, why) then { return (R.error, "push: " + why) }
+    (R.ok, blobs) then {
+      var uploaded = 0
+      var skipped = 0
+      var bytes = 0
+      var i = 0
+      while i < blobs.length() {
+        const blob = blobs[i]
+        case push_one_blob(client, base, repo, blob, head_transport, params, progress) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, moved) then {
+            if moved {
+              uploaded = uploaded + 1
+              bytes = bytes + blob.body.length()
+            } else {
+              skipped = skipped + 1
+            }
+          }
+        }
+        i = i + 1
+      }
+      case push_manifest(client, base, repo, layout, tags, params, progress) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, entry) then {
+          const (digest, media_type) = entry
+          return (R.ok, PushReport.new(digest, media_type, tags, uploaded, skipped, bytes))
+        }
+      }
+    }
+  }
+}
+
+// A blob's identity and bytes: the digest comes from the file's layout name
+// (the hex IS the digest), the size from the bytes themselves.
+class PushBlob {
+  def init(digest String, path String, body String) {
+    self.digest = digest
+    self.path = path
+    self.body = body
+  }
+}
+
+// Every blob in the layout's blob store, sorted by name for a deterministic
+// push order.
+def list_blobs(layout String) (R, Array[PushBlob]) {
+  const dir = layout + "/blobs/sha256"
+  case os.list_dir(dir) {
+    (R.error, why) then { return (R.error, "cannot list " + dir + ": " + why) }
+    (R.ok, names) then {
+      var out = []
+      var i = 0
+      while i < names.length() {
+        const name = names[i]
+        if name != "" {
+          case file.read(dir + "/" + name) {
+            (R.error, why) then { return (R.error, "cannot read blob " + name + ": " + why) }
+            (R.ok, body) then {
+              out = out.append(PushBlob.new("sha256:" + name, dir + "/" + name, body))
+            }
+          }
+        }
+        i = i + 1
+      }
+      return (R.ok, sort_blobs(out))
+    }
+  }
+}
+
+// Insertion sort by digest: pushes run in a stable order regardless of the
+// directory listing's mood. Strings have no order operators in Emo, so the
+// comparison walks the hex byte-wise.
+def sort_blobs(items Array[PushBlob]) Array[PushBlob] {
+  var out = []
+  var i = 0
+  while i < items.length() {
+    var j = 0
+    var placed = false
+    while j < out.length() {
+      if !placed && digest_less(items[i].digest, out[j].digest) {
+        out = insert_at(out, j, items[i])
+        placed = true
+      }
+      j = j + 1
+    }
+    if !placed {
+      out = out.append(items[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+const push_hex_charset = "0123456789abcdef"
+
+def digest_less(a String, b String) Bool {
+  var i = 0
+  while i < a.length() && i < b.length() {
+    const ca = a.substring(i, 1)
+    const cb = b.substring(i, 1)
+    if ca != cb {
+      return push_hex_charset.index_of(ca) < push_hex_charset.index_of(cb)
+    }
+    i = i + 1
+  }
+  return a.length() < b.length()
+}
+
+def insert_at(items Array[PushBlob], at Int64, item PushBlob) Array[PushBlob] {
+  var out = []
+  var i = 0
+  while i < items.length() {
+    if i == at {
+      out = out.append(item)
+    }
+    out = out.append(items[i])
+    i = i + 1
+  }
+  if at >= items.length() {
+    out = out.append(item)
+  }
+  return out
+}
+
+// HEAD first: a 200 means the registry already has the blob — skip without
+// reading (or sending) a byte. A 401 dances (push+pull scope) and retries
+// the HEAD once. Otherwise upload: small blobs in one POST?digest=, large
+// ones as a session of PATCH chunks closed by the digest PUT.
+def push_one_blob(client src.registry.Client, base String, repo String, blob PushBlob, head_transport HeadTransport, params PushParams, progress Progress) (R, Bool) {
+  const url = base + "/v2/" + repo + "/blobs/" + blob.digest
+  case head_retry(head_transport, "blob HEAD " + blob.digest, url, client.auth_headers(), params) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, resp) then {
+      if resp.status == 200 {
+        progress.step("skip blob " + blob.digest + " (already on the registry)")
+        return (R.ok, false)
+      }
+      if resp.status == 401 {
+        case client.authenticate_scope(push_scope(repo)) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, _) then {
+            case head_retry(head_transport, "blob HEAD " + blob.digest, url, client.auth_headers(), params) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, retry) then {
+                if retry.status == 200 {
+                  progress.step("skip blob " + blob.digest + " (already on the registry)")
+                  return (R.ok, false)
+                }
+                if retry.status != 404 {
+                  return (R.error, "registry: blob HEAD " + blob.digest + " answered status " + retry.status.to_string() + " after the dance")
+                }
+                return upload_blob(client, base, repo, blob, params, progress)
+              }
+            }
+          }
+        }
+      }
+      if resp.status != 404 {
+        return (R.error, "registry: blob HEAD " + blob.digest + " answered status " + resp.status.to_string())
+      }
+      return upload_blob(client, base, repo, blob, params, progress)
+    }
+  }
+}
+
+// The HEAD probe with the same retry discipline as the body-carrying
+// requests.
+def head_retry(head_transport HeadTransport, what String, url String, headers Array[(String, String)], params PushParams) (R, src.registry.Response) {
+  var attempt = 0
+  var last = ""
+  while attempt < params.attempts {
+    if attempt > 0 {
+      time.sleep(push_retry_seconds)
+    }
+    case head_transport.head(url, headers, push_blob_timeout) {
+      (R.error, why) then { last = why }
+      (R.ok, resp) then {
+        if resp.status >= 500 {
+          last = "registry answered status " + resp.status.to_string()
+        } else {
+          return (R.ok, resp)
+        }
+      }
+    }
+    attempt = attempt + 1
+  }
+  return (R.error, "registry: " + what + " failed after " + params.attempts.to_string() + " attempts: " + last)
+}
+
+// The blob's bytes leave this machine: single request, or a session.
+def upload_blob(client src.registry.Client, base String, repo String, blob PushBlob, params PushParams, progress Progress) (R, Bool) {
+  if blob.body.length() <= params.single_max {
+    return push_blob_single(client, base, repo, blob, params, progress)
+  }
+  return push_blob_chunked(client, base, repo, blob, params, progress)
+}
+
+// One POST with the digest parameter and the whole body — 201 done.
+def push_blob_single(client src.registry.Client, base String, repo String, blob PushBlob, params PushParams, progress Progress) (R, Bool) {
+  const url = base + "/v2/" + repo + "/blobs/uploads/?digest=" + src.registry.percent_encode(blob.digest)
+  const headers = src.registry.merge_headers([("Content-Type", "application/octet-stream")], client.auth_headers())
+  case request_retry(client, "blob upload " + blob.digest, "POST", url, headers, blob.body, params) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, resp) then {
+      if resp.status == 201 {
+        progress.step("push blob " + blob.digest + " (" + blob.body.length().to_string() + " bytes)")
+        return (R.ok, true)
+      }
+      return upload_failure("blob upload " + blob.digest, resp)
+    }
+  }
+}
+
+// POST opens the session; PATCH appends each chunk (Content-Range is the
+// spec's bare start-end); the closing PUT carries the digest and no body.
+def push_blob_chunked(client src.registry.Client, base String, repo String, blob PushBlob, params PushParams, progress Progress) (R, Bool) {
+  const start_url = base + "/v2/" + repo + "/blobs/uploads/"
+  case request_retry(client, "upload session " + blob.digest, "POST", start_url, client.auth_headers(), "", params) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, opened) then {
+      if opened.status != 202 {
+        return upload_failure("upload session " + blob.digest, opened)
+      }
+      const location = resolve_location(base, opened.header("Location"))
+      if location == "" {
+        return (R.error, "registry: upload session for " + blob.digest + " answered no Location")
+      }
+      const total = blob.body.length()
+      var offset = 0
+      while offset < total {
+        const end = offset + params.chunk_size
+        var stop = end
+        if stop > total {
+          stop = total
+        }
+        const chunk = blob.body.substring(offset, stop - offset)
+        const range = offset.to_string() + "-" + (stop - 1).to_string()
+        const headers = src.registry.merge_headers([("Content-Type", "application/octet-stream"), ("Content-Range", range)], client.auth_headers())
+        case request_retry(client, "chunk " + range + " of " + blob.digest, "PATCH", location, headers, chunk, params) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, resp) then {
+            if resp.status != 202 && resp.status != 204 {
+              return upload_failure("chunk " + range + " of " + blob.digest, resp)
+            }
+          }
+        }
+        offset = stop
+      }
+      const close_url = location + "?digest=" + src.registry.percent_encode(blob.digest)
+      case request_retry(client, "blob close " + blob.digest, "PUT", close_url, client.auth_headers(), "", params) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, resp) then {
+          if resp.status == 201 {
+            progress.step("push blob " + blob.digest + " (" + total.to_string() + " bytes, " + ((total + params.chunk_size - 1) / params.chunk_size).to_string() + " chunks)")
+            return (R.ok, true)
+          }
+          return upload_failure("blob close " + blob.digest, resp)
+        }
+      }
+    }
+  }
+}
+
+// The manifest stage. Real registries validate an index's children against
+// their manifest tables, so every descriptor in the layout's index.json
+// goes out as a manifest PUT by digest first (recursively — a nested index's
+// children come before the nested index itself; this is what buildx-shaped
+// layouts carry in blobs/sha256). Then the tag PUTs: a single-manifest
+// layout tags the manifest itself (the maximally compatible answer), a
+// multi-platform layout tags the index. The registry's Docker-Content-Digest
+// must equal the local sha256 — a mismatch is an integrity failure, never a
+// silent re-tag.
+def push_manifest(client src.registry.Client, base String, repo String, layout String, tags Array[String], params PushParams, progress Progress) (R, (String, String)) {
+  case file.read(layout + "/index.json") {
+    (R.error, why) then { return (R.error, "push: cannot read the layout index: " + why) }
+    (R.ok, index_body) then {
+      case src.oci.read_index(layout) {
+        (R.error, why) then { return (R.error, "push: " + why) }
+        (R.ok, entries) then {
+          // buildx writes one descriptor per --tag, all naming the same
+          // manifest — dedupe so each manifest pushes once and the
+          // single-platform decision looks at digests, not tag count.
+          const unique = dedupe_entries(entries)
+          var i = 0
+          while i < unique.length() {
+            case put_descriptor(client, base, repo, layout, unique[i], params, progress) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, _) then { }
+            }
+            i = i + 1
+          }
+          // The tag target: the manifest when the index carries exactly one
+          // manifest child, the index itself otherwise.
+          var body = index_body
+          var media = src.registry.mt_oci_index
+          var digest = "sha256:" + crypto.hex_encode(crypto.sha2.sha256(index_body.to_bytes()))
+          if unique.length() == 1 && is_manifest_type(unique[0].media_type) {
+            case blob_bytes(layout, unique[0].digest) {
+              (R.error, why) then { return (R.error, "push: " + why) }
+              (R.ok, manifest_body) then {
+                body = manifest_body
+                media = unique[0].media_type
+                digest = unique[0].digest
+              }
+            }
+          }
+          i = 0
+          while i < tags.length() {
+            case put_tag(client, base, repo, tags[i], body, media, digest, params) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, _) then {
+                progress.step("push tag " + tags[i] + " -> " + digest)
+              }
+            }
+            i = i + 1
+          }
+          return (R.ok, (digest, media))
+        }
+      }
+    }
+  }
+}
+
+def is_manifest_type(media String) Bool {
+  return media == src.registry.mt_oci_manifest || media == src.registry.mt_docker_manifest
+}
+
+// First occurrence wins; the descriptors differ only in their annotations.
+def dedupe_entries(entries Array[src.oci.LayoutEntry]) Array[src.oci.LayoutEntry] {
+  var out = []
+  var i = 0
+  while i < entries.length() {
+    var seen = false
+    var j = 0
+    while j < out.length() {
+      if out[j].digest == entries[i].digest {
+        seen = true
+      }
+      j = j + 1
+    }
+    if !seen {
+      out = out.append(entries[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// One descriptor's manifest PUT by digest; index-type descriptors recurse
+// into their children first.
+def put_descriptor(client src.registry.Client, base String, repo String, layout String, entry src.oci.LayoutEntry, params PushParams, progress Progress) (R, Bool) {
+  case blob_bytes(layout, entry.digest) {
+    (R.error, why) then { return (R.error, "push: " + why) }
+    (R.ok, body) then {
+      if is_manifest_type(entry.media_type) {
+        return put_by_digest(client, base, repo, entry.digest, body, entry.media_type, params, progress)
+      }
+      // An index child: its manifests must be in the registry before the
+      // index itself. The nested entries come from the descriptor's own
+      // bytes.
+      case src.oci.parse_index_entries(body, "push: nested index") {
+        (R.error, why) then { return (R.error, "push: " + why) }
+        (R.ok, children) then {
+          var i = 0
+          while i < children.length() {
+            case put_descriptor(client, base, repo, layout, children[i], params, progress) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, _) then { }
+            }
+            i = i + 1
+          }
+          return put_by_digest(client, base, repo, entry.digest, body, entry.media_type, params, progress)
+        }
+      }
+    }
+  }
+}
+
+// The blob's bytes from the layout's store; the layout is validated, so a
+// missing blob is a push-side bug.
+def blob_bytes(layout String, digest String) (R, String) {
+  const hex = src.blob.digest_hex(digest)
+  if hex == "" {
+    return (R.error, "'" + digest + "' is not a sha256 digest")
+  }
+  return file.read(layout + "/blobs/sha256/" + hex)
+}
+
+// One manifest PUT by digest with the 401 dance-and-retry.
+def put_by_digest(client src.registry.Client, base String, repo String, digest String, body String, media String, params PushParams, progress Progress) (R, Bool) {
+  const url = base + "/v2/" + repo + "/manifests/" + digest
+  const headers = src.registry.merge_headers([("Content-Type", media)], client.auth_headers())
+  case request_retry(client, "manifest " + digest, "PUT", url, headers, body, params) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, resp) then {
+      if resp.status == 401 {
+        case client.authenticate_scope(push_scope(repo)) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, _) then {
+            const retry_headers = src.registry.merge_headers([("Content-Type", media)], client.auth_headers())
+            case request_retry(client, "manifest " + digest, "PUT", url, retry_headers, body, params) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, retry) then {
+                if retry.status != 201 {
+                  return upload_failure("manifest " + digest, retry)
+                }
+                progress.step("push manifest " + digest)
+                return (R.ok, true)
+              }
+            }
+          }
+        }
+      }
+      if resp.status != 201 {
+        return upload_failure("manifest " + digest, resp)
+      }
+      progress.step("push manifest " + digest)
+      return (R.ok, true)
+    }
+  }
+}
+
+// One tag's manifest PUT with the 401 dance-and-retry. The registry's
+// Docker-Content-Digest must equal the pushed bytes' digest.
+def put_tag(client src.registry.Client, base String, repo String, tag String, body String, media String, digest String, params PushParams) (R, Bool) {
+  const url = base + "/v2/" + repo + "/manifests/" + tag
+  const headers = src.registry.merge_headers([("Content-Type", media)], client.auth_headers())
+  case request_retry(client, "manifest " + tag, "PUT", url, headers, body, params) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, resp) then {
+      if resp.status == 401 {
+        case client.authenticate_scope(push_scope(repo)) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, _) then {
+            const retry_headers = src.registry.merge_headers([("Content-Type", media)], client.auth_headers())
+            case request_retry(client, "manifest " + tag, "PUT", url, retry_headers, body, params) {
+              (R.error, why) then { return (R.error, why) }
+              (R.ok, retry) then { return check_manifest_answer(tag, digest, retry) }
+            }
+          }
+        }
+      }
+      return check_manifest_answer(tag, digest, resp)
+    }
+  }
+}
+
+// 201 with a matching Docker-Content-Digest is the only good answer.
+def check_manifest_answer(tag String, digest String, resp src.registry.Response) (R, Bool) {
+  if resp.status != 201 {
+    return upload_failure("manifest " + tag, resp)
+  }
+  const served = resp.header("Docker-Content-Digest")
+  if served != "" && served != digest {
+    return (R.error, "integrity: the registry answered digest " + served + " for " + tag + ", the pushed bytes hash to " + digest)
+  }
+  return (R.ok, true)
+}
+
+// The registry's error envelope rides in the body; surface it with the
+// status so the operator sees the registry's own words.
+def upload_failure(what String, resp src.registry.Response) (R, Bool) {
+  var detail = resp.body.trim()
+  if detail.length() > 200 {
+    detail = detail.substring(0, 200) + "…"
+  }
+  if detail != "" {
+    return (R.error, "registry: " + what + " answered status " + resp.status.to_string() + ": " + detail)
+  }
+  return (R.error, "registry: " + what + " answered status " + resp.status.to_string())
+}
+
+// Relative upload Locations are joined with the base.
+def resolve_location(base String, location String) String {
+  if location == "" {
+    return ""
+  }
+  if location.starts_with("http://") || location.starts_with("https://") {
+    return location
+  }
+  if location.starts_with("/") {
+    return base + location
+  }
+  return location
+}
+
+// The retry wrapper: transport errors and 5xx get another try (with a short
+// pause); everything else answers as-is. Retries are per request — the
+// pipeline is idempotent (HEAD-skip + digest-addressed uploads), so a
+// mid-flight failure can replay without corrupting anything.
+def request_retry(client src.registry.Client, what String, method String, url String, headers Array[(String, String)], body String, params PushParams) (R, src.registry.Response) {
+  const transport = client.get_transport()
+  var attempt = 0
+  var last = ""
+  while attempt < params.attempts {
+    if attempt > 0 {
+      time.sleep(push_retry_seconds)
+    }
+    case transport.request(method, url, headers, body, push_blob_timeout) {
+      (R.error, why) then { last = why }
+      (R.ok, resp) then {
+        if resp.status >= 500 {
+          last = "registry answered status " + resp.status.to_string()
+        } else {
+          return (R.ok, resp)
+        }
+      }
+    }
+    attempt = attempt + 1
+  }
+  return (R.error, "registry: " + what + " failed after " + params.attempts.to_string() + " attempts: " + last)
+}

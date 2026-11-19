@@ -134,8 +134,12 @@ tool:       docker
 layout:     /tmp/pokerface-build-4242/layout
 digest:     sha256:5f42… (application/vnd.oci.image.manifest.v1+json)
 tags:       latest, sha-0123abcd
-(not pushed yet — push arrives with T4.3)
+pushed:     127.0.0.1:4599/acme/app (3 uploaded, 0 skipped)
 ```
 
 One `digest:` line per unique digest (a multi-platform build reports the
-index). `--json` prints `tool`, `layout`, `digests`, `tags`, `platforms`.
+index). When `pokerface.yaml` has a `registry` section, the layout then
+goes to that registry — the push pipeline is
+[push.md](push.md); without one the report says so and the image stays
+local. `--json` prints `tool`, `layout`, `digests`, `tags`, `platforms`,
+`pushed`, `digest`.

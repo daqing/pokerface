@@ -32,6 +32,14 @@ class FakeManifestStore {
 class FakeBlobStore {
   def init(config_body String) {
     self.config_body = Box.new(config_body)
+    self.extra = Box.new(Map.new())
+  }
+
+  // Extra blobs by digest, for the nested-index walks.
+  def add(digest String, body String) {
+    const map = self.extra.read()
+    map.set(digest, body)
+    self.extra.replace(map)
   }
 
   def put(digest String, body String) (R, registry.blobstore.BlobInfo) {
@@ -43,6 +51,10 @@ class FakeBlobStore {
   }
 
   def get(digest String) (R, String) {
+    const map = self.extra.read()
+    if map.has(digest) {
+      return (R.ok, map.get(digest))
+    }
     if digest == config_digest {
       return (R.ok, self.config_body.read())
     }
@@ -305,6 +317,44 @@ def test_resolve_an_index_reports_its_platforms() {
 
 // ---------------------------------------------------------------------------
 // Failure paths.
+
+// The buildx shape: the tag's index wraps a nested index whose children
+// carry the platforms — the platform walk recurses through the blob store
+// and answers the leaf architectures.
+def test_resolve_a_nested_index_reports_the_leaf_platforms() {
+  const nested = "{\"schemaVersion\":2,\"mediaType\":\"" + oci_index_type
+    + "\",\"manifests\":["
+    + "{\"mediaType\":\"" + oci_manifest_type + "\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"size\":10,\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"}},"
+    + "{\"mediaType\":\"" + oci_manifest_type + "\",\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"size\":10,\"platform\":{\"architecture\":\"arm64\",\"os\":\"linux\"}}"
+    + "]}"
+  const top = "{\"schemaVersion\":2,\"mediaType\":\"" + oci_index_type
+    + "\",\"manifests\":[{\"mediaType\":\"" + oci_index_type + "\",\"digest\":\"" + digest_of(nested) + "\",\"size\":" + nested.length().to_string() + "}]}"
+  const blobs = FakeBlobStore.new(config_body)
+  blobs.add(digest_of(nested), nested)
+  const payload = registry.manifests.ManifestPayload.new(true, digest_of(top), oci_index_type, top)
+  const response = resolve.handle(resolve_request(tag_query("acme/app", "multi")), FakeManifestStore.new(payload, ""), blobs)
+  expect_equal(200, response.status)
+  expect_true(response.body.index_of("\"architecture\":\"amd64\"") >= 0)
+  expect_true(response.body.index_of("\"architecture\":\"arm64\"") >= 0)
+  // No empty platform placeholder from the platformless wrapper child.
+  expect_true(response.body.index_of("\"architecture\":\"\"") < 0)
+}
+
+// A flat index whose manifest child carries no platform: the platform comes
+// from the child manifest's config blob.
+def test_resolve_a_platformless_manifest_child_reads_the_config() {
+  const child = "{\"schemaVersion\":2,\"mediaType\":\"" + oci_manifest_type
+    + "\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\""
+    + config_digest + "\",\"size\":40},\"layers\":[]}"
+  const top = "{\"schemaVersion\":2,\"mediaType\":\"" + oci_index_type
+    + "\",\"manifests\":[{\"mediaType\":\"" + oci_manifest_type + "\",\"digest\":\"" + digest_of(child) + "\",\"size\":" + child.length().to_string() + "}]}"
+  const blobs = FakeBlobStore.new(config_body)
+  blobs.add(digest_of(child), child)
+  const payload = registry.manifests.ManifestPayload.new(true, digest_of(top), oci_index_type, top)
+  const response = resolve.handle(resolve_request(tag_query("acme/app", "latest")), FakeManifestStore.new(payload, ""), blobs)
+  expect_equal(200, response.status)
+  expect_true(response.body.index_of("\"architecture\":\"amd64\"") >= 0)
+}
 
 def test_resolve_missing_tag_is_a_404() {
   const absent = registry.manifests.absent_payload()

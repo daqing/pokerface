@@ -15,6 +15,7 @@
 | [errors.md](errors.md) | Error kinds, fixed exit codes, remediation hints, JSON errors, verbose logging and redaction. | `src/errors.emo`, `src/common.emo` |
 | [registry-client.md](registry-client.md) | `/v2/` probe, Bearer auth, manifest/index fetch, media types. | `src/registry.emo` |
 | [pull.md](pull.md) | The pull chain, failure fallbacks, offline mode, host discipline. | `src/commands/pull.emo` |
+| [push.md](push.md) | The push pipeline: blob HEAD-skip, single/chunked uploads, manifests by digest, tag application, digest verification, auth scope (M4/T4.3). | `src/push.emo` |
 | [oci-layout.md](oci-layout.md) | Writing/validating `oci-layout`, `index.json`, `blobs/sha256`. | `src/oci.emo` |
 | [runtime-import.md](runtime-import.md) | Docker/Podman/containerd import via skopeo, verification, cleanup. | `src/runtime.emo` |
 | [cache.md](cache.md) | Cache layout, marker, TTL/size limits, `cache ls/rm/verify`. | `src/cache.emo`, `src/commands/cache.emo` |

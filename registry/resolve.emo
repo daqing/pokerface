@@ -59,18 +59,9 @@ def describe(repository String, tag String, payload registry.manifests.ManifestP
       var platforms = []
       var revision = ""
       if doc.is_index() {
-        const entries = doc.index.manifests
-        var i = 0
-        while i < entries.length() {
-          const platform = entries[i].platform
-          var entry = []
-          entry = entry.append(("architecture", json.string(platform.architecture)))
-          entry = entry.append(("os", json.string(platform.os)))
-          if platform.variant != "" {
-            entry = entry.append(("variant", json.string(platform.variant)))
-          }
-          platforms = platforms.append(json.object(entry))
-          i = i + 1
+        case collect_platforms(blobs, doc.index.manifests, [], 0) {
+          (R.error, why) then { return (R.error, why) }
+          (R.ok, found) then { platforms = found }
         }
         revision = find_annotation(doc.index.annotations, revision_annotation)
       } else {
@@ -93,6 +84,75 @@ def describe(repository String, tag String, payload registry.manifests.ManifestP
       return (R.ok, json.encode(json.object(fields)))
     }
   }
+}
+
+// The index's platforms. Direct children carry their own platform; buildx
+// wraps multi-platform pushes in a nested index whose child carries none —
+// its bytes come from the blob store and the walk recurses (depth-guarded).
+// A manifest child without a platform takes it from its config blob, and a
+// child of an unknown shape is skipped rather than answered as an empty
+// platform.
+def collect_platforms(blobs registry.blobstore.BlobStore, entries Array[registry.oci.IndexEntry], out Array[json.Json], depth Int64) (R, Array[json.Json]) {
+  if depth > 4 {
+    return (R.error, "resolve: the index nests more than 4 levels deep")
+  }
+  var found = out
+  var i = 0
+  while i < entries.length() {
+    const item = entries[i]
+    if item.platform.present() {
+      found = found.append(platform_json(item.platform))
+    } else {
+      if registry.oci.is_index_type(item.descriptor.media_type) {
+        case blobs.get(item.descriptor.digest) {
+          (R.error, why) then { return (R.error, "resolve: nested index " + item.descriptor.digest + ": " + why) }
+          (R.ok, body) then {
+            case registry.oci.parse_document(body, item.descriptor.media_type) {
+              (R.error, why) then { return (R.error, "resolve: nested index " + item.descriptor.digest + ": " + why) }
+              (R.ok, child) then {
+                if child.is_index() {
+                  case collect_platforms(blobs, child.index.manifests, found, depth + 1) {
+                    (R.error, why) then { return (R.error, why) }
+                    (R.ok, deeper) then { found = deeper }
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else {
+        if registry.oci.is_manifest_type(item.descriptor.media_type) {
+          case blobs.get(item.descriptor.digest) {
+            (R.error, why) then { return (R.error, "resolve: manifest " + item.descriptor.digest + ": " + why) }
+            (R.ok, manifest_body) then {
+              case registry.oci.parse_document(manifest_body, item.descriptor.media_type) {
+                (R.error, why) then { return (R.error, why) }
+                (R.ok, manifest_doc) then {
+                  case config_platform(blobs, manifest_doc.manifest.config.digest) {
+                    (R.error, why) then { return (R.error, why) }
+                    (R.ok, entry) then { found = found.append(entry) }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  return (R.ok, found)
+}
+
+// The platform's JSON entry: architecture, os, and the variant when present.
+def platform_json(platform registry.oci.Platform) json.Json {
+  var entry = []
+  entry = entry.append(("architecture", json.string(platform.architecture)))
+  entry = entry.append(("os", json.string(platform.os)))
+  if platform.variant != "" {
+    entry = entry.append(("variant", json.string(platform.variant)))
+  }
+  return json.object(entry)
 }
 
 // An image manifest's platform lives in its config blob.

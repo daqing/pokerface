@@ -1,0 +1,491 @@
+// T4.3 tests for the push pipeline — run with `emo test`.
+//
+// RecTransport answers from an ordered rule list and records every request
+// in full (method, URL, headers, body), so the tests can assert the digest
+// parameters, the Content-Range chunks, the Bearer scopes, and the retry
+// sequence. The layouts come from the real fixture assembler, so the pushed
+// digests are genuine.
+
+require "os"
+require "file"
+require "time"
+require "crypto"
+
+const push_mod = src.push
+
+// ---------------------------------------------------------------------------
+// A recording transport: ordered rules, each with a call budget. A rule
+// matches when the method and a URL substring agree (and, when set, the
+// Authorization header carries a substring); while its budget lasts it
+// answers, then matching falls through to later rules — the mechanism the
+// retry and the auth-dance tests sequence their answers with.
+
+class RecRule {
+  def init(method String, url_contains String, auth_contains String, status Int64, body String, headers Array[(String, String)], times Int64) {
+    self.method = method
+    self.url_contains = url_contains
+    self.auth_contains = auth_contains
+    self.status = status
+    self.body = body
+    self.headers = headers
+    self.left = Box.new(times)
+  }
+}
+
+class RecRequest {
+  def init(method String, url String, headers Array[(String, String)], body String) {
+    self.method = method
+    self.url = url
+    self.headers = headers
+    self.body = body
+  }
+
+  def header(name String) String {
+    const wanted = name.lower()
+    var i = 0
+    while i < self.headers.length() {
+      const (key, value) = self.headers[i]
+      if key.lower() == wanted {
+        return value
+      }
+      i = i + 1
+    }
+    return ""
+  }
+}
+
+class RecTransport {
+  def init(rules Array[RecRule]) {
+    self.rules = rules
+    self.requests = Box.new([])
+  }
+
+  def request(method String, url String, headers Array[(String, String)], body String, timeout Float64) (R, src.registry.Response) {
+    const record = RecRequest.new(method, url, headers, body)
+    self.requests.replace(self.requests.read().append(record))
+    var i = 0
+    while i < self.rules.length() {
+      const rule = self.rules[i]
+      if rule.left.read() > 0 && rule_matches(rule, method, url, headers) {
+        rule.left.replace(rule.left.read() - 1)
+        return (R.ok, src.registry.Response.new(rule.status, rule.headers, rule.body))
+      }
+      i = i + 1
+    }
+    return (R.ok, src.registry.Response.new(404, [], "rec: no rule matches " + method + " " + url))
+  }
+
+  def calls() Int64 {
+    return self.requests.read().length()
+  }
+
+  // The recorded request that touched `url_contains` (the first one).
+  def request_touching(url_contains String) RecRequest {
+    const all = self.requests.read()
+    var i = 0
+    while i < all.length() {
+      if all[i].url.index_of(url_contains) >= 0 {
+        return all[i]
+      }
+      i = i + 1
+    }
+    expect_fail("no request touched " + url_contains)
+    return RecRequest.new("", "", [], "")
+  }
+
+  def requests_matching(url_contains String) Array[RecRequest] {
+    var out = []
+    const all = self.requests.read()
+    var i = 0
+    while i < all.length() {
+      if all[i].url.index_of(url_contains) >= 0 {
+        out = out.append(all[i])
+      }
+      i = i + 1
+    }
+    return out
+  }
+}
+
+// A progress sink that keeps the lines for assertions.
+class CollectorProgress {
+  def init() {
+    self.lines = Box.new([])
+  }
+
+  def step(text String) Void {
+    self.lines.replace(self.lines.read().append(text))
+  }
+}
+
+// The HEAD probe's fake: same rule mechanics as RecTransport, separate
+// recording, because HEAD answers go through HeadTransport in the pipeline.
+class RecHeadTransport {
+  def init(rules Array[RecRule]) {
+    self.rules = rules
+    self.requests = Box.new([])
+  }
+
+  def head(url String, headers Array[(String, String)], timeout Float64) (R, src.registry.Response) {
+    self.requests.replace(self.requests.read().append(RecRequest.new("HEAD", url, headers, "")))
+    var i = 0
+    while i < self.rules.length() {
+      const rule = self.rules[i]
+      if rule.left.read() > 0 && rule_matches(rule, "HEAD", url, headers) {
+        rule.left.replace(rule.left.read() - 1)
+        return (R.ok, src.registry.Response.new(rule.status, rule.headers, ""))
+      }
+      i = i + 1
+    }
+    return (R.ok, src.registry.Response.new(404, [], "rec: no HEAD rule matches " + url))
+  }
+
+  def head_answered(url_contains String, times Int64) Bool {
+    const all = self.requests.read()
+    var hits = 0
+    var i = 0
+    while i < all.length() {
+      if all[i].url.index_of(url_contains) >= 0 {
+        hits = hits + 1
+      }
+      i = i + 1
+    }
+    return hits == times
+  }
+}
+
+def rule_matches(rule RecRule, method String, url String, headers Array[(String, String)]) Bool {
+  if rule.method != "" && rule.method != method {
+    return false
+  }
+  if url.index_of(rule.url_contains) < 0 {
+    return false
+  }
+  const auth = src.registry.Response.new(200, headers, "").header("Authorization")
+  if rule.auth_contains == "-none-" {
+    return auth == ""
+  }
+  if rule.auth_contains == "" {
+    return true
+  }
+  return auth.index_of(rule.auth_contains) >= 0
+}
+
+// ---------------------------------------------------------------------------
+// The fixture layout (same shapes test/oci_layout.emo drives).
+
+def temp_base_dir() String {
+  var base = "/tmp/"
+  case os.getenv("TMPDIR") {
+    (R.ok, tmp) then {
+      if tmp != "" {
+        base = tmp
+      }
+    }
+    (R.error, _) then { base = "/tmp/" }
+  }
+  if base.substring(base.length() - 1, 1) != "/" {
+    base = base + "/"
+  }
+  return base
+}
+
+def push_tmp(name String) String {
+  return temp_base_dir() + "pokerface-push-test-" + os.getpid().to_string() + "-" + name
+}
+
+def read_fixture(name String) String {
+  case file.read("test/fixtures/oci/" + name) {
+    (R.ok, text) then { return text }
+    (R.error, why) then {
+      expect_fail("cannot read fixture " + name + ": " + why)
+      return ""
+    }
+  }
+}
+
+def digest_of(body String) String {
+  return "sha256:" + crypto.hex_encode(crypto.sha2.sha256(body.to_bytes()))
+}
+
+// Assembles the single-manifest fixture layout and answers its path.
+def make_layout(name String) String {
+  const layout = push_tmp(name)
+  const body = read_fixture("manifest.json")
+  const config = read_fixture("config.json")
+  const layer = read_fixture("layer-0.tar.gz")
+  const sources = [
+    src.oci.BlobSource.new(digest_of(config), config.length(), "test/fixtures/oci/config.json"),
+    src.oci.BlobSource.new(digest_of(layer), layer.length(), "test/fixtures/oci/layer-0.tar.gz")
+  ]
+  const spec = src.oci.LayoutSpec.new("application/vnd.oci.image.manifest.v1+json", body, digest_of(body), "v1", sources)
+  case src.oci.assemble(layout, spec) {
+    (R.error, why) then { expect_fail("cannot assemble the layout: " + why) }
+    (R.ok, _) then { }
+  }
+  return layout
+}
+
+const test_image = "127.0.0.1:4591/acme/app"
+const test_repo = "acme/app"
+
+// The challenge header the auth tests replay.
+def challenge_header() String {
+  return "Bearer realm=\"https://auth.example.com/token\",service=\"pokerface-registry\""
+}
+
+// ---------------------------------------------------------------------------
+// The happy path: three blobs uploaded in one request each, the manifest
+// PUT under the tag, the digest verified.
+
+def test_push_uploads_blobs_and_the_manifest() {
+  const layout = make_layout("happy")
+  const transport = RecTransport.new([
+    RecRule.new("GET", "/v2/", "-none-", 200, "{}", [], 5),
+    RecRule.new("POST", "blobs/uploads/?digest=", "", 201, "", [], 5),
+    // The child manifest goes out by digest first; the tag then points at
+    // the manifest (a single-manifest layout).
+    RecRule.new("PUT", "/manifests/sha256:", "", 201, "", [], 5),
+    RecRule.new("PUT", "/manifests/v1", "", 201, "", [("Docker-Content-Digest", manifest_digest())], 5)
+  ])
+  const head = RecHeadTransport.new([
+    RecRule.new("HEAD", "/blobs/", "", 404, "", [], 5)
+  ])
+  const progress = CollectorProgress.new()
+  case push_mod.push_layout(layout, test_image, ["v1"], "", transport, head, push_mod.push_params(), progress) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, report) then {
+      expect_equal(manifest_digest(), report.digest)
+      expect_equal(src.registry.mt_oci_manifest, report.media_type)
+      expect_equal(3, report.uploaded)
+      expect_equal(0, report.skipped)
+      // The POST carried the digest parameter for a blob's digest (the
+      // digest value is percent-encoded).
+      const post = transport.request_touching("blobs/uploads/?digest=")
+      expect_true(post.url.index_of("digest=sha256%3A") >= 0)
+      expect_true(manifest_digest() != "" && transport.requests_matching("blobs/uploads/?digest=").length() == 3)
+      // The child manifest went out by digest, the tag PUT carried the
+      // manifest media type and the exact manifest bytes.
+      expect_equal(1, transport.requests_matching("/manifests/sha256:").length())
+      const put = transport.request_touching("/manifests/v1")
+      expect_equal(src.registry.mt_oci_manifest, put.header("Content-Type"))
+      expect_equal(read_fixture("manifest.json"), put.body)
+      expect_true(progress.lines.read().length() >= 5)
+    }
+  }
+}
+
+def manifest_digest() String {
+  return digest_of(read_fixture("manifest.json"))
+}
+
+// buildx writes one descriptor per --tag into index.json, all naming the
+// same manifest; the push must dedupe them and still tag the manifest
+// (single-platform).
+def test_push_dedupes_per_tag_descriptors() {
+  const layout = make_layout("dedupe")
+  // Rewrite the index with the same manifest listed under two tags, the
+  // shape buildx produces for --tag=a --tag=b.
+  const manifest = read_fixture("manifest.json")
+  const digest = manifest_digest()
+  const size = manifest.length()
+  const index = "{\"schemaVersion\":2,\"mediaType\":\"" + src.registry.mt_oci_index
+    + "\",\"manifests\":["
+    + "{\"mediaType\":\"" + src.registry.mt_oci_manifest + "\",\"digest\":\"" + digest + "\",\"size\":" + size.to_string()
+    + ",\"annotations\":{\"org.opencontainers.image.ref.name\":\"a\"},\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"}},"
+    + "{\"mediaType\":\"" + src.registry.mt_oci_manifest + "\",\"digest\":\"" + digest + "\",\"size\":" + size.to_string()
+    + ",\"annotations\":{\"org.opencontainers.image.ref.name\":\"b\"},\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"}}"
+    + "]}"
+  file.write(layout + "/index.json", index)
+  const transport = RecTransport.new([
+    RecRule.new("GET", "/v2/", "-none-", 200, "{}", [], 5),
+    RecRule.new("POST", "blobs/uploads/?digest=", "", 201, "", [], 5),
+    RecRule.new("PUT", "/manifests/sha256:", "", 201, "", [], 5),
+    RecRule.new("PUT", "/manifests/", "", 201, "", [("Docker-Content-Digest", digest)], 5)
+  ])
+  const head = RecHeadTransport.new([
+    RecRule.new("HEAD", "/blobs/", "", 404, "", [], 5)
+  ])
+  case push_mod.push_layout(layout, test_image, ["a", "b"], "", transport, head, push_mod.push_params(), CollectorProgress.new()) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, report) then {
+      expect_equal(digest, report.digest)
+      expect_equal(src.registry.mt_oci_manifest, report.media_type)
+      // The manifest went out by digest exactly once despite two descriptors.
+      expect_equal(1, transport.requests_matching("/manifests/sha256:").length())
+      // Each tag goes out once, pointing at the manifest.
+      expect_equal(1, transport.requests_matching("/manifests/a").length())
+      expect_equal(1, transport.requests_matching("/manifests/b").length())
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A repeat push: every blob HEADs 200, nothing uploads, no POST happens.
+
+def test_push_skips_existing_blobs() {
+  const layout = make_layout("skip")
+  const transport = RecTransport.new([
+    RecRule.new("GET", "/v2/", "", 200, "{}", [], 5),
+    RecRule.new("POST", "blobs", "", 201, "", [], 5),
+    RecRule.new("PUT", "/manifests/sha256:", "", 201, "", [], 5),
+    RecRule.new("PUT", "/manifests/v1", "", 201, "", [("Docker-Content-Digest", manifest_digest())], 5)
+  ])
+  const head = RecHeadTransport.new([
+    RecRule.new("HEAD", "/blobs/", "", 200, "", [], 5)
+  ])
+  case push_mod.push_layout(layout, test_image, ["v1"], "", transport, head, push_mod.push_params(), CollectorProgress.new()) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, report) then {
+      expect_equal(0, report.uploaded)
+      expect_equal(3, report.skipped)
+      expect_equal(0, transport.requests_matching("blobs/uploads/?digest=").length())
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A blob over the single-request limit goes out as a session: POST, one
+// PATCH per chunk with the spec's bare Content-Range, the closing PUT with
+// the digest.
+
+def test_push_uploads_large_blobs_in_chunks() {
+  const layout = make_layout("chunked")
+  const transport = RecTransport.new([
+    RecRule.new("GET", "/v2/", "-none-", 200, "{}", [], 5),
+    // The config (221 bytes) and the layer (142 bytes) are under the
+    // single-request limit; only the manifest blob (477 bytes) rides the
+    // chunked path with a 100-byte chunk size.
+    RecRule.new("POST", "blobs/uploads/?digest=", "", 201, "", [], 5),
+    RecRule.new("POST", "blobs/uploads/", "", 202, "", [("Location", "/v2/" + test_repo + "/blobs/uploads/sess1")], 5),
+    RecRule.new("PATCH", "blobs/uploads/sess1", "", 202, "", [], 10),
+    RecRule.new("PUT", "blobs/uploads/sess1?digest=", "", 201, "", [], 5),
+    RecRule.new("PUT", "/manifests/sha256:", "", 201, "", [], 5),
+    RecRule.new("PUT", "/manifests/v1", "", 201, "", [("Docker-Content-Digest", manifest_digest())], 5)
+  ])
+  const head = RecHeadTransport.new([
+    RecRule.new("HEAD", "/blobs/", "", 404, "", [], 5)
+  ])
+  const params = push_mod.PushParams.new(250, 100, 3)
+  case push_mod.push_layout(layout, test_image, ["v1"], "", transport, head, params, CollectorProgress.new()) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, report) then {
+      expect_equal(3, report.uploaded)
+      const manifest_size = read_fixture("manifest.json").length()
+      const patches = transport.requests_matching("blobs/uploads/sess1")
+      // PATCHes only (the URL match also catches the closing PUT — filter).
+      var count = 0
+      var i = 0
+      while i < patches.length() {
+        if patches[i].method == "PATCH" {
+          count = count + 1
+        }
+        i = i + 1
+      }
+      expect_equal((manifest_size + 99) / 100, count)
+      // The first chunk's Content-Range is the spec's bare start-end.
+      const first = transport.request_touching("blobs/uploads/sess1")
+      expect_equal("0-99", first.header("Content-Range"))
+      // The closing PUT carried the digest and no body.
+      const closes = transport.requests_matching("blobs/uploads/sess1?digest=")
+      expect_equal(1, closes.length())
+      expect_equal("", closes[0].body)
+      expect_true(closes[0].url.index_of("digest=sha256%3A") >= 0)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auth: the challenge runs the dance, a pull-only token's 401 re-dances
+// with the push+pull scope, and the retried requests carry the new token.
+
+def test_push_dances_with_the_push_scope() {
+  const layout = make_layout("auth")
+  const transport = RecTransport.new([
+    // The probe: unauthenticated /v2/ is challenged.
+    RecRule.new("GET", "/v2/", "-none-", 401, "", [("WWW-Authenticate", challenge_header())], 5),
+    // The re-dance's token fetch carries the push+pull scope: TOK2. (Before
+    // the generic token rule — ordered matching. The whole scope value is
+    // percent-encoded, slashes included.)
+    RecRule.new("GET", "scope=repository%3Aacme%2Fapp%3Apull%2Cpush", "", 200, "{\"token\":\"TOK2\"}", [], 5),
+    // The first token fetch (the challenge names no scope): TOK1.
+    RecRule.new("GET", "auth.example.com", "", 200, "{\"token\":\"TOK1\"}", [], 5),
+    // The probe retry with TOK1 succeeds.
+    RecRule.new("GET", "/v2/", "TOK1", 200, "{}", [], 5),
+    // Everything after the dance works with TOK2 (the dance's verify probe
+    // included).
+    RecRule.new("GET", "/v2/", "TOK2", 200, "{}", [], 5),
+    RecRule.new("POST", "blobs/uploads/?digest=", "TOK2", 201, "", [], 5),
+    RecRule.new("PUT", "/manifests/sha256:", "TOK2", 201, "", [], 5),
+    RecRule.new("PUT", "/manifests/v1", "TOK2", 201, "", [("Docker-Content-Digest", manifest_digest())], 5)
+  ])
+  const head = RecHeadTransport.new([
+    // The first blob HEAD with the scopeless token is rejected.
+    RecRule.new("HEAD", "/blobs/", "TOK1", 401, "", [("WWW-Authenticate", challenge_header())], 5),
+    RecRule.new("HEAD", "/blobs/", "TOK2", 404, "", [], 5)
+  ])
+  case push_mod.push_layout(layout, test_image, ["v1"], "", transport, head, push_mod.push_params(), CollectorProgress.new()) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, report) then {
+      expect_equal(3, report.uploaded)
+      // The scope token URL was requested exactly once.
+      expect_equal(1, transport.requests_matching("scope=repository%3A").length())
+      // No upload ever went out with the scopeless token.
+      const posts = transport.requests_matching("blobs/uploads/?digest=")
+      var i = 0
+      while i < posts.length() {
+        expect_true(posts[i].header("Authorization").index_of("TOK2") >= 0)
+        i = i + 1
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The registry answered a digest that disagrees with the pushed bytes — an
+// integrity error, never a silent re-tag.
+
+def test_push_verifies_the_manifest_digest() {
+  const layout = make_layout("mismatch")
+  const wrong = "sha256:" + crypto.hex_encode(crypto.sha2.sha256("wrong".to_bytes()))
+  const transport = RecTransport.new([
+    RecRule.new("GET", "/v2/", "", 200, "{}", [], 5),
+    RecRule.new("PUT", "/manifests/sha256:", "", 201, "", [], 5),
+    RecRule.new("PUT", "/manifests/v1", "", 201, "", [("Docker-Content-Digest", wrong)], 5)
+  ])
+  const head = RecHeadTransport.new([
+    RecRule.new("HEAD", "/blobs/", "", 200, "", [], 5)
+  ])
+  case push_mod.push_layout(layout, test_image, ["v1"], "", transport, head, push_mod.push_params(), CollectorProgress.new()) {
+    (R.error, why) then {
+      expect_true(why.index_of("integrity:") == 0)
+      expect_true(why.index_of(wrong) >= 0)
+    }
+    (R.ok, _) then { expect_fail("a wrong served digest was accepted") }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A 500 gets another try before the pipeline gives up.
+
+def test_push_retries_a_500() {
+  const layout = make_layout("retry")
+  const transport = RecTransport.new([
+    RecRule.new("GET", "/v2/", "", 200, "{}", [], 5),
+    // First attempt 500s; the retry hits the later rule and succeeds.
+    RecRule.new("POST", "blobs/uploads/?digest=", "", 500, "boom", [], 1),
+    RecRule.new("POST", "blobs/uploads/?digest=", "", 201, "", [], 5),
+    RecRule.new("PUT", "/manifests/sha256:", "", 201, "", [], 5),
+    RecRule.new("PUT", "/manifests/v1", "", 201, "", [("Docker-Content-Digest", manifest_digest())], 5)
+  ])
+  const head = RecHeadTransport.new([
+    RecRule.new("HEAD", "/blobs/", "", 404, "", [], 5)
+  ])
+  case push_mod.push_layout(layout, test_image, ["v1"], "", transport, head, push_mod.push_params(), CollectorProgress.new()) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, report) then {
+      expect_equal(3, report.uploaded)
+      expect_equal(4, transport.requests_matching("blobs/uploads/?digest=").length())
+    }
+  }
+}
