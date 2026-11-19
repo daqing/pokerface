@@ -622,7 +622,7 @@ Exit criteria:
 
 | Status | ID | Task | Depends on | Estimate |
 | --- | --- | --- | --- | --- |
-| [ ] | T4.1 | `pokerface build` command and build plan | T1.4, T1.5 | 2h |
+| [x] | T4.1 | `pokerface build` command and build plan | T1.4, T1.5 | 2h |
 | [ ] | T4.2 | BuildKit / podman build adapter | T4.1 | 3-4h |
 | [ ] | T4.3 | Registry push: blobs + manifest | T1.10, T2.12, T4.2 | 3h |
 | [ ] | T4.4 | Generate and write back the lock file | T4.3 | 2h |
@@ -651,6 +651,8 @@ Exit criteria:
 **Acceptance**: Example configuration output is stable; a missing Dockerfile, missing context, or duplicate tags produce errors; `--dry-run` performs no build or network requests; `--platform` can override.
 
 **Depends on**: T1.4, T1.5 · **Estimate**: 2h
+
+> **Notes** (2026-11-19, ~2.5h): Done. `src/build.emo` holds the plan model (`GitMetadata`, `BuildPlan`), the tag renderer (manual `{{`/`}}` scanning — `String.index_of` takes no start index), the collision check (two distinct templates rendering the same string collide, error names both positions: `tags[1] ('{{ git.tag }}') collides with tags[0]`), the Git capture (rev-parse/describe run in the CONTEXT directory; exact-match describe failure = not tag-triggered, `""`), and `plan()` with the shared `context_dir` resolution (relative to the config file's dir; a `.` context joins to `/.` and the tail is dropped). `src/commands/build.emo` composes read → parse (`src.config.load` — the BUILD config, never `src.settings.load`, which would reject it as the client config.yaml with unknown fields) → context check → Git capture → plan → Dockerfile check → print; `compose_plan` + `plan_text` split out (the T1.14 resolve precedent) so the tests assert the exact lines `print_plan` printlns without stdout interception. Discovery: `--config` > `./pokerface.yaml` (cwd; `os.getcwd()` returns a bare String). Empty render (a lone `{{ git.tag }}` untagged) funnels through the charset check — one rejection shape, "renders to an invalid tag". Without `--dry-run` is a usage error until T4.2. Router gotcha: `route()` rejected every unknown `--` option after any command but pull/cache, so `build --dry-run` never reached the command — build joined the per-command parse list. Verified: 12 tests (renderer/collisions/metadata/plan/command), `emo test` 500/500, c target builds, and the compiled binary driven end to end (cwd discovery, `--config`, `--json`, `--platform` override, exit codes 2/1 for usage/validation). Spec: `docs/spec/build-plan.md`. Follow-ups: T4.2 consumes `BuildPlan`; T4.10 folds this into the CLI reference.
 
 #### T4.2 BuildKit / Podman Build Adapter
 

@@ -90,10 +90,10 @@ def route(argv Array[String]) Int64 {
         config = arg.substring(9, arg.length() - 9)
       }
       _ when arg.starts_with("-") then {
-        // Global flags are handled above. After `pull`, an unrecognized
-        // option belongs to the command and is parsed (and rejected) there;
-        // other commands have no command-specific options yet.
-        if command == "pull" || command == "cache" {
+        // Global flags are handled above. After a command with its own
+        // options (pull, cache, build), an unrecognized option belongs to
+        // the command and is parsed (and rejected) there.
+        if command == "pull" || command == "cache" || command == "build" {
           rest = rest.append(arg)
         } else {
           return src.errors.usage_report("", "unknown option " + arg, json)
@@ -120,7 +120,7 @@ def route(argv Array[String]) Int64 {
     "version" then { return run_version(flags) }
     "resolve" then { return src.commands.resolve.run(flags, rest, src.settings.RealEnv.new()) }
     "pull" then { return src.commands.pull.run(flags, rest, src.settings.RealEnv.new()) }
-    "build" then { return not_implemented(command, flags) }
+    "build" then { return src.commands.build.run(flags, rest, src.settings.RealEnv.new()) }
     "config" then { return not_implemented(command, flags) }
     "cache" then { return src.commands.cache.run(flags, rest, src.settings.RealEnv.new()) }
     _ then {

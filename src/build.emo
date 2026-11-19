@@ -1,0 +1,212 @@
+// T4.1: the build plan — the bridge between pokerface.yaml and the actual
+// build. The tag renderer turns the config's templates (`{{ commit.short }}`,
+// `{{ git.tag }}`, `{{ branch }}`, `{{ version }}`, with literal prefixes and
+// suffixes) into concrete tags from the Git metadata of the repository being
+// built, then rejects collisions the file-level duplicate check could not
+// see (`{{ branch }}` and `{{ git.tag }}` both rendering `main`).
+//
+// The plan itself is the build's whole input: image reference, rendered
+// tags, platforms (with the CLI's --platform override applied), build args,
+// and the context/Dockerfile paths — everything `--dry-run` prints and the
+// T4.2 adapter consumes. Spec: docs/spec/pokerface-yaml.md (the placeholder
+// table) and docs/spec/build-plan.md.
+
+// The Git facts the renderer needs, captured once for the whole plan.
+class GitMetadata {
+  def init(commit_short String, git_tag String, branch String, version String) {
+    self.commit_short = commit_short
+    self.git_tag = git_tag
+    self.branch = branch
+    self.version = version
+  }
+}
+
+class BuildPlan {
+  def init(image String, tags Array[String], platforms Array[String], args Map[String, String], context String, dockerfile String, target String) {
+    self.image = image
+    self.tags = tags
+    self.platforms = platforms
+    self.args = args
+    self.context = context
+    self.dockerfile = dockerfile
+    self.target = target
+  }
+}
+
+// Renders one template. Unknown placeholders and unterminated holes were
+// rejected by the config parser; the renderer still answers an error rather
+// than printing something half-rendered.
+def render_tag(template String, metadata GitMetadata) (R, String) {
+  var out = ""
+  var i = 0
+  while i < template.length() {
+    // The next "{{" at or after i (index_of has no start index).
+    var open = -1
+    var scan = i
+    while scan + 1 < template.length() {
+      if template.substring(scan, 2) == "{{" {
+        open = scan
+        break
+      }
+      scan = scan + 1
+    }
+    if open < 0 {
+      out = out + template.substring(i, template.length() - i)
+      break
+    }
+    // The matching "}}" after the hole opened.
+    var close = -1
+    scan = open + 2
+    while scan + 1 < template.length() {
+      if template.substring(scan, 2) == "}}" {
+        close = scan
+        break
+      }
+      scan = scan + 1
+    }
+    if close < 0 {
+      return (R.error, "tag template '" + template + "': unterminated placeholder")
+    }
+    out = out + template.substring(i, open - i)
+    const name = template.substring(open + 2, close - open - 2).trim()
+    case placeholder_value(name, metadata) {
+      (R.error, why) then { return (R.error, "tag template '" + template + "': " + why) }
+      (R.ok, value) then { out = out + value }
+    }
+    i = close + 2
+  }
+  // Empty output and bad characters both funnel through the charset check,
+  // so every rejection names the same shape of problem.
+  case validate_rendered(out) {
+    (R.error, why) then { return (R.error, "tag template '" + template + "' renders to an invalid tag: " + why) }
+    (R.ok, _) then { return (R.ok, out) }
+  }
+}
+
+def placeholder_value(name String, metadata GitMetadata) (R, String) {
+  case name {
+    "commit.short" then { return (R.ok, metadata.commit_short) }
+    "git.tag" then { return (R.ok, metadata.git_tag) }
+    "branch" then { return (R.ok, metadata.branch) }
+    "version" then { return (R.ok, metadata.version) }
+    _ then { return (R.error, "unknown placeholder '{{ " + name + " }}'") }
+  }
+}
+
+// The rendered tag must satisfy the same charset the config parser enforces
+// for literal tags: lowercase alphanumerics plus `.` `_` `-`. `:` (registry
+// ports) and `/` (namespaces) belong to the image field, never the tag.
+const tag_charset = "abcdefghijklmnopqrstuvwxyz0123456789.-_"
+
+def validate_rendered(tag String) (R, Bool) {
+  if tag == "" {
+    return (R.error, "the tag is empty")
+  }
+  if tag.starts_with(".") || tag.starts_with("-") {
+    return (R.error, "the tag starts with '" + tag.substring(0, 1) + "'")
+  }
+  var i = 0
+  while i < tag.length() {
+    if tag_charset.index_of(tag.substring(i, 1)) < 0 {
+      return (R.error, "character '" + tag.substring(i, 1) + "' is not allowed in a tag")
+    }
+    i = i + 1
+  }
+  return (R.ok, true)
+}
+
+// Renders every configured tag and refuses the collisions the file-level
+// duplicate check cannot see: two distinct templates that render to the same
+// string (`{{ branch }}` and `{{ git.tag }}` when the build is tag-triggered
+// on main).
+def render_tags(templates Array[String], metadata GitMetadata) (R, Array[String]) {
+  var out = []
+  var i = 0
+  while i < templates.length() {
+    case render_tag(templates[i], metadata) {
+      (R.error, why) then { return (R.error, why) }
+      (R.ok, tag) then {
+        var j = 0
+        while j < out.length() {
+          if out[j] == tag {
+            return (R.error, "tags[" + i.to_string() + "] ('" + templates[i] + "') collides with tags["
+              + j.to_string() + "] — both render to '" + tag + "'")
+          }
+          j = j + 1
+        }
+        out = out.append(tag)
+      }
+    }
+    i = i + 1
+  }
+  return (R.ok, out)
+}
+
+// Captures the Git facts from the repository the build runs in: the current
+// commit (short), the tag pointing exactly at HEAD ("" when the build is not
+// tag-triggered), and the current branch. The version comes from the
+// version file's VERSION field when present (the repo's own convention);
+// a missing file renders `{{ version }}` to "" — the tag then fails the
+// charset check with a clear message.
+def git_metadata(runner src.git.CommandRunner, repo_root String) (R, GitMetadata) {
+  case runner.run(["git", "-C", repo_root, "rev-parse", "--short=8", "HEAD"], 10.0) {
+    (R.error, why) then { return (R.error, "git: cannot read the commit: " + why) }
+    (R.ok, commit) then {
+      var commit_short = commit.trim()
+      var tag = ""
+      case runner.run(["git", "-C", repo_root, "describe", "--tags", "--exact-match", "HEAD"], 10.0) {
+        (R.error, _) then { tag = "" }
+        (R.ok, found) then { tag = found.trim() }
+      }
+      var branch = ""
+      case runner.run(["git", "-C", repo_root, "rev-parse", "--abbrev-ref", "HEAD"], 10.0) {
+        (R.error, _) then { branch = "" }
+        (R.ok, name) then { branch = name.trim() }
+      }
+      var version = ""
+      case runner.run(["git", "-C", repo_root, "describe", "--tags", "--abbrev=0"], 10.0) {
+        (R.error, _) then { version = "" }
+        (R.ok, latest) then { version = latest.trim() }
+      }
+      return (R.ok, GitMetadata.new(commit_short, tag, branch, version))
+    }
+  }
+}
+
+// The context directory resolved against the config file's directory (the
+// T1.4 convention: relative paths in pokerface.yaml are relative to the
+// file). Shared by the plan and by the command's Git capture, so both see
+// the same directory. A context of "." (the common default) joins to "/.";
+// the tail is dropped here.
+def context_dir(raw String, config_dir String) String {
+  var context = raw
+  if context.starts_with("./") || context.starts_with("../") || (context != "" && context.substring(0, 1) != "/") {
+    context = config_dir + "/" + context
+  }
+  if context.length() >= 2 && context.substring(context.length() - 2, 2) == "/." {
+    context = context.substring(0, context.length() - 2)
+  }
+  return context
+}
+
+// Assembles the plan from a parsed config. `platform_override` replaces the
+// configured platforms when the CLI passed --platform (possibly several
+// times — the caller sends the list). The context and Dockerfile paths are
+// resolved by context_dir.
+def plan(config src.config.PokerfaceConfig, metadata GitMetadata, config_dir String, platform_override Array[String]) (R, BuildPlan) {
+  case render_tags(config.tags, metadata) {
+    (R.error, why) then { return (R.error, why) }
+    (R.ok, tags) then {
+      var platforms = config.build.platforms
+      if platform_override.length() > 0 {
+        platforms = platform_override
+      }
+      const context = context_dir(config.build.context, config_dir)
+      var dockerfile = config.build.dockerfile
+      if dockerfile != "" && dockerfile.substring(0, 1) != "/" {
+        dockerfile = context + "/" + dockerfile
+      }
+      return (R.ok, BuildPlan.new(config.image, tags, platforms, config.build.args, context, dockerfile, config.build.target))
+    }
+  }
+}

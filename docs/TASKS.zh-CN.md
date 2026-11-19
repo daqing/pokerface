@@ -622,7 +622,7 @@ images:
 
 | 状态 | ID | 任务 | 依赖 | 预估 |
 | --- | --- | --- | --- | --- |
-| [ ] | T4.1 | `pokerface build` 命令与构建计划 | T1.4、T1.5 | 2h |
+| [x] | T4.1 | `pokerface build` 命令与构建计划 | T1.4、T1.5 | 2h |
 | [ ] | T4.2 | BuildKit / podman 构建适配 | T4.1 | 3-4h |
 | [ ] | T4.3 | Registry 推送：Blob + Manifest | T1.10、T2.12、T4.2 | 3h |
 | [ ] | T4.4 | lock 文件生成与写回 | T4.3 | 2h |
@@ -651,6 +651,8 @@ images:
 **验收**：示例配置输出稳定；缺 Dockerfile / 上下文不存在 / tag 重复时报错；`--dry-run` 不执行任何构建或网络请求；支持 `--platform` 覆盖。
 
 **依赖**：T1.4、T1.5 · **预估**：2h
+
+> **笔记**（2026-11-19，约 2.5h）：完成。`src/build.emo` 承载计划模型（`GitMetadata`、`BuildPlan`）、tag 渲染器（手扫 `{{`/`}}`——`String.index_of` 不带起始下标）、碰撞检查（两条不同模板渲染出同一字符串即碰撞，错误同时给出两个位置：`tags[1] ('{{ git.tag }}') collides with tags[0]`）、Git 事实采集（rev-parse/describe 在**上下文目录**里跑；exact-match describe 失败 = 非 tag 触发，记 `""`），以及带共享 `context_dir` 解析的 `plan()`（相对配置文件目录解析；`.` 上下文拼接成 `/.` 后去尾）。`src/commands/build.emo` 的组合是读 → 解析（`src.config.load`——这是**构建**配置，绝不走 `src.settings.load`，后者会按客户端 config.yaml 的未知字段拒绝它）→ 上下文检查 → Git 采集 → 计划 → Dockerfile 检查 → 打印；拆出 `compose_plan` + `plan_text`（T1.14 resolve 的先例），测试直接断言 `print_plan` println 的原行，不需要拦截 stdout。发现规则：`--config` > `./pokerface.yaml`（cwd；`os.getcwd()` 返回裸 String）。空渲染（未打 tag 构建上的单独 `{{ git.tag }}`）统一走字符集检查——一种拒绝形状，"renders to an invalid tag"。不带 `--dry-run` 在 T4.2 前是用法错误。路由踩坑：`route()` 对除 pull/cache 外的任何命令都直接拒绝未知 `--` 选项，`build --dry-run` 根本到不了命令——build 已加入按命令解析名单。验证：12 个测试（渲染/碰撞/元数据/计划/命令），`emo test` 500/500，c target 编译通过，编译产物端到端驱动（cwd 发现、`--config`、`--json`、`--platform` 覆盖、退出码 2/1）。规范：`docs/spec/build-plan.md`。后续：T4.2 消费 `BuildPlan`；T4.10 并入 CLI 参考。
 
 #### T4.2 BuildKit / podman 构建适配
 

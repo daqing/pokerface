@@ -1,7 +1,7 @@
 # Specification Index
 
-> The client's v0.1 contracts (M1, complete) and the server side as it lands
-> (M2, in progress).
+> The client's v0.1 contracts (M1, complete), the server side (M2,
+> complete), and M4 (build and delivery) as it lands.
 
 | Spec | Covers | Implemented by |
 
@@ -9,6 +9,7 @@
 > `deploy/` with Compose, and `scripts/e2e-m2.sh` is the end-to-end smoke.
 | --- | --- | --- |
 | [pokerface-yaml.md](pokerface-yaml.md) | The build input committed with the app: image, tags, platforms, builder. | `src/config.emo` |
+| [build-plan.md](build-plan.md) | The build plan: config discovery, Git metadata capture, tag rendering/collisions, path resolution, dry-run output (M4/T4.1). | `src/commands/build.emo`, `src/build.emo` |
 | [pokerface-lock.md](pokerface-lock.md) | The metadata CI writes back: `commit → image → digest` chain. | `src/lockfile.emo` |
 | [config.md](config.md) | Client config precedence, credentials, XDG paths, cache limits. | `src/settings.emo` |
 | [errors.md](errors.md) | Error kinds, fixed exit codes, remediation hints, JSON errors, verbose logging and redaction. | `src/errors.emo`, `src/common.emo` |

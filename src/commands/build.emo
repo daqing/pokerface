@@ -1,0 +1,207 @@
+// T4.1: the `pokerface build` command — read pokerface.yaml (the --config
+// flag names it, otherwise it lives in the current directory), capture the
+// Git metadata of the repository the context names, render the tag
+// templates, and answer a build plan. `--dry-run` prints the plan and
+// performs no build and no network requests; executing the plan is T4.2's
+// adapter, so running without --dry-run is a usage error for now.
+// `--platform` overrides the configured platforms (repeatable: --platform
+// linux/amd64 --platform linux/arm64).
+//
+// pokerface.yaml is the BUILD config (src.config.load) — a different file
+// from the client's config.yaml (src.settings.load), so the settings loader
+// is not involved. Validation happens before anything prints: the config
+// must parse, the context directory and Dockerfile must exist on disk, and
+// the rendered tags must be collision-free. Spec: docs/spec/build-plan.md.
+
+require "file"
+require "os"
+require "json"
+
+def run(flags src.common.Flags, rest Array[String], env src.settings.EnvSource) Int64 {
+  var dry_run = false
+  var platforms = []
+  var i = 0
+  while i < rest.length() {
+    const arg = rest[i]
+    if arg == "--dry-run" {
+      dry_run = true
+    } else {
+      if arg.starts_with("--platform=") {
+        platforms = platforms.append(arg.substring(11, arg.length() - 11))
+      } else {
+        if arg == "--platform" {
+          if i + 1 >= rest.length() {
+            return src.errors.usage_report("build", "--platform expects a value (e.g. linux/amd64)", flags.json)
+          }
+          i = i + 1
+          platforms = platforms.append(rest[i])
+        } else {
+          if arg.starts_with("-") {
+            return src.errors.usage_report("build", "unknown option '" + arg + "' (known: --dry-run, --platform)", flags.json)
+          }
+          return src.errors.usage_report("build", "unexpected argument '" + arg + "' (build takes no positional arguments)", flags.json)
+        }
+      }
+    }
+    i = i + 1
+  }
+  if !dry_run {
+    return src.errors.usage_report("build", "executing the plan is not implemented yet — pass --dry-run", flags.json)
+  }
+
+  var config_path = flags.config
+  if config_path == "" {
+    config_path = os.getcwd() + "/pokerface.yaml"
+  }
+
+  case compose_plan(config_path, platforms) {
+    (R.error, why) then { return src.errors.report("build", why, flags.json) }
+    (R.ok, plan) then {
+      case check_dockerfile(plan) {
+        (R.error, why) then { return src.errors.report("build", why, flags.json) }
+        (R.ok, _) then {
+          if flags.json {
+            print_plan_json(plan)
+          } else {
+            print_plan(plan)
+          }
+          return src.common.exit_ok
+        }
+      }
+    }
+  }
+}
+
+// The composition without any output: read pokerface.yaml, parse it as the
+// build config, capture the Git facts from the context directory, and
+// assemble the plan. The command prints; the tests assert on the same plan.
+def compose_plan(config_path String, platforms Array[String]) (R, src.build.BuildPlan) {
+  case file.read(config_path) {
+    (R.error, why) then { return (R.error, "cannot read " + config_path + ": " + why) }
+    (R.ok, text) then {
+      case src.config.load(text) {
+        (R.error, why) then { return (R.error, why) }
+        (R.ok, config) then {
+          const config_dir = dir_of(config_path)
+          const repo_root = src.build.context_dir(config.build.context, config_dir)
+          case os.list_dir(repo_root) {
+            (R.error, why) then { return (R.error, "build.context: cannot open " + repo_root + ": " + why) }
+            (R.ok, _) then {
+              const runner = src.git.RealRunner.new()
+              case src.build.git_metadata(runner, repo_root) {
+                (R.error, why) then { return (R.error, why) }
+                (R.ok, metadata) then {
+                  return src.build.plan(config, metadata, config_dir, platforms)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+def dir_of(path String) String {
+  var i = path.length() - 1
+  while i >= 0 {
+    if path.substring(i, 1) == "/" {
+      if i == 0 {
+        return "/"
+      }
+      return path.substring(0, i)
+    }
+    i = i - 1
+  }
+  return "."
+}
+
+// The Dockerfile inside the (already verified) context must exist before a
+// build plan is worth printing.
+def check_dockerfile(plan src.build.BuildPlan) (R, Bool) {
+  case file.read(plan.dockerfile) {
+    (R.error, why) then { return (R.error, "build.dockerfile: cannot read " + plan.dockerfile + ": " + why) }
+    (R.ok, _) then { return (R.ok, true) }
+  }
+}
+
+// The human plan. Stable field order, matching the --json keys.
+def print_plan(plan src.build.BuildPlan) {
+  println(plan_text(plan))
+}
+
+// The plan's lines without a trailing newline — print_plan printlns it, the
+// tests assert on the substrings.
+def plan_text(plan src.build.BuildPlan) String {
+  var lines = "image:      " + plan.image + "\n"
+  lines = lines + "tags:       " + join(plan.tags, ", ") + "\n"
+  lines = lines + "platforms:  " + join(plan.platforms, ", ") + "\n"
+  if plan.target != "" {
+    lines = lines + "target:     " + plan.target + "\n"
+  }
+  lines = lines + "dockerfile: " + plan.dockerfile + "\n"
+  lines = lines + "context:    " + plan.context + "\n"
+  const names = plan.args.keys()
+  if names.length() > 0 {
+    var pairs = []
+    var i = 0
+    while i < names.length() {
+      pairs = pairs.append(names[i] + "=" + plan.args.get(names[i]))
+      i = i + 1
+    }
+    lines = lines + "args:       " + join(pairs, ", ") + "\n"
+  }
+  lines = lines + "(dry run — no build performed)"
+  return lines
+}
+
+// One JSON object per plan; the keys are stable and script-friendly.
+def print_plan_json(plan src.build.BuildPlan) {
+  var tag_values = []
+  var i = 0
+  while i < plan.tags.length() {
+    tag_values = tag_values.append(json.string(plan.tags[i]))
+    i = i + 1
+  }
+  var platform_values = []
+  i = 0
+  while i < plan.platforms.length() {
+    platform_values = platform_values.append(json.string(plan.platforms[i]))
+    i = i + 1
+  }
+  var arg_values = []
+  const names = plan.args.keys()
+  i = 0
+  while i < names.length() {
+    arg_values = arg_values.append(json.object([
+      ("name", json.string(names[i])),
+      ("value", json.string(plan.args.get(names[i])))
+    ]))
+    i = i + 1
+  }
+  var fields = [
+    ("image", json.string(plan.image)),
+    ("tags", json.array(tag_values)),
+    ("platforms", json.array(platform_values))
+  ]
+  if plan.target != "" {
+    fields = fields.append(("target", json.string(plan.target)))
+  }
+  fields = fields.append(("dockerfile", json.string(plan.dockerfile)))
+  fields = fields.append(("context", json.string(plan.context)))
+  fields = fields.append(("args", json.array(arg_values)))
+  println(json.encode(json.object(fields)))
+}
+
+def join(items Array[String], sep String) String {
+  var out = ""
+  var i = 0
+  while i < items.length() {
+    if i > 0 {
+      out = out + sep
+    }
+    out = out + items[i]
+    i = i + 1
+  }
+  return out
+}

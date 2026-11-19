@@ -63,7 +63,7 @@ A tag rule is a string of at most 128 characters, either:
 
 Supported placeholders:
 
-| Placeholder | Renders to (T4.1) | Example |
+| Placeholder | Renders to (see [build-plan.md](build-plan.md)) | Example |
 | --- | --- | --- |
 | `{{ commit.short }}` | The 8-character commit SHA the image was built from | `sha-01234567` |
 | `{{ git.tag }}` | The Git tag that triggered the build; empty when the build was not tag-triggered | `v1.2.0` |
@@ -78,8 +78,8 @@ Validation rejects, with the tag's position (`tags[1]`) in the error:
   (`"Bad Tag"` — uppercase and space).
 
 Two tag rules that are identical strings are rejected as duplicates.
-Whether two *templates* can render to the same tag at build time is checked
-in T4.1, not here.
+Two distinct *templates* that render to the same tag at build time collide
+there — [build-plan.md](build-plan.md) has the check.
 
 ## Error format
 

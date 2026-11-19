@@ -60,7 +60,7 @@ def test_missing_config_value_exits_two() {
 }
 
 def test_unimplemented_commands_report_not_implemented() {
-  expect_equal(cli.exit_failure, cli.route(["pokerface", "build"]))
+  // `build` is T4.1's real command now; `config` is still a stub.
   expect_equal(cli.exit_failure, cli.route(["pokerface", "config"]))
 }
 
