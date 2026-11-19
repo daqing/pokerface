@@ -1,0 +1,13 @@
+version: 1
+image: 127.0.0.1:4599/hello/app
+build:
+  context: "."
+  dockerfile: Dockerfile
+  platforms:
+    - linux/amd64
+    - linux/arm64
+tags:
+  - latest
+  - "sha-{{ commit.short }}"
+registry:
+  url: http://127.0.0.1:4599

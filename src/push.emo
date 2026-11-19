@@ -15,8 +15,14 @@ require "time"
 require "crypto"
 require "net"
 
-const push_single_max = 4194304
-const push_chunk_size = 4194304
+// Uploads never write more than 64 KiB in one request: the c runtime's
+// plain-TCP `send` treats EAGAIN (a full socket buffer) as a fatal error
+// instead of waiting for writability, so a multi-megabyte single write dies
+// mid-body on loopback. 64 KiB is under the default socket buffer, and the
+// fork-per-connection registry drains each request promptly. The same
+// bound is why a giant blob travels as many PATCH chunks rather than one.
+const push_single_max = 65536
+const push_chunk_size = 65536
 const push_attempts = 3
 const push_retry_seconds = 0.5
 const push_blob_timeout = 300.0
