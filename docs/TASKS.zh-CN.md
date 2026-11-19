@@ -627,7 +627,7 @@ images:
 | [x] | T4.3 | Registry 推送：Blob + Manifest | T1.10、T2.12、T4.2 | 3h |
 | [x] | T4.4 | lock 文件生成与写回 | T4.3 | 2h |
 | [x] | T4.5 | 构建触发与版本策略 ADR | 无 | 1h |
-| [ ] | T4.6 | CI 模板：GitHub Actions 为主 | T4.3、T4.4 | 3h |
+| [x] | T4.6 | CI 模板：GitHub Actions 为主 | T4.3、T4.4 | 3h |
 | [ ] | T4.7 | 安装脚本与发布工作流 | T1.1 | 3h |
 | [ ] | T4.8 | 文档站骨架与导航 | T4.5 | 2-3h |
 | [ ] | T4.9 | 快速开始与安装文档 | T4.7、T4.8 | 2h |
@@ -711,6 +711,8 @@ images:
 **验收**：workflow 通过 `actionlint`；示例仓库能跑通；提交 lock 使用 `[skip ci]` 或路径过滤避免循环；secrets 不落盘；权限最小化。
 
 **依赖**：T4.3、T4.4 · **预估**：3h
+
+> **笔记**（2026-11-20，约 2h）：完成。`.github/workflows/publish.yaml` 实现 ADR 0001 的触发契约（分支推送、`v*` tag、`workflow_dispatch`）：`fetch-depth: 0` 的 checkout（渲染器要的 Git 事实）、固定版本的安装步骤（T4.7 的脚本，`POKERFACE_VERSION` 环境变量）、`pokerface build --write-lock`（推送由 registry 节驱动——没有会忘掉的 `--push` 旗标，这是对任务原文的有意偏差，已记录在 build-plan.md），以及只在 lock 变化时才提交回推的步骤，提交信息 `pokerface: update pokerface.lock.yaml [skip ci]`。**防循环双保险**：push 的 `paths-ignore: pokerface.lock.yaml` 加上提交信息里的 `[skip ci]`——任一都够用，两个都带上是因为模板被人改坏一份时不该变成无限构建循环。**权限最小化**：只给 `contents: write`——registry 用自己的 `POKERFACE_REGISTRY_TOKEN` secret 认证，从不用 GitHub 的；token 以步骤级环境变量进 CLI，绝不落盘（lock 的 schema 没有凭据字段）。**本仓库内的安全**：工作流在本仓库空转——步骤级 `hashFiles('pokerface.yaml') != ''` 守卫——actionlint v1.7.7 抓到 `hashFiles` 在 JOB 级不合法（报错正是 "calling function hashFiles is not allowed here"），这就是守卫放在步骤上的原因；`actionlint .github/workflows/publish.yaml` 通过（二进制取到 /tmp，不做全局安装）。GitLab（`.gitlab-ci.yml` 示例，dind、branch/tag/web 三种 rules、掩码+保护变量）与 Gitea（同形工作流；其防循环靠 paths-ignore，因为 `[skip ci]` 的支持取决于实例版本）在 `docs/ci/gitlab-ci.md` 与 `docs/ci/gitea-actions.md`；`docs/ci/github-actions.md` 是逐步说明。**主机上能验的都验了**：工作流的 commit-back 步骤在仿真里**逐字**跑过（本地仓库 + bare 远端 + 真实 registry）：首次运行以准确的信息提交并推送 lock，空暂存路径干净地空转，重复运行行为一致，`git log` 里 lock 提交都带 `[skip ci]`；"示例仓库跑通"仍是需要真实 GitHub 的检查（留给 T4.17 的回归）。值得记住的 YAML 坑：`tags: [latest, sha-{{ commit.short }}]` 解析失败——`{{` 会在流序列里打开流映射；模板条目要加引号。规范索引已链接 docs/ci/。
 
 #### T4.7 安装脚本与发布工作流
 

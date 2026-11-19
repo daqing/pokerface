@@ -1,0 +1,62 @@
+# The pokerface publish workflow (T4.6, ADR 0001) — copy this file into an
+# application repository that carries a pokerface.yaml.
+#
+# Triggers are exactly ADR 0001's three: a branch push, a version tag push
+# (v*), and a manual dispatch. The lock write-back cannot re-trigger the
+# build: push paths ignore pokerface.lock.yaml, and the lock commit's
+# message carries [skip ci] as the second guard (belt and suspenders —
+# other CI systems honor one or the other).
+#
+# In THIS repository the workflow no-ops: the job-level hashFiles guard
+# skips everything when there is no pokerface.yaml at the root.
+
+name: publish
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+    paths-ignore:
+      - "pokerface.lock.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: write # the lock write-back is the only write this job needs
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The full history carries the tag/branch facts the renderer needs
+          # ({{ version }}, {{ git.tag }}, {{ commit.short }}).
+          fetch-depth: 0
+
+      - name: Install pokerface (pinned)
+        if: hashFiles('pokerface.yaml') != ''
+        env:
+          POKERFACE_VERSION: "v0.1.0"
+        run: curl -fsSL "https://raw.githubusercontent.com/daqing/pokerface/main/install.sh" | bash
+
+      - name: Build, push, and write the lock
+        if: hashFiles('pokerface.yaml') != ''
+        env:
+          # The token lives in the environment for this step only — it is
+          # never written to disk, never echoed, and never lands in the
+          # lock (the lock's schema has no credential field).
+          POKERFACE_REGISTRY_TOKEN: ${{ secrets.POKERFACE_REGISTRY_TOKEN }}
+        run: pokerface build --write-lock
+
+      - name: Commit the lock back
+        if: hashFiles('pokerface.yaml') != ''
+        run: |
+          git config user.name "pokerface-ci"
+          git config user.email "pokerface-ci@users.noreply.github.com"
+          git add pokerface.lock.yaml
+          if git diff --cached --quiet; then
+            echo "the lock did not change"
+          else
+            git commit -m "pokerface: update pokerface.lock.yaml [skip ci]"
+            git push
+          fi

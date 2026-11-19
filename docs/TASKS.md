@@ -627,7 +627,7 @@ Exit criteria:
 | [x] | T4.3 | Registry push: blobs + manifest | T1.10, T2.12, T4.2 | 3h |
 | [x] | T4.4 | Generate and write back the lock file | T4.3 | 2h |
 | [x] | T4.5 | Build trigger and versioning strategy ADR | none | 1h |
-| [ ] | T4.6 | CI template: GitHub Actions first | T4.3, T4.4 | 3h |
+| [x] | T4.6 | CI template: GitHub Actions first | T4.3, T4.4 | 3h |
 | [ ] | T4.7 | Install script and release workflow | T1.1 | 3h |
 | [ ] | T4.8 | Docs site skeleton and navigation | T4.5 | 2-3h |
 | [ ] | T4.9 | Quick start and installation guide | T4.7, T4.8 | 2h |
@@ -711,6 +711,8 @@ Exit criteria:
 **Acceptance**: The workflow passes `actionlint`; the example repository runs it successfully; the lock commit uses `[skip ci]` or path filters to avoid a loop; secrets are never written to disk; permissions are minimized.
 
 **Depends on**: T4.3, T4.4 · **Estimate**: 3h
+
+> **Notes** (2026-11-20, ~2h): Done. `.github/workflows/publish.yaml` implements ADR 0001's trigger contract (branch pushes, `v*` tags, `workflow_dispatch`): checkout with `fetch-depth: 0` (the renderer's Git facts), a pinned install step (T4.7's script, `POKERFACE_VERSION` env), `pokerface build --write-lock` (push is driven by the registry section — there is no `--push` flag to forget, a deliberate deviation from this task's original text documented in build-plan.md), and a commit-back step that pushes the lock only when it changed, with `pokerface: update pokerface.lock.yaml [skip ci]`. **Loop guards, belt and suspenders**: push `paths-ignore: pokerface.lock.yaml` AND the `[skip ci]` message — either suffices, both ship because a misconfigured fork should not become an infinite build loop. **Permissions minimized**: `contents: write` only — the registry authenticates with its own `POKERFACE_REGISTRY_TOKEN` secret, never GitHub's; the token reaches the CLI as a step-scoped env var and never lands on disk (the lock schema has no credential field). **In-repo safety**: the workflow no-ops in THIS repository via a step-level `hashFiles('pokerface.yaml') != ''` guard — actionlint v1.7.7 caught that `hashFiles` is invalid at the JOB level (the exact error "calling function hashFiles is not allowed here"), which is why the guard sits on the steps; `actionlint .github/workflows/publish.yaml` passes (binary fetched to /tmp, no global install). GitLab (`.gitlab-ci.yml` example with dind, rules for branch/tag/web, masked+protected variables) and Gitea (same workflow shape; the loop guard there is paths-ignore because `[skip ci]` support is version-dependent) live in `docs/ci/gitlab-ci.md` and `docs/ci/gitea-actions.md`; `docs/ci/github-actions.md` is the walkthrough. **Verified as far as the host can**: the workflow's commit-back step was run VERBATIM in a simulation (local repo + bare remote + real registry): first run commits the lock with the exact message and pushes, the empty-staging path no-ops cleanly, repeat runs behave, and `git log` shows `[skip ci]` on the lock commits; "the example repository runs it successfully" stays a live-GitHub check (recorded for T4.17's regression). The YAML gotcha worth remembering: `tags: [latest, sha-{{ commit.short }}]` fails to parse — `{{` opens a flow mapping inside a flow sequence; quote the template entries. Spec index links docs/ci/.
 
 #### T4.7 Install Script and Release Workflow
 
