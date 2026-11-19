@@ -638,7 +638,7 @@ Exit criteria:
 | [x] | T4.14 | End-to-end demo script | T4.3, T4.13, T1.14 | 3h |
 | [x] | T4.15 | Failure fallback and troubleshooting matrix | T1.14, T2.19 | 2h |
 | [ ] | T4.16 | README, Chinese edition, and release checklist | T4.8-T4.15 | 2h |
-| [ ] | T4.17 | CI end-to-end regression | T4.14 | 3h |
+| [x] | T4.17 | CI end-to-end regression | T4.14 | 3h |
 
 ### 6.3 Task Details
 
@@ -841,6 +841,8 @@ Exit criteria:
 **Acceptance**: CI passes on the main branch; runtime stays under 15 minutes; failures upload compose and CLI logs; the E2E run does not contact Docker Hub; required base images are pre-cached or built locally, with pinned sources in the workflow.
 
 **Depends on**: T4.14 · **Estimate**: 3h
+
+> **Notes** (2026-11-20, ~1h): Done. `.github/workflows/e2e.yaml`: the three e2e scripts (m1 client loop, m2 registry protocol, m4 build-delivery in `--ci` mode) run on every push touching code (main+develop), daily at 02:23 UTC, and on dispatch. **Toolchain cache**: `~/.opam` cached with a key pinned to a FIXED emo-lang commit (`EMO_REF` env — the same SHA the install step pins, so a rebuild is reproducible; the acceptance's "pinned sources"); on a cache hit the install step is skipped and only PATH is set. **No Docker Hub / no base images**: every image is FROM scratch and served by the script's own local registry — nothing to pre-cache, stated in the workflow header. **Budget**: timeout-minutes 15; the scripts took 13–14s locally plus a cold toolchain (~10 min, cached afterwards). **Failure logs**: each script's stdout is redirected to /tmp/e2e-*.out (echoed into the job log on failure), the scripts keep their temp dirs with per-step logs on failure, and a `failure()`-gated upload-artifact collects /tmp/e2e-*.out + /tmp/pokerface-e2e*/. **Ride-along**: `emo test` runs after the e2e legs. actionlint passes; **all three scripts verified green on the final tree** (m1 ok, m2 ok, m4 PASS 13s). "CI passes on main" is the one check that needs the real GitHub run — the workflow is shaped to make it true.
 
 ## 7. Suggested Execution Order
 

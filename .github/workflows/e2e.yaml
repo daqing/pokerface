@@ -1,0 +1,83 @@
+# The CI end-to-end regression (T4.17): the three e2e scripts run on every
+# push that touches code and daily on a schedule, so a regression in the
+# registry, the CLI, or the build scripts cannot land quietly.
+#
+# Docker Hub is never contacted: every image is built FROM scratch and
+# served by the local registry the scripts start — there are no base images
+# to pre-cache, and the Emo toolchain (the heavy step) is cached and pinned
+# to a fixed upstream commit, so the whole run stays inside the 15-minute
+# budget.
+
+name: e2e
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "src/**"
+      - "registry/**"
+      - "scripts/**"
+      - "examples/**"
+      - "test/**"
+      - "main.emo"
+      - "package.emo"
+      - "package.lock"
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # The Emo toolchain is pinned: the cache key and the install pin use
+      # the same commit, so a rebuild is reproducible.
+      EMO_REF: 88281e111aecbc919b041e911fa0d2fda1fe5296
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: emo-toolchain-${{ env.EMO_REF }}
+
+      - name: Install the Emo toolchain (cached)
+        run: |
+          if [ ! -x "$HOME/.opam/default/bin/emo" ]; then
+            opam init --auto-setup --disable-sandboxing -y
+            opam pin add emo.dev "git+https://github.com/emo-lang/emo.git#${EMO_REF}" --yes
+            opam install emo.dev --yes
+          fi
+          echo "$HOME/.opam/default/bin" >> "$GITHUB_PATH"
+          emo version
+
+      - name: Install skopeo (the runtime import leg)
+        run: sudo apt-get update && sudo apt-get install -y skopeo
+
+      - name: M1 client loop
+        run: ./scripts/e2e-m1.sh > /tmp/e2e-m1.out 2>&1 || { cat /tmp/e2e-m1.out; exit 1; }
+      - name: M2 registry protocol
+        run: ./scripts/e2e-m2.sh > /tmp/e2e-m2.out 2>&1 || { cat /tmp/e2e-m2.out; exit 1; }
+      - name: M4 build-delivery path
+        run: ./scripts/e2e.sh --ci > /tmp/e2e-m4.out 2>&1 || { cat /tmp/e2e-m4.out; exit 1; }
+
+      - name: The unit suite rides along
+        run: emo test
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-logs
+          path: |
+            /tmp/e2e-m1.out
+            /tmp/e2e-m2.out
+            /tmp/e2e-m4.out
+            /tmp/pokerface-e2e*/
+            /tmp/pokerface-e2e-m2.*/
+            /tmp/pokerface-e2e-m1.*/
+          if-no-files-found: ignore

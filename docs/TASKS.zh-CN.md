@@ -638,7 +638,7 @@ images:
 | [x] | T4.14 | 端到端演示脚本 | T4.3、T4.13、T1.14 | 3h |
 | [x] | T4.15 | 故障回退与排障矩阵 | T1.14、T2.19 | 2h |
 | [ ] | T4.16 | README、中文版与发布清单 | T4.8-T4.15 | 2h |
-| [ ] | T4.17 | CI 端到端回归 | T4.14 | 3h |
+| [x] | T4.17 | CI 端到端回归 | T4.14 | 3h |
 
 ### 6.3 任务详情
 
@@ -841,6 +841,8 @@ images:
 **验收**：CI 在主干通过；耗时控制在 15 分钟内；失败时能下载 compose 日志与 CLI 日志；E2E 运行阶段不访问 Docker Hub；构建所需基础镜像提前缓存或使用本地镜像，并在 workflow 中固定来源。
 
 **依赖**：T4.14 · **预估**：3h
+
+> **笔记**（2026-11-20，约 1h）：完成。`.github/workflows/e2e.yaml`：三个 e2e 脚本（m1 客户端链路、m2 registry 协议、m4 构建交付的 `--ci` 模式）在触碰代码的推送（main+develop）、每日 02:23 UTC 与手动触发时运行。**工具链缓存**：`~/.opam` 以固定 emo-lang commit 为键（`EMO_REF` 环境变量——安装步骤钉同一个 SHA，重建可复现；即验收要求的"源钉死"）；命中缓存则跳过安装只设 PATH。**无 Docker Hub、无基础镜像**：所有镜像 FROM scratch 并由脚本自起的本地 registry 供源——没有需要预缓存的镜像，工作流头注明。**预算**：timeout-minutes 15；本地脚本 13–14 秒，冷工具链约 10 分钟（之后有缓存）。**失败日志**：每个脚本的 stdout 重定向到 /tmp/e2e-*.out（失败时回显进任务日志），脚本失败时保留带分步日志的临时目录，`failure()` 门控的 upload-artifact 收集 /tmp/e2e-*.out 与 /tmp/pokerface-e2e*/。**顺带**：e2e 之后跑 `emo test`。actionlint 通过；**三个脚本在最终树上全部验证绿色**（m1 ok、m2 ok、m4 PASS 13s）。"main 分支 CI 通过"是需要真实 GitHub 运行的一项——工作流已按此塑形。
 
 ## 7. 建议执行顺序
 
