@@ -40,6 +40,8 @@ jobs:
           if [ -n "$drift" ]; then
             echo "::warning file=docs/reference/cli.md::routed commands missing from the CLI reference: $drift"
           fi
+      - name: Validate the examples against the JSON Schemas
+        run: python3 docs/schema/validate.py
       - name: Build the site (fails on dead links)
         run: python3 docs-site/build.py
       - uses: actions/upload-pages-artifact@v3

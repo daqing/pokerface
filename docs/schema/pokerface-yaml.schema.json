@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://daqing.github.io/pokerface/schema/pokerface-yaml.schema.json",
+  "title": "pokerface.yaml v0.1",
+  "description": "The build input committed with the application (docs/spec/pokerface-yaml.md). The schema mirrors the shape the parser enforces; the implementation adds the cross-field rules the schema language cannot express (duplicate tag rendering, empty renders, the bare-`.`-as-float rejection).",
+  "type": "object",
+  "required": ["version", "image", "build"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "image": {
+      "type": "string",
+      "description": "<host>[:<port>]/<owner>/<repo>, lowercase, no scheme, no tag, no digest.",
+      "pattern": "^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(/[a-z0-9][a-z0-9._-]*)+$"
+    },
+    "build": { "$ref": "#/$defs/build" },
+    "tags": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/tagRule" }
+    },
+    "registry": {
+      "type": "object",
+      "required": ["url"],
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string",
+          "pattern": "^https?://",
+          "description": "The registry base URL; http:// is for local development registries only."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "build": {
+      "type": "object",
+      "required": ["context"],
+      "additionalProperties": false,
+      "properties": {
+        "context": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The build context directory, relative to the repository root. Quote a bare `.` — YAML's core schema reads `.` as a float."
+        },
+        "dockerfile": {
+          "type": "string",
+          "minLength": 1,
+          "default": "Dockerfile",
+          "description": "Relative to the build context."
+        },
+        "target": {
+          "type": "string",
+          "description": "The Dockerfile stage; empty or absent means the final stage."
+        },
+        "platforms": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "default": ["linux/amd64"],
+          "items": {
+            "type": "string",
+            "pattern": "^(linux|windows|darwin|freebsd)/(amd64|arm64|arm|386|riscv64)$"
+          }
+        },
+        "args": {
+          "type": "object",
+          "description": "Build args passed to the builder. Values must be strings — quote numbers.",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "tagRule": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "A literal tag or a template of literal segments and {{ placeholder }} holes.",
+      "pattern": "^([a-z0-9._-]+|\\{\\{[ ]*(commit\\.short|git\\.tag|branch|version)[ ]*\\}\\})+$"
+    }
+  }
+}

@@ -1,10 +1,11 @@
 # `pokerface.yaml` v0.1 Specification
 
-> Status: v0.1, implemented by `src/config.emo` (task T1.4). `pokerface.yaml`
-> lives at the root of the application repository and describes how the
-> project's image is built and pushed (decision D2). The CI-generated
-> companion file is `pokerface.lock.yaml` (T1.5,
-> `docs/spec/pokerface-lock.md`).
+> Status: v0.1, implemented by `src/config.emo` (task T1.4) and formalized
+> with a JSON Schema in T4.11 (`docs/schema/pokerface-yaml.schema.json`,
+> validated by `docs/schema/validate.py`). `pokerface.yaml` lives at the
+> root of the application repository and describes how the project's image
+> is built and pushed (decision D2). The CI-generated companion file is
+> `pokerface.lock.yaml` (T1.5, `docs/spec/pokerface-lock.md`).
 
 ## Example
 
@@ -80,6 +81,46 @@ Validation rejects, with the tag's position (`tags[1]`) in the error:
 Two tag rules that are identical strings are rejected as duplicates.
 Two distinct *templates* that render to the same tag at build time collide
 there — [build-plan.md](build-plan.md) has the check.
+
+## Version compatibility
+
+While `version` is `1`, the parser accepts **exactly** version `1` — any
+other integer (or a string, or a float) is rejected as an unknown version,
+and unknown fields at any level are rejected with their path. A future file
+version (`2`) must ship a parser that still reads version `1` files
+(back-compat is a requirement recorded here, not an accident); strictness
+may relax only in a version that changes the `version` constant, never as a
+quiet patch. The JSON Schema in `docs/schema/pokerface-yaml.schema.json`
+pins this shape: `"version": { "const": 1 }`,
+`"additionalProperties": false` at every level.
+
+The schema mirrors the shape; the implementation adds the cross-field rules
+the schema language cannot express:
+
+- duplicate tags, and two templates that render to the same tag (T4.1);
+- a rendered tag that is empty or outside the charset;
+- a bare `context: .` (YAML reads it as a float — the error carries the
+  quote hint);
+- `args` values that are not strings.
+
+`docs/schema/validate.py` runs the example against the schema in the docs
+workflow, so the example and the schema cannot drift apart.
+
+## OCI mapping
+
+| `pokerface.yaml` field | Lands as |
+| --- | --- |
+| `image` | The registry repository path (`/v2/<owner>/<repo>/…` on the image's host) |
+| `tags` (rendered) | The tag PUTs — one descriptor per tag in the layout's index, the tag entries in the registry |
+| `build.platforms` | The `platform` objects on the index's descriptors (`{"os": "linux", "architecture": "amd64"}`) |
+| `build.args` | The builder's `--build-arg` flags — **never** image metadata |
+| `build.target` | The builder's `--target` flag — **never** image metadata |
+
+The OCI **labels** on the image config are not config fields; the build
+writes them from the Git facts (T4.2): `org.opencontainers.image.revision`
+(the commit), `source` (the origin remote), `version` (the newest tag), and
+`created` (UTC RFC 3339). The lock (T4.4) records the result:
+`docs/spec/pokerface-lock.md`.
 
 ## Error format
 

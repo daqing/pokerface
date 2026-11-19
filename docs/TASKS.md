@@ -632,7 +632,7 @@ Exit criteria:
 | [x] | T4.8 | Docs site skeleton and navigation | T4.5 | 2-3h |
 | [x] | T4.9 | Quick start and installation guide | T4.7, T4.8 | 2h |
 | [x] | T4.10 | CLI and configuration reference | T1.1, T1.8 | 2h |
-| [ ] | T4.11 | YAML / lock / metadata specification | T1.4, T1.5 | 3h |
+| [x] | T4.11 | YAML / lock / metadata specification | T1.4, T1.5 | 3h |
 | [ ] | T4.12 | Registry operations guide | T2.17 | 3h |
 | [ ] | T4.13 | Example application | T4.2, T4.3 | 3h |
 | [ ] | T4.14 | End-to-end demo script | T4.3, T4.13, T1.14 | 3h |
@@ -771,6 +771,8 @@ Exit criteria:
 **Acceptance**: All examples validate against the schema; the spec covers unknown fields and version upgrades; validation matches the implementation; review finds no ambiguity.
 
 **Depends on**: T1.4, T1.5 · **Estimate**: 3h
+
+> **Notes** (2026-11-20, ~2h): Done. The two specs were already written with their field tables through T1.4/T1.5/T4.1/T4.4; T4.11 formalized them. **JSON Schemas** (the recommended deliverable): `docs/schema/pokerface-yaml.schema.json` and `pokerface-lock.schema.json` — draft 2020-12, `version` as `const 1`, `additionalProperties: false` at every level, regexes for the image/source/commit/digest/tag/platform shapes, and each schema's description stating the cross-field rules the schema language CANNOT express (duplicate tags and render collisions for yaml; unique image names and generated_at's non-participation for lock — the ambiguity review's main finding was making this split explicit). `docs/schema/validate.py` validates `examples/pokerface.yaml` and `examples/pokerface.lock.yaml` against them (draft-2020-12 via jsonschema 4.25, pyyaml 6.0.3) — **2 examples ok**, wired into the docs workflow so example↔schema drift fails the build. **Version compatibility**: both specs now state the exactness rule (version 1 only), the upgrade policy (a future version MUST keep reading version 1; strictness relaxes only with a version bump, never a quiet patch), and the schema-implementation split. **OCI mappings**: tables mapping every config/lock field to its OCI landing spot — image → repository path, rendered tags → tag PUTs/descriptors, platforms → index platform objects, args/target → builder flags NEVER metadata; the labels table (revision/source/version/created) points at T4.2; the lock's digest/manifest_digest/platforms map to the resolve API's answer. Builder field = build metadata only. The review pass confirmed the field tables match the implementation (defaults: dockerfile Dockerfile, platforms [linux/amd64], tags [latest]; charset rules; unknown-field paths) — no ambiguity found beyond the schema-limit note. Site rebuilt (43 pages), emo test 526/526 unchanged (docs only).
 
 #### T4.12 Registry Operations Guide
 

@@ -632,7 +632,7 @@ images:
 | [x] | T4.8 | 文档站骨架与导航 | T4.5 | 2-3h |
 | [x] | T4.9 | 快速开始与安装文档 | T4.7、T4.8 | 2h |
 | [x] | T4.10 | CLI 与配置参考 | T1.1、T1.8 | 2h |
-| [ ] | T4.11 | YAML / lock / 元数据规范 | T1.4、T1.5 | 3h |
+| [x] | T4.11 | YAML / lock / 元数据规范 | T1.4、T1.5 | 3h |
 | [ ] | T4.12 | Registry 运维指南 | T2.17 | 3h |
 | [ ] | T4.13 | 示例应用 | T4.2、T4.3 | 3h |
 | [ ] | T4.14 | 端到端演示脚本 | T4.3、T4.13、T1.14 | 3h |
@@ -771,6 +771,8 @@ images:
 **验收**：所有示例通过 Schema 校验；规范覆盖未知字段 / 版本升级策略；与实现中的校验一致；review 无歧义。
 
 **依赖**：T1.4、T1.5 · **预估**：3h
+
+> **笔记**（2026-11-20，约 2h）：完成。两份规范在 T1.4/T1.5/T4.1/T4.4 时已带完整字段表；T4.11 做了形式化。**JSON Schema**（推荐交付物）：`docs/schema/pokerface-yaml.schema.json` 与 `pokerface-lock.schema.json`——draft 2020-12，`version` 用 `const 1`，每层 `additionalProperties: false`，image/source/commit/digest/tag/platform 形状用正则钉住，每个 schema 的 description 写明 schema 语言**无法表达**的跨字段规则（yaml 的重复 tag 与渲染碰撞；lock 的镜像名唯一与 generated_at 不参与校验——评审的主要产出就是把这条边界写明）。`docs/schema/validate.py` 把 `examples/pokerface.yaml` 与 `examples/pokerface.lock.yaml` 对着 schema 校验（draft-2020-12，jsonschema 4.25、pyyaml 6.0.3）——**2 个示例全部通过**，并接入 docs 工作流，示例与 schema 的漂移会让构建失败。**版本兼容**：两份规范写明严格相等规则（只认 version 1）、升级策略（未来版本必须继续读 version 1；放宽只随版本号变更，绝不悄悄打补丁）、以及 schema 与实现的分工。**OCI 映射**：表格把每个配置/lock 字段映射到 OCI 落点——image → 仓库路径、渲染后的 tags → tag PUT/描述符、platforms → index 的 platform 对象、args/target → 构建器旗标**绝不是**镜像元数据；labels 表（revision/source/version/created）指向 T4.2；lock 的 digest/manifest_digest/platforms 对应 resolve API 的回答。builder 字段只是构建元数据，不是 OCI 字段。评审确认字段表与实现一致（默认值：dockerfile Dockerfile、platforms [linux/amd64]、tags [latest]；字符集规则；未知字段路径）——除 schema 限制的说明外未发现歧义。站点重建（43 页），emo test 526/526 不变（纯文档）。
 
 #### T4.12 Registry 运维指南
 

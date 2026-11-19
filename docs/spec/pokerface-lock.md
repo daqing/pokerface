@@ -1,10 +1,11 @@
 # `pokerface.lock.yaml` v0.1 Specification
 
-> Status: v0.1, implemented by `src/lockfile.emo` (tasks T1.5 and T4.4). CI
-> writes this file back to the application repository after a successful
-> build and push (decision D2), so the pull side can resolve
-> `tag → commit → digest` from Git alone. The build-side input is
-> `pokerface.yaml` (`docs/spec/pokerface-yaml.md`).
+> Status: v0.1, implemented by `src/lockfile.emo` (tasks T1.5 and T4.4) and
+> formalized with a JSON Schema in T4.11
+> (`docs/schema/pokerface-lock.schema.json`). CI writes this file back to
+> the application repository after a successful build and push (decision
+> D2), so the pull side can resolve `tag → commit → digest` from Git alone.
+> The build-side input is `pokerface.yaml` (`docs/spec/pokerface-yaml.md`).
 
 ## Example
 
@@ -93,6 +94,34 @@ build and push:
   `pokerface: update pokerface.lock.yaml`); it never pushes and commits no
   other staged or modified file. `pokerface resolve` consumes the lock from
   that commit directly.
+
+## Version compatibility
+
+`version` must be exactly `1` — the same exactness rule as
+[pokerface-yaml.md](pokerface-yaml.md). A future version must ship a parser
+that still reads version `1` files; strictness relaxes only with the
+version bump. The JSON Schema `docs/schema/pokerface-lock.schema.json` pins
+the shape (`"version": { "const": 1 }`, every level
+`additionalProperties: false`), and the implementation adds what the schema
+cannot say: no two image entries share a name, no duplicate tags inside an
+entry, `generated_at` never participates in digest verification, and the
+byte-stable generation rules above.
+
+## OCI mapping
+
+| lock field | Lands as |
+| --- | --- |
+| `commit` | The build's `org.opencontainers.image.revision` label — the same SHA the T4.1 renderer used |
+| `source` | The repository the consumers resolve; the build's `org.opencontainers.image.source` label comes from the same origin remote |
+| `image` + `tags` | The registry's tag entries — every tag PUT verified against the pushed bytes' digest |
+| `digest` | The tag's top-level descriptor: the **manifest** digest for a single-platform build, the **index** digest for multi-platform |
+| `manifest_digest` | The selected platform's manifest digest when a consumer pins one (`pokerface resolve` serves it as the same field) |
+| `platforms` | The index's `platform` objects — the same answer `/api/v1/resolve` gives for the tag |
+| `builder` | Which adapter produced the image (buildkit = the buildx path, podman = the podman path) — build metadata only, never an OCI field |
+
+The resolution chain this file exists for: `ref → commit (Git) → this file
+at that commit → image → digest` (`docs/spec/pull.md`), with the registry's
+`/api/v1/resolve` as the read-only fallback (`docs/spec/registry-resolve.md`).
 
 ## Digest verification
 

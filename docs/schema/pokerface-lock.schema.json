@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://daqing.github.io/pokerface/schema/pokerface-lock.schema.json",
+  "title": "pokerface.lock.yaml v0.1",
+  "description": "The metadata written back after a successful build and push (docs/spec/pokerface-lock.md). The implementation adds the cross-entry rules the schema cannot express: no two images may share a name, no duplicate tags inside an entry, and generated_at never participates in digest verification.",
+  "type": "object",
+  "required": ["version", "commit", "source", "images"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "commit": {
+      "type": "string",
+      "description": "The full 40-character lowercase hex commit SHA the images were built from.",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "source": {
+      "type": "string",
+      "description": "The repository the images were built from, <host>/<owner>/<repo> after normalization; a ref is rejected.",
+      "pattern": "^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$"
+    },
+    "generated_at": {
+      "type": "string",
+      "description": "RFC 3339 timestamp, informational only. The generator leaves it empty for byte-stable rebuilds."
+    },
+    "images": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/image" }
+    }
+  },
+  "$defs": {
+    "image": {
+      "type": "object",
+      "required": ["image", "tags", "digest"],
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9.-]*(?::[0-9]+)?(/[a-z0-9][a-z0-9._-]*)+$"
+        },
+        "tags": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$",
+            "description": "Already-rendered OCI tags — placeholders belong in pokerface.yaml."
+          }
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "The index digest for a multi-platform build, the manifest digest otherwise."
+        },
+        "manifest_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "The selected platform's manifest digest; absent means same as digest."
+        },
+        "platforms": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "default": ["linux/amd64"],
+          "items": {
+            "type": "string",
+            "pattern": "^(linux|windows|darwin|freebsd)/(amd64|arm64|arm|386|riscv64)$"
+          }
+        },
+        "builder": {
+          "type": "string",
+          "enum": ["buildkit", "podman"]
+        }
+      }
+    }
+  }
+}
