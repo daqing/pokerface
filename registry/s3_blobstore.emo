@@ -291,7 +291,14 @@ class S3Store {
   }
 
   // A real direct URL, so the caller answers 307 instead of proxying bytes.
+  // `presign_ttl: 0` disables the redirect: the empty answer sends the
+  // caller down the store.get path, which streams the bytes through the
+  // registry — the shape a deployment behind a single public entrypoint
+  // needs (the presigned host is the internal one).
   def presign_get(digest String, ttl_seconds Int64) String {
+    if self.settings.presign_ttl <= 0 {
+      return ""
+    }
     case object_key_with(self.settings.prefix, digest) {
       (R.error, why) then { return "" }
       (R.ok, key) then {

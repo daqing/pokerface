@@ -708,6 +708,25 @@ def apply_env(config RegistryConfig, env src.settings.EnvSource) (R, RegistryCon
     }
     (R.error, _) then { }
   }
+  // The challenge's realm is what clients follow to reach the token
+  // endpoint; behind a TLS proxy the default (built from the listen
+  // address) names the internal socket, so the public URL arrives here.
+  case env.getenv("POKERFACE_REGISTRY_AUTH_REALM") {
+    (R.ok, v) then {
+      if v != "" {
+        auth = RegistryAuth.new(auth.enabled, v, auth.service, auth.issuer, auth.token_ttl, auth.users, auth.signing_key)
+      }
+    }
+    (R.error, _) then { }
+  }
+  case env.getenv("POKERFACE_REGISTRY_AUTH_SERVICE") {
+    (R.ok, v) then {
+      if v != "" {
+        auth = RegistryAuth.new(auth.enabled, auth.realm, v, auth.issuer, auth.token_ttl, auth.users, auth.signing_key)
+      }
+    }
+    (R.error, _) then { }
+  }
   var observability = config.observability
   case env.getenv("POKERFACE_REGISTRY_ACCESS_LOG") {
     (R.ok, v) then {
@@ -1099,8 +1118,8 @@ def validate_s3(s3 S3Settings, path String) (R, Bool) {
   if s3.secret_key == "" {
     return (R.error, cfg_error(path, "store.s3.secret_key: must not be empty (set POKERFACE_REGISTRY_S3_SECRET_KEY)"))
   }
-  if s3.presign_ttl <= 0 || s3.presign_ttl > max_presign_ttl {
-    return (R.error, cfg_error(path, "store.s3.presign_ttl: must be between 1 and " + max_presign_ttl.to_string() + " seconds"))
+  if s3.presign_ttl < 0 || s3.presign_ttl > max_presign_ttl {
+    return (R.error, cfg_error(path, "store.s3.presign_ttl: must be between 0 and " + max_presign_ttl.to_string() + " seconds (0 disables presigning — blobs then stream through the registry, which is what a single-entrypoint deployment behind a proxy wants)"))
   }
   return (R.ok, true)
 }

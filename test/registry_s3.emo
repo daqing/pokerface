@@ -345,6 +345,22 @@ def test_presign_get_returns_a_signed_url() {
   expect_equal(1, transport.count())
 }
 
+// presign_ttl: 0 is the "stream through the registry" switch: no URL is
+// minted, so the blob route falls back to the store read behind the single
+// public entrypoint.
+def test_presign_get_is_disabled_by_a_zero_ttl() {
+  const settings = cfg.S3Settings.new(
+    "http://127.0.0.1:9000", "pokerface", "us-east-1", "AKIAEXAMPLE",
+    "secret-value", true, "registry", "", true, 0)
+  case s3.open_with(settings, FakeS3Transport.new([answer(200)])) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, store) then {
+      expect_equal("", store.presign_get(round_trip_digest(), 0))
+      expect_equal("", store.presign_get(round_trip_digest(), 60))
+    }
+  }
+}
+
 def test_virtual_host_style_addresses_the_bucket_subdomain() {
   const settings = cfg.S3Settings.new(
     "https://s3.example.com",

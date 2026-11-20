@@ -676,6 +676,22 @@ def test_auth_config_env_key_override() {
   }
 }
 
+// The challenge's realm behind a TLS proxy: the public token URL arrives
+// by environment, overriding the listen-derived default.
+def test_auth_config_env_realm_override() {
+  const base = auth_tmp_base()
+  const path = base + "envrealm.yaml"
+  write_file(path, "listen:\n  host: 127.0.0.1\n  port: 5001\ndata_dir: " + base + "data\nauth:\n  enabled: true\n  users:\n    - username: alice\n      password: wonderland\n")
+  const env = Map.new(("POKERFACE_REGISTRY_AUTH_SIGNING_KEY", "s"), ("POKERFACE_REGISTRY_AUTH_REALM", "https://registry.example.com/token"), ("POKERFACE_REGISTRY_AUTH_SERVICE", "public-registry"))
+  case load_config(path, env) {
+    (R.error, why) then { expect_fail(why) }
+    (R.ok, config) then {
+      expect_equal("https://registry.example.com/token", config.auth.realm)
+      expect_equal("public-registry", config.auth.service)
+    }
+  }
+}
+
 def test_auth_config_unknown_field_is_refused() {
   const base = auth_tmp_base()
   const path = base + "unknown.yaml"

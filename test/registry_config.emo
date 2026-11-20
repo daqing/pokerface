@@ -323,6 +323,17 @@ def test_s3_rejects_bad_endpoints_and_ttl() {
     (R.ok, _) then { expect_fail("expected a ttl error") }
     (R.error, why) then { expect_true(why.index_of("presign_ttl") >= 0) }
   }
+  write_config(path, "store:\n  backend: s3\n  s3:\n    endpoint: http://minio:9000\n    bucket: b\n    access_key: a\n    secret_key: s\n    presign_ttl: -1\n")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, _) then { expect_fail("expected a negative-ttl error") }
+    (R.error, why) then { expect_true(why.index_of("presign_ttl") >= 0) }
+  }
+  // 0 is the "stream through the registry" switch, not an error.
+  write_config(path, "store:\n  backend: s3\n  s3:\n    endpoint: http://minio:9000\n    bucket: b\n    access_key: a\n    secret_key: s\n    presign_ttl: 0\n")
+  case reg_config.load(env_empty(), path) {
+    (R.ok, config) then { expect_equal(0, config.store.s3.presign_ttl) }
+    (R.error, why) then { expect_fail(why) }
+  }
 }
 
 def test_s3_env_overrides() {

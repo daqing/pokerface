@@ -21,7 +21,7 @@
 | `prefix` | `""` | key prefix; surrounding slashes are trimmed |
 | `ca_file` | `""` | replaces the system trust store with this CA bundle |
 | `verify_tls` | `true` | `false` disables certificate verification (development only) |
-| `presign_ttl` | `900` | default validity for `presign_get`, seconds; 1–604800 |
+| `presign_ttl` | `900` | default validity for `presign_get`, seconds; 0–604800, `0` disables presigning (blobs stream through the registry) |
 
 The service summary prints the endpoint, bucket, prefix, and
 `access_key=<set>` — never the key itself or the secret.
@@ -82,7 +82,10 @@ A 404 on an object maps to the BlobStore's `blobstore: not found:` error; a
 `presign_get(digest, ttl)` returns a direct URL signed with `UNSIGNED-PAYLOAD`
 and `host` as the only signed header, so a route can answer 307 without
 proxying the bytes. A ttl of `0` (or less) uses `store.s3.presign_ttl`; values
-above AWS's 604800 s ceiling are clamped. The URL's validity window is
+above AWS's 604800 s ceiling are clamped. `store.s3.presign_ttl: 0` disables
+presigning outright — the empty answer routes blob GETs through the registry's
+own store read, which is what a single-entrypoint deployment (one public
+Caddy, MinIO on the internal network) needs. The URL's validity window is
 `[signed_at, signed_at + ttl)` and the policy carries the secret nowhere — the
 signature is the only credential material in it.
 

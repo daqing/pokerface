@@ -22,6 +22,19 @@ $ docker compose ps            # all three healthy
   `POKERFACE_REGISTRY_*` environment overrides from `.env`, and the auth
   account's password comes from `deploy/registry.password`
   (`password_file`, mounted read-only) — never baked into an image.
+  The compose environment also sets `POKERFACE_REGISTRY_AUTH_REALM` to the
+  public `https://<domain>/token` (clients follow the 401 challenge's realm;
+  the internal listen address is unreachable for them) and
+  `POKERFACE_REGISTRY_S3_PRESIGN_TTL=0`, which makes blob GETs stream
+  through the registry instead of redirecting to a presigned internal MinIO
+  URL — Caddy stays the single entrypoint.
+- `createbucket` — a one-shot service that creates the S3 bucket the
+  registry's startup check requires (`mc mb --ignore-existing`). Both MinIO
+  and mc come from `minio/minio:local` / `minio/mc:local`, built from the
+  pinned upstream sources: MinIO stopped publishing community images and
+  binary downloads in 2025 (`RELEASE.2025-04-22T22-12-26Z` for the server,
+  `RELEASE.2025-05-21T01-59-54Z` for mc here). Build them once per machine
+  — see the notes under "Verified" below.
 - `deploy/Dockerfile` — a two-stage build. Stage 1 compiles the registry
   with the Emo toolchain (the `EMO_BUILDER_IMAGE` build argument names the
   image carrying `emo`; the toolchain is young, so until a builder image is
@@ -75,21 +88,19 @@ loudly if MinIO's bucket vanished.
   verified on the host (SIGTERM → marker → `shutting down` / `stopped` →
   clean exit).
 - `docker compose config` validates the stack definition.
-- **The stack definition was exercised with every piece running locally**
-  (2026-11-20, section-9 verification): MinIO comes up healthy (built
-  from the pinned upstream source — MinIO stopped publishing community
-  images/binary downloads in 2025), and the registry accepts the mounted
-  config, the auth account, and the S3 settings — then **the Linux
-  registry binary dies on its first HTTP exchange**. That is an upstream
-  Emo bug in the Linux c target's HTTP stack, not the stack definition:
-  raw `net` primitives, sqlite, and the runtime core all pass on Linux
-  (`registry/db_selftest.emo`: 135 checks), while any live HTTP response
-  segfaults. Details and the bisection evidence:
-  `docs/notes/runtime-capabilities.md` ("The Linux runtime's HTTP
-  stack"). Until upstream fixes it, run the registry on macOS or wait for
-  the runtime fix; the stack itself needs no further changes.
-- The Caddy leg was not reached (it gates on the registry's healthcheck).
-- Building the image on a machine with the Emo toolchain for macOS only
-  produces a macOS binary — the container build needs a Linux toolchain
-  (the `EMO_BUILDER_IMAGE` path) or a compiler built for Linux, as the
-  verification did.
+- **The whole stack was exercised end to end** (2026-11-20, section-9
+  verification): `docker compose up -d` brings all three services up
+  healthy; `skopeo login` through Caddy succeeds against the public realm;
+  a skopeo push lands in MinIO; the tag list and blobs answer through
+  Caddy (blobs streamed by the registry, `presign_ttl: 0`); and a full
+  `docker compose down` + `up` leaves the tags and blobs intact (the named
+  volumes). Getting there required fixing two upstream Emo Linux runtime
+  bugs (uninitialized `pending` in the connection meta, missing
+  `<stddef.h>`) — recorded in `docs/notes/runtime-capabilities.md`; the
+  fixes live on the emo repo's `fix/stdlib-http` branch.
+- The registry image needs a **Linux** Emo compiler: this machine's
+  toolchain builds macOS binaries. The verification built one with the emo
+  repo's own release builder image (`devtools/release-builder.Dockerfile`,
+  `emo-release:ubuntu22.04-arm64`) and used it for both the registry and
+  the probe programs; `EMO_BUILDER_IMAGE` is the supported path once a
+  published builder image exists.

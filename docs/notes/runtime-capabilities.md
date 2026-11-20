@@ -153,8 +153,17 @@ T4.16 verification: the runtime uses `offsetof` without `<stddef.h>`
 registry needs `sqlite3.h` plus `libsqlite3` at link time. Neither is the
 crash.
 
-Consequence: **the compose stack cannot run until the Linux runtime's
-HTTP path is fixed upstream.** The stack definition itself is now correct
-(see `deploy/`): a required config file, a password file for the auth
-account, and an exec-form MinIO healthcheck — MinIO comes up healthy and
-the registry binary accepts the config, then dies on its first request.
+**Fixed** (2026-11-20, branch `fix/stdlib-http` in the emo repo, worktree
+`emo-fix-stdlib-http`): `emo_net_meta_register` left the new
+`emo_net_meta`'s `pending`/`pending_len` uninitialized after `malloc`;
+glibc's tcache supplies recycled bytes, so the first `read_line` on a
+connection read a garbage length, doubled its buffer until it overflowed,
+and aborted in `realloc`. macOS's allocator happened to return zeroed
+pages, hiding the bug. The fix zeroes the fields on registration (and
+drops a reused fd's previous pending bytes); a second commit adds
+`<stddef.h>` for the `offsetof` the strict `-std=c11` build needs. With
+both, a Linux/arm64 registry serves the full surface — skopeo push, tags,
+manifest GET, blob GET, metrics — and the compose stack comes up healthy.
+The crash was pinned with an injected `backtrace` handler (no gdb on this
+machine) after valgrind proved useless here: under valgrind's allocator
+layout the bug stayed dormant.

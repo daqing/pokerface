@@ -27,8 +27,16 @@ services:
       POKERFACE_REGISTRY_S3_ACCESS_KEY: "${MINIO_ROOT_USER:?set in .env}"
       POKERFACE_REGISTRY_S3_SECRET_KEY: "${MINIO_ROOT_PASSWORD:?set in .env}"
       POKERFACE_REGISTRY_S3_PATH_STYLE: "true"
+      # Blobs stream through the registry instead of a 307 to a presigned
+      # MinIO URL: the presigned host is the internal one, and Caddy is the
+      # stack's single entrypoint.
+      POKERFACE_REGISTRY_S3_PRESIGN_TTL: "0"
       POKERFACE_REGISTRY_AUTH_ENABLED: "${REGISTRY_AUTH_ENABLED:-true}"
       POKERFACE_REGISTRY_AUTH_SIGNING_KEY: "${REGISTRY_SIGNING_KEY:?set in .env}"
+      # Clients follow the challenge's realm to the token endpoint; behind
+      # Caddy the public URL is the only reachable one (the listen address
+      # would name the internal socket).
+      POKERFACE_REGISTRY_AUTH_REALM: "https://${REGISTRY_DOMAIN}/token"
     volumes:
       - registry-data:/data
       # The service requires a config file; this one carries no secrets —
@@ -37,8 +45,8 @@ services:
       # The push account's password (operator-created, gitignored).
       - ./registry.password:/etc/pokerface/password:ro
     depends_on:
-      minio:
-        condition: service_healthy
+      createbucket:
+        condition: service_completed_successfully
     expose:
       - "5000"
     # The healthcheck lives in the image (wget against /healthz); compose
@@ -64,6 +72,20 @@ services:
       timeout: 5s
       retries: 6
       start_period: 10s
+
+  # The registry refuses to start before its bucket exists (the startup
+  # check), so a one-shot client creates it. minio/mc's community image is
+  # no longer published, so mc comes from a locally built image of the
+  # pinned upstream source — the same pinning as the MinIO server image.
+  createbucket:
+    image: minio/mc:local
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MC_HOST_local: "http://${MINIO_ROOT_USER:?set in .env}:${MINIO_ROOT_PASSWORD:?set in .env}@minio:9000"
+    entrypoint: ["/usr/bin/mc", "mb", "--ignore-existing", "local/${MINIO_BUCKET:-pokerface}"]
 
   caddy:
     image: caddy:2
