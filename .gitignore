@@ -4,3 +4,5 @@ docs-site/site/
 examples/hello/pokerface.lock.yaml
 .env
 deploy/registry.password
+bin
+/main
