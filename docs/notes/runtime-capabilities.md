@@ -122,3 +122,39 @@ write path) — recommended upstream follow-up; until it lands, a plain
 200 GET of a blob larger than the socket buffer dies mid-body for
 every client (curl included), which is why the pull always resumes
 through windows.
+
+## The Linux runtime's HTTP stack (T4.16 checklist verification, 2026-11-20)
+
+**Any HTTP exchange through the `http`/`httpd` packages segfaults (or
+traps, SIGTRAP) on the Linux c target**; the same code runs fine on macOS.
+Found while verifying the compose stack (section 9, item 4) — the Linux
+registry binary listens and dies on the first request; a minimal Linux
+client program dies on the first real response. Evidence, narrowed by
+bisection:
+
+- `registry/db_selftest.emo` built for linux/arm64: **135 checks pass** —
+  the allocator, strings, sqlite, and the fiber scheduler's basic paths
+  are sound.
+- Raw `net` over the same connection works, each primitive verified
+  separately: `connect`, `write`, `read_line`, `read_exactly(64648)`,
+  `read_all`, `set_timeout`.
+- `http.request` against a *closed* port answers the clean
+  "connection refused"; against any **live** server (MinIO, Python
+  http.server, the Emo registry itself) the process dies with no error —
+  `EMO_TRACE` shows the fiber dispatched, `""request""` printed, then the
+  trap, with no scheduler round-trip.
+- Upstream `origin/main` carries no newer fix in `emo_c_runtime.c`
+  (`git log HEAD..origin/main -- src/emo_codegen/c/emo_c_runtime.c` is
+  empty at 88281e11).
+
+Building for Linux also needs two workarounds already applied in the
+T4.16 verification: the runtime uses `offsetof` without `<stddef.h>`
+(glibc + `-std=c11` rejects it; inject via a `cc` wrapper), and the
+registry needs `sqlite3.h` plus `libsqlite3` at link time. Neither is the
+crash.
+
+Consequence: **the compose stack cannot run until the Linux runtime's
+HTTP path is fixed upstream.** The stack definition itself is now correct
+(see `deploy/`): a required config file, a password file for the auth
+account, and an exec-form MinIO healthcheck — MinIO comes up healthy and
+the registry binary accepts the config, then dies on its first request.

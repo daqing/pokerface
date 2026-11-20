@@ -1,0 +1,24 @@
+# The registry's base configuration for the compose stack (T2.17). The
+# service requires a configuration file (a missing one is a startup error —
+# docs/spec/registry-config.md); everything environment-specific — the S3
+# endpoint and credentials, the auth signing key — is layered on top from
+# the compose environment (POKERFACE_REGISTRY_* overrides win over the
+# file). No secret belongs in this file.
+
+listen:
+  host: 0.0.0.0
+  port: 5000
+
+data_dir: /data
+
+store:
+  backend: s3
+
+auth:
+  enabled: true
+  # The account's password comes from a mounted file (deploy/registry.password,
+  # created by the operator, gitignored — never baked into an image or the
+  # compose file). The list is required whenever auth is enabled.
+  users:
+    - username: pokerface
+      password_file: /etc/pokerface/password

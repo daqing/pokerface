@@ -8,12 +8,20 @@ entrypoint.
 ```console
 $ cd deploy
 $ cp ../.env.example .env      # then edit: credentials, domain, signing key
+$ openssl rand -base64 24 | tr -d '\n' > registry.password   # the auth account
+$ chmod 600 registry.password
 $ docker compose up -d
 $ docker compose ps            # all three healthy
 ```
 
 ## What the pieces are
 
+- `deploy/registry.compose.yaml` — the base configuration the service
+  **requires** (a missing config file is a startup error). It carries no
+  secrets: the S3 endpoint, credentials, and auth key arrive as
+  `POKERFACE_REGISTRY_*` environment overrides from `.env`, and the auth
+  account's password comes from `deploy/registry.password`
+  (`password_file`, mounted read-only) — never baked into an image.
 - `deploy/Dockerfile` — a two-stage build. Stage 1 compiles the registry
   with the Emo toolchain (the `EMO_BUILDER_IMAGE` build argument names the
   image carrying `emo`; the toolchain is young, so until a builder image is
@@ -67,9 +75,21 @@ loudly if MinIO's bucket vanished.
   verified on the host (SIGTERM → marker → `shutting down` / `stopped` →
   clean exit).
 - `docker compose config` validates the stack definition.
-- The full `docker compose up` could not be run on the development machine:
-  the MinIO and Caddy images are unreachable there (Docker Hub and the
-  configured mirror both time out — the same limitation recorded in T2.6's
-  S3 notes). On a machine with registry access, `docker compose up -d` from
-  `deploy/` is the verification; the smoke script (T2.19) exercises the
-  stack end to end once it is up.
+- **The stack definition was exercised with every piece running locally**
+  (2026-11-20, section-9 verification): MinIO comes up healthy (built
+  from the pinned upstream source — MinIO stopped publishing community
+  images/binary downloads in 2025), and the registry accepts the mounted
+  config, the auth account, and the S3 settings — then **the Linux
+  registry binary dies on its first HTTP exchange**. That is an upstream
+  Emo bug in the Linux c target's HTTP stack, not the stack definition:
+  raw `net` primitives, sqlite, and the runtime core all pass on Linux
+  (`registry/db_selftest.emo`: 135 checks), while any live HTTP response
+  segfaults. Details and the bisection evidence:
+  `docs/notes/runtime-capabilities.md` ("The Linux runtime's HTTP
+  stack"). Until upstream fixes it, run the registry on macOS or wait for
+  the runtime fix; the stack itself needs no further changes.
+- The Caddy leg was not reached (it gates on the registry's healthcheck).
+- Building the image on a machine with the Emo toolchain for macOS only
+  produces a macOS binary — the container build needs a Linux toolchain
+  (the `EMO_BUILDER_IMAGE` path) or a compiler built for Linux, as the
+  verification did.
