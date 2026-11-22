@@ -7,9 +7,10 @@
 # young — see docs/registry/deployment.md).
 #
 # Stage 2 runs the binary. The c target links libsqlite3 (the registry's
-# metadata store), so the slim runtime installs it; everything else — the
-# HTTP server, the filesystem blob store, YAML/JSON, SHA-256 — is compiled
-# into the binary.
+# metadata store) and, with a toolchain whose reachability walk sees the
+# httpd TLS tier, OpenSSL; the slim runtime installs both. Everything else —
+# the HTTP server, the filesystem blob store, YAML/JSON, SHA-256 — is
+# compiled into the binary.
 
 ARG EMO_BUILDER_IMAGE=ghcr.io/emo-lang/emo-builder:0.1.0
 
@@ -27,7 +28,7 @@ RUN emo build -o /out/pokerface-registry registry/main.emo
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libsqlite3-0 wget ca-certificates \
+ && apt-get install -y --no-install-recommends libsqlite3-0 libssl3 wget ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --system --home /data --shell /usr/sbin/nologin pokerface \

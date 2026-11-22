@@ -4,9 +4,10 @@
 # from. Each platform builds natively on its runner — no cross-compilation,
 # no emulation.
 #
-# The Emo toolchain is the published binary release on Linux; the macOS
-# archive is built for a newer macOS than the runners provide (dyld cannot
-# find _dup3), so macOS builds the compiler from source with opam.
+# The Emo toolchain is built from source on every runner: the release needs
+# compiler fixes that are not in a published emo release (the TLS
+# reachability walk and the plain-send would-block retry), and the Linux
+# binary release predates them. EMO_REF pins the commit both platforms use.
 
 name: release
 
@@ -28,58 +29,77 @@ jobs:
           - { os: macos-latest, platform: darwin-arm64 }
     runs-on: ${{ matrix.os }}
     env:
-      # The published toolchain release the Linux binaries are built with; a
-      # tag rebuilds with the same compiler.
-      EMO_VERSION: v0.26.1120.1
-      # The compiler commit behind EMO_VERSION; macOS builds it from source.
-      EMO_REF: 2d94fcec9a07d72d048bff5c5264d3cd655c21c5
+      # The emo commit the binaries are built with. It must be reachable
+      # from github.com/emo-lang/emo: opam pins by full SHA, so a local-only
+      # commit fails the checkout.
+      EMO_REF: 63e2f00950e38cc386ec08fc468087c4b0fedcd2
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up OCaml (macOS builds the toolchain from source)
-        if: runner.os == 'macOS'
+      - name: Set up OCaml
         uses: ocaml/setup-ocaml@v3
         with:
           ocaml-compiler: 5.5.0
           opam-disable-sandboxing: true
 
-      - name: Install the Emo toolchain (opam, macOS)
-        if: runner.os == 'macOS'
+      - name: Install the Emo toolchain (opam)
         run: |
           opam pin add emo.dev "git+https://github.com/emo-lang/emo.git#${EMO_REF}" --yes
           opam install emo.dev --yes
           echo "$(opam var bin)" >> "$GITHUB_PATH"
           opam exec -- emo version
 
-      - name: Install the Emo toolchain (binary)
+      - name: Install libsqlite3 and OpenSSL (the registry and the TLS client link them)
         if: runner.os == 'Linux'
-        env:
-          EMO_PREFIX: ${{ runner.temp }}/emo
-        run: |
-          # The prefix is on PATH first, so the installer skips the shell-rc edit.
-          export PATH="$EMO_PREFIX/bin:$PATH"
-          curl -fsSL https://www.emo-lang.cn/cdn/install.sh | sh
-          echo "$EMO_PREFIX/bin" >> "$GITHUB_PATH"
-          "$EMO_PREFIX/bin/emo" version
-
-      - name: Install libsqlite3 (the registry links it)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
-      - name: Install libsqlite3 (the registry links it)
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
+      - name: Install libsqlite3 and OpenSSL
         if: runner.os == 'macOS'
         run: |
-          brew install sqlite
+          brew install sqlite openssl@3
           echo "PKG_CONFIG_PATH=$(brew --prefix sqlite)/lib/pkgconfig" >> "$GITHUB_ENV"
 
       - name: Build
         run: |
           mkdir -p bin
-          emo build -o ./bin/pokerface main.emo
-          emo build -o ./bin/pokerface-registry ./registry/main.emo
+          extra=()
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            extra=(--cclib="-L$(brew --prefix openssl@3)/lib")
+          fi
+          emo build "${extra[@]}" -o ./bin/pokerface main.emo
+          emo build "${extra[@]}" -o ./bin/pokerface-registry ./registry/main.emo
+
+      - name: Bundle OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          ssl_old="$(otool -L bin/pokerface | awk '/libssl.*\.dylib/ {print $1; exit}')"
+          crypto_old="$(otool -L bin/pokerface | awk '/libcrypto.*\.dylib/ {print $1; exit}')"
+          ssl_name="$(basename "$ssl_old")"
+          crypto_name="$(basename "$crypto_old")"
+          cp "$ssl_old" "$crypto_old" bin/
+          for f in bin/pokerface bin/pokerface-registry; do
+            install_name_tool -change "$ssl_old" "@executable_path/$ssl_name" "$f"
+            install_name_tool -change "$crypto_old" "@executable_path/$crypto_name" "$f"
+          done
+          install_name_tool -id "@executable_path/$ssl_name" "bin/$ssl_name"
+          install_name_tool -id "@executable_path/$crypto_name" "bin/$crypto_name"
+          # libssl's own libcrypto reference can be the Cellar path, not the
+          # opt symlink the executable records: rewrite what it actually says.
+          crypto_in_ssl="$(otool -L "bin/$ssl_name" | awk '/libcrypto.*\.dylib/ {print $1; exit}')"
+          install_name_tool -change "$crypto_in_ssl" "@executable_path/$crypto_name" "bin/$ssl_name"
+          # install_name_tool invalidates the code signature; arm64 refuses
+          # modified binaries until they are signed again (ad hoc is enough).
+          codesign --force --sign - bin/pokerface bin/pokerface-registry "bin/$ssl_name" "bin/$crypto_name"
 
       - name: Package
         run: |
-          tar -czf "pokerface-${{ matrix.platform }}.tar.gz" -C bin pokerface pokerface-registry
+          names=(pokerface pokerface-registry)
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            for lib in bin/libssl.*.dylib bin/libcrypto.*.dylib; do
+              names+=("$(basename "$lib")")
+            done
+          fi
+          tar -czf "pokerface-${{ matrix.platform }}.tar.gz" -C bin "${names[@]}"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "pokerface-${{ matrix.platform }}.tar.gz" > "pokerface-${{ matrix.platform }}.sha256"
           else

@@ -55,10 +55,14 @@ $ sha256sum -c <(grep linux-amd64 checksums.txt)        # Linux
 and the registry build natively on three runners (linux-amd64, linux-arm64,
 darwin-arm64 — no cross-compilation, no emulation), land as
 `pokerface-<platform>.tar.gz` with per-platform `.sha256` files and a
-combined `checksums.txt`, and publish as a GitHub Release. The Linux
-binaries are built with the published Emo toolchain (the binary release
-pinned by `EMO_VERSION`); the macOS archive targets a newer macOS than the
-runners, so `darwin-arm64` builds the compiler from source with opam.
+combined `checksums.txt`, and publish as a GitHub Release. Every runner
+builds the Emo toolchain from source at the workflow's `EMO_REF` commit
+(the runtime fixes the binaries need are not in a published emo release
+yet) and links OpenSSL, so the CLI ships HTTPS support. The macOS tarball
+carries `libssl`/`libcrypto` beside the binaries (their install names point
+at `@executable_path`, and the installer puts them in the same directory);
+Linux binaries link the system `libssl3`, present in mainstream
+distributions.
 
 ## Building from source
 
@@ -69,5 +73,7 @@ $ emo build -o /usr/local/bin/pokerface main.emo
 $ emo build -o /usr/local/bin/pokerface-registry registry/main.emo
 ```
 
-The registry links `libsqlite3` (install the dev package); the CLI links
-nothing beyond libc.
+The registry links `libsqlite3` (install the dev package). The CLI links
+OpenSSL for HTTPS: install the development files, or pass
+`--cclib=-L<openssl-lib-dir>` when the libraries live outside the default
+link path (Homebrew's `openssl@3`/`openssl@4`, say).

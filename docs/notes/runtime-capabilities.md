@@ -117,16 +117,16 @@ Consequences and the workaround, both shipped in T4.13:
   `download_blob_with`).
 
 The root-cause fix landed in the emo runtime's `develop` branch on
-2026-11-22 (c target, `emo_net_write_once`; unreleased at the time of
-writing): a raw `send` that answers `EAGAIN`/`EWOULDBLOCK` now parks the
-fiber on writability and retries, toward the connection's timeout — a
-deadline past with nothing writable answers "timed out writing to …" —
-the same discipline reads and the TLS path already kept. With the fix a
-plain 200 GET of a large blob completes for every client (curl, crane,
-skopeo), and a `conn.write` above the socket buffer no longer fails. The
-window workarounds above stay: they are still correct and keep memory
-bounded. Toolchains released before the fix still need the windows for
-large transfers.
+2026-11-22 (c target, `emo_net_write_once`): a raw `send` that answers
+`EAGAIN`/`EWOULDBLOCK` now parks the fiber on writability and retries,
+toward the connection's timeout — a deadline past with nothing writable
+answers "timed out writing to …" — the same discipline reads and the TLS
+path already kept. With the fix a plain 200 GET of a large blob completes
+for every client (curl, crane, skopeo), and a `conn.write` above the
+socket buffer no longer fails. The pokerface v0.3.3 binaries are built
+from a toolchain that carries the fix; older releases still need the
+window workarounds above for large transfers, which stay because they are
+still correct and keep memory bounded.
 
 ## The Linux runtime's HTTP stack (T4.16 checklist verification, 2026-11-20)
 

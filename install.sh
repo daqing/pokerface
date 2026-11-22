@@ -110,6 +110,14 @@ for bin in pokerface pokerface-registry; do
     mv "$TMPDIR_INSTALL/$bin" "$INSTALL_DIR/$bin"
   fi
 done
+# The macOS tarball carries the OpenSSL dylibs the binaries load from
+# @executable_path; they sit beside the binaries and nowhere else.
+for lib in "$TMPDIR_INSTALL"/libssl.*.dylib "$TMPDIR_INSTALL"/libcrypto.*.dylib; do
+  if [ -f "$lib" ]; then
+    chmod 755 "$lib"
+    mv "$lib" "$INSTALL_DIR/"
+  fi
+done
 
 if ! command -v pokerface >/dev/null 2>&1; then
   say ""

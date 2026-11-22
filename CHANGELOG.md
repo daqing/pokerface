@@ -4,6 +4,24 @@ All notable changes to pokerface. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the release
 tags (`vX.Y.Z`), and unreleased work lives at the top.
 
+## [0.3.3] — 2026-11-22
+
+### Fixed
+
+- `pokerface pull` works against HTTPS registries: the released binaries
+  were built without TLS and failed with "net_tls_connect_with is not
+  supported on this target yet" — the Emo compiler's TLS reachability walk
+  skipped class and interface method bodies, and the release build never
+  linked OpenSSL.
+- Plain GETs of large blobs no longer die mid-body: the runtime now parks
+  on a would-block send instead of failing it.
+
+### Changed
+
+- Release builds compile the Emo toolchain from the pinned `EMO_REF`
+  commit on every platform (Linux no longer uses the binary release) and
+  link OpenSSL, so the runtime fixes ship in the binaries.
+
 ## [0.3.2] — 2026-11-22
 
 ### Fixed

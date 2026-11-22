@@ -36,6 +36,10 @@ emo build -o /tmp/pokerface-registry-check registry/main.emo
   before tagging anyway.
 - The workflows pass `actionlint`:
   `actionlint .github/workflows/*.yaml`.
+- A local `emo build` of the CLI now links OpenSSL (the release binaries
+  ship HTTPS support): install the OpenSSL development files, or pass
+  `--cclib=-L<openssl-lib-dir>` (Homebrew's `openssl@3`/`openssl@4`). The
+  registry does not use TLS and links no OpenSSL.
 
 ## 4. Tag and publish
 
@@ -48,6 +52,10 @@ git push origin vX.Y.Z
   (linux/amd64, linux/arm64, darwin/arm64), per-platform
   tarballs (`pokerface` + `pokerface-registry`) with `.sha256` files and a combined
   `checksums.txt`, published as a GitHub Release with generated notes.
+- Both platforms build the Emo toolchain from source at the workflow's
+  `EMO_REF` commit — the fixes the binaries need are not in a published emo
+  release. That commit must be pushed to `github.com/emo-lang/emo`, because
+  opam pins it by full SHA; a local-only commit fails the build at the pin.
 - Watch the run; a red arm64 job is still a red release (`fail-fast` is
   off, so all three finish — check each).
 
@@ -79,10 +87,15 @@ POKERFACE_VERSION=vX.Y.Z POKERFACE_INSTALL_DIR=/tmp/pf-release-check \
 
 ## Known limitations to state in the notes
 
-- The Linux binaries are built with the published Emo toolchain (the
-  binary release pinned by `EMO_VERSION`); macOS builds the compiler from
-  source with opam, because the released macOS archive targets a newer
-  macOS than the runners.
-- Plain-HTTP GET responses larger than ~64 KiB can die mid-transfer (the
-  runtime's socket-write limitation, `docs/notes/runtime-capabilities.md`);
-  `pokerface`'s own push/pull walk bounded windows and are unaffected.
+- The binaries are built with an Emo toolchain compiled from source at the
+  workflow's `EMO_REF` commit — that pin carries the runtime fixes the
+  release needs, which are not in a published emo release yet. Move the pin
+  (and this note) once they are released.
+- The registry and the CLI link OpenSSL at build time (the toolchain's
+  reachability walk counts the httpd TLS tier). Linux binaries load the
+  system `libssl3` at run time — present in mainstream distributions and in
+  the compose image's `debian:bookworm-slim`. The macOS tarball bundles
+  `libssl`/`libcrypto` with `@executable_path` install names, and
+  `install.sh` places them beside the binaries; without the installer,
+  keep all files from the archive together. The registry additionally needs
+  `libsqlite3` at run time.

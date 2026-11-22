@@ -189,9 +189,8 @@
   blobs bigger than ~64 KiB — on push (mitigated: uploads are 64 KiB
   windows), on pull (mitigated: the registry serves bounded 206 windows and
   the pull walks them), or on a plain GET by other clients. The plain-GET
-  failure is fixed in the emo runtime's `develop` branch (2026-11-22,
-  unreleased at the time of writing); toolchains built before that fix
-  still show it.
+  failure is fixed in the emo runtime (2026-11-22) and ships in the
+  pokerface v0.3.3 binaries; older releases still show it.
 - **Cause**: older emo toolchains' plain-TCP `send` treats EAGAIN (socket
   buffer full) as fatal; documented in
   `docs/notes/runtime-capabilities.md`.
