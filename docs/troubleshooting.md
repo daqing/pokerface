@@ -188,13 +188,18 @@
 - **Symptom**: a transfer dies mid-body (`closed after N of M bytes`) for
   blobs bigger than ~64 KiB — on push (mitigated: uploads are 64 KiB
   windows), on pull (mitigated: the registry serves bounded 206 windows and
-  the pull walks them), or on a plain GET by other clients (still broken).
-- **Cause**: the Emo runtime's plain-TCP `send` treats EAGAIN (socket
+  the pull walks them), or on a plain GET by other clients. The plain-GET
+  failure is fixed in the emo runtime's `develop` branch (2026-11-22,
+  unreleased at the time of writing); toolchains built before that fix
+  still show it.
+- **Cause**: older emo toolchains' plain-TCP `send` treats EAGAIN (socket
   buffer full) as fatal; documented in
-  `docs/notes/runtime-capabilities.md` with the recommended runtime fix.
-- **Handling**: pokerface's own push/pull work through the window
-  protocol; for other clients (skopeo, curl), pull large images with
-  `pokerface pull` until the runtime fix lands.
+  `docs/notes/runtime-capabilities.md`.
+- **Handling**: with a fixed emo, rebuild the registry and every client
+  (the runtime is compiled into the binary). On older toolchains,
+  pokerface's own push/pull still work through the window protocol; for
+  other clients (skopeo, curl, crane), pull large images with
+  `pokerface pull`.
 - **Verification**: `test/registry_blobs.emo`'s Range-window tests;
   executed: the hello example's 2.5 MB layer pulled through the windows
   and served by the container (T4.13).
