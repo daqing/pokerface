@@ -4,8 +4,8 @@
 > and the entry point `registry/main.emo`. Build and run:
 
 ```console
-$ emo build -o .emo-build/registry registry/main.emo
-$ scripts/run-registry.sh .emo-build/registry --config registry.yaml
+$ emo build -o .emo-build/pokerface-registry registry/main.emo
+$ scripts/run-registry.sh .emo-build/pokerface-registry --config registry.yaml
 ```
 
 ## Configuration precedence

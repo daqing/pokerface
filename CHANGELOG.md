@@ -4,6 +4,15 @@ All notable changes to pokerface. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the release
 tags (`vX.Y.Z`), and unreleased work lives at the top.
 
+## [0.2.0] — 2026-11-22
+
+### Changed
+
+- The registry server installs and runs as `pokerface-registry` (was the
+  generic `registry`), and release builds land in `bin/`.
+- Release binaries are built with the published Emo toolchain; Intel macOS
+  (`darwin-amd64`) is no longer a release target.
+
 ## [0.1.0] — 2026-11-20
 
 The first complete path: an application repository commits

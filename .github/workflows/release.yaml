@@ -1,13 +1,10 @@
 # The release workflow (T4.7): a v* tag builds the CLI and the registry for
-# the four release platforms, publishes the tarballs with a checksums.txt,
+# the three release platforms, publishes the tarballs with a checksums.txt,
 # and cuts the GitHub Release the install script (install.sh) downloads
 # from. Each platform builds natively on its runner — no cross-compilation,
 # no emulation.
 #
-# The Emo toolchain step is the heavy one (opam pins the compiler from the
-# emo-lang repository at a fixed commit, so a release rebuilds identically);
-# when a published builder image lands, this step becomes one `docker run` —
-# the same caveat deploy/Dockerfile records (T2.17).
+# The Emo toolchain is the published binary release, pinned by EMO_VERSION.
 
 name: release
 
@@ -27,27 +24,23 @@ jobs:
           - { os: ubuntu-latest, platform: linux-amd64 }
           - { os: ubuntu-24.04-arm, platform: linux-arm64 }
           - { os: macos-latest, platform: darwin-arm64 }
-          - { os: macos-13, platform: darwin-amd64 }
     runs-on: ${{ matrix.os }}
     env:
-      # The compiler commit behind the v0.26.1120.1 toolchain the release was
-      # built and verified with; a tag rebuilds with the same compiler. (The
-      # package file lives on develop — main has none.)
-      EMO_REF: 2d94fcec9a07d72d048bff5c5264d3cd655c21c5
+      # The published toolchain release the binaries are built with; a tag
+      # rebuilds with the same compiler.
+      EMO_VERSION: v0.26.1120.1
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up OCaml
-        uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: 5.5.0
-          opam-disable-sandboxing: true
-
-      - name: Install the Emo toolchain
+      - name: Install the Emo toolchain (binary)
+        env:
+          EMO_PREFIX: ${{ runner.temp }}/emo
         run: |
-          opam pin add emo.dev "git+https://github.com/emo-lang/emo.git#${EMO_REF}" --yes
-          opam install emo.dev --yes
-          opam exec -- emo version
+          # The prefix is on PATH first, so the installer skips the shell-rc edit.
+          export PATH="$EMO_PREFIX/bin:$PATH"
+          curl -fsSL https://www.emo-lang.cn/cdn/install.sh | sh
+          echo "$EMO_PREFIX/bin" >> "$GITHUB_PATH"
+          "$EMO_PREFIX/bin/emo" version
 
       - name: Install libsqlite3 (the registry links it)
         if: runner.os == 'Linux'
@@ -59,11 +52,14 @@ jobs:
           echo "PKG_CONFIG_PATH=$(brew --prefix sqlite)/lib/pkgconfig" >> "$GITHUB_ENV"
 
       - name: Build
-        run: opam exec -- sh -c 'emo build -o pokerface main.emo && emo build -o registry registry/main.emo'
+        run: |
+          mkdir -p bin
+          emo build -o ./bin/pokerface main.emo
+          emo build -o ./bin/pokerface-registry ./registry/main.emo
 
       - name: Package
         run: |
-          tar -czf "pokerface-${{ matrix.platform }}.tar.gz" pokerface registry
+          tar -czf "pokerface-${{ matrix.platform }}.tar.gz" -C bin pokerface pokerface-registry
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "pokerface-${{ matrix.platform }}.tar.gz" > "pokerface-${{ matrix.platform }}.sha256"
           else

@@ -7,7 +7,7 @@
 # and drain in-flight requests. Run the service through this script (or set
 # POKERFACE_REGISTRY_SHUTDOWN_FILE yourself and touch that file).
 #
-#   scripts/run-registry.sh .emo-build/registry --config registry.yaml
+#   scripts/run-registry.sh .emo-build/pokerface-registry --config registry.yaml
 
 set -euo pipefail
 

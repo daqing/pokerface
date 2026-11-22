@@ -143,7 +143,7 @@ pokerface version
 
 ```bash
 # 启动本地 registry（生产部署见 docs/registry/operations.md）
-registry --config registry.yaml &
+pokerface-registry --config registry.yaml &
 
 # 在应用仓库里（docs/getting-started.zh-CN.md 有完整 walkthrough）：
 pokerface build --write-lock     # buildx 构建、pokerface 推送、lock 记录 digest

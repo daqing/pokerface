@@ -7,7 +7,7 @@
 set -e
 
 shutdown_file="${POKERFACE_REGISTRY_SHUTDOWN_FILE:-/data/registry.shutdown}"
-registry_bin="${REGISTRY_BIN:-/usr/local/bin/registry}"
+registry_bin="${REGISTRY_BIN:-/usr/local/bin/pokerface-registry}"
 term_handler() {
   echo "registry: shutdown requested" >&2
   touch "$shutdown_file"

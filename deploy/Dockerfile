@@ -21,7 +21,7 @@ COPY src ./src
 COPY registry ./registry
 # The toolchain resolves the pinned packages from its registry cache; the
 # build itself needs no network when the cache is warm.
-RUN emo build -o /out/registry registry/main.emo
+RUN emo build -o /out/pokerface-registry registry/main.emo
 
 
 FROM debian:bookworm-slim AS runtime
@@ -33,7 +33,7 @@ RUN apt-get update \
 RUN useradd --system --home /data --shell /usr/sbin/nologin pokerface \
  && mkdir -p /data && chown pokerface:pokerface /data
 
-COPY --from=builder /out/registry /usr/local/bin/registry
+COPY --from=builder /out/pokerface-registry /usr/local/bin/pokerface-registry
 COPY deploy/registry-entrypoint.sh /usr/local/bin/registry-entrypoint
 RUN chmod +x /usr/local/bin/registry-entrypoint
 

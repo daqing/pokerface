@@ -128,7 +128,7 @@ through windows.
 **Any HTTP exchange through the `http`/`httpd` packages segfaults (or
 traps, SIGTRAP) on the Linux c target**; the same code runs fine on macOS.
 Found while verifying the compose stack (section 9, item 4) — the Linux
-registry binary listens and dies on the first request; a minimal Linux
+registry binary (`pokerface-registry`) listens and dies on the first request; a minimal Linux
 client program dies on the first real response. Evidence, narrowed by
 bisection:
 

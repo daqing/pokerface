@@ -40,7 +40,7 @@ store:
   backend: fs
   root: $HOME/pokerface-quick/blobs
 EOF
-$ registry --config "$HOME/pokerface-quick/registry.yaml" &
+$ pokerface-registry --config "$HOME/pokerface-quick/registry.yaml" &
 $ curl -s http://127.0.0.1:4599/healthz
 ok
 ```

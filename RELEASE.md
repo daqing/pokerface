@@ -25,7 +25,7 @@ checklist is the human part before and after it runs.
 ```bash
 emo test                       # the full suite, green
 emo build -o /tmp/pf-check main.emo
-emo build -o /tmp/registry-check registry/main.emo
+emo build -o /tmp/pokerface-registry-check registry/main.emo
 ./scripts/e2e.sh               # the M4 path: build → push → lock → resolve → pull → HTTP 200
 ./scripts/e2e-m2.sh            # the registry protocol edges
 ./scripts/e2e-m1.sh            # the client loop
@@ -44,12 +44,12 @@ git tag -a vX.Y.Z -m "pokerface vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-- The `v*` tag triggers `release.yaml`: four native platform builds
-  (linux/amd64, linux/arm64, darwin/arm64, darwin-amd64), per-platform
-  tarballs (`pokerface` + `registry`) with `.sha256` files and a combined
+- The `v*` tag triggers `release.yaml`: three native platform builds
+  (linux/amd64, linux/arm64, darwin/arm64), per-platform
+  tarballs (`pokerface` + `pokerface-registry`) with `.sha256` files and a combined
   `checksums.txt`, published as a GitHub Release with generated notes.
 - Watch the run; a red arm64 job is still a red release (`fail-fast` is
-  off, so all four finish — check each).
+  off, so all three finish — check each).
 
 ## 5. Post-release verification
 
@@ -59,7 +59,7 @@ POKERFACE_VERSION=vX.Y.Z POKERFACE_INSTALL_DIR=/tmp/pf-release-check \
 /tmp/pf-release-check/pokerface version   # must print vX.Y.Z's version
 ```
 
-- Confirm the release page carries four tarballs + `checksums.txt`.
+- Confirm the release page carries three tarballs + `checksums.txt`.
 - `skopeo` sanity on the published binaries is not a thing — the binaries
   are static (the CLI); the registry needs libsqlite3 at runtime (document
   it in the release notes when it changes).
@@ -79,8 +79,8 @@ POKERFACE_VERSION=vX.Y.Z POKERFACE_INSTALL_DIR=/tmp/pf-release-check \
 
 ## Known limitations to state in the notes
 
-- The Emo toolchain builds the release from source (opam pin); a published
-  builder image will replace that step.
+- The binaries are built with the published Emo toolchain (the binary
+  release pinned by `EMO_VERSION`).
 - Plain-HTTP GET responses larger than ~64 KiB can die mid-transfer (the
   runtime's socket-write limitation, `docs/notes/runtime-capabilities.md`);
   `pokerface`'s own push/pull walk bounded windows and are unaffected.

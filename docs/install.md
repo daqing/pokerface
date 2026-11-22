@@ -1,7 +1,7 @@
 # Installing pokerface (T4.7)
 
-One line installs the `pokerface` CLI and the `registry` server for your
-platform (macOS and Linux, amd64 and arm64):
+One line installs the `pokerface` CLI and the `pokerface-registry` server for your
+platform (macOS on Apple Silicon, Linux on amd64 and arm64):
 
 ```console
 $ curl -fsSL https://raw.githubusercontent.com/daqing/pokerface/main/install.sh | sh
@@ -52,13 +52,12 @@ $ sha256sum -c <(grep linux-amd64 checksums.txt)        # Linux
 ## How releases are built
 
 `.github/workflows/release.yaml` cuts a release on every `v*` tag: the CLI
-and the registry build natively on four runners (linux-amd64, linux-arm64,
-darwin-arm64, darwin-amd64 — no cross-compilation, no emulation), land as
+and the registry build natively on three runners (linux-amd64, linux-arm64,
+darwin-arm64 — no cross-compilation, no emulation), land as
 `pokerface-<platform>.tar.gz` with per-platform `.sha256` files and a
-combined `checksums.txt`, and publish as a GitHub Release. The heavy step
-is the Emo toolchain install (opam pinning the compiler); when a published
-builder image lands it becomes one `docker run` — the same caveat
-`deploy/Dockerfile` records.
+combined `checksums.txt`, and publish as a GitHub Release. The binaries are
+built with the published Emo toolchain (the binary release pinned by
+`EMO_VERSION`).
 
 ## Building from source
 
@@ -66,7 +65,7 @@ The toolchain is the Emo compiler (`emo-lang/emo`); with it on your PATH:
 
 ```console
 $ emo build -o /usr/local/bin/pokerface main.emo
-$ emo build -o /usr/local/bin/registry registry/main.emo
+$ emo build -o /usr/local/bin/pokerface-registry registry/main.emo
 ```
 
 The registry links `libsqlite3` (install the dev package); the CLI links

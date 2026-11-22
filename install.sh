@@ -28,8 +28,8 @@ need curl
 need tar
 need sha256sum || need shasum
 
-# darwin-amd64, darwin-arm64, linux-amd64, linux-arm64 — the release
-# workflow's matrix (docs/workflow: .github/workflows/release.yaml).
+# darwin-arm64, linux-amd64, linux-arm64 — the release workflow's matrix
+# (docs/workflow: .github/workflows/release.yaml).
 detect_platform() {
   os="$(uname -s)"
   arch="$(uname -m)"
@@ -38,6 +38,9 @@ detect_platform() {
     Linux) platform="linux" ;;
     *) fail "unsupported operating system: $os" ;;
   esac
+  if [ "$os" = Darwin ] && [ "$arch" != arm64 ]; then
+    fail "no Intel macOS build — pokerface ships macOS for Apple Silicon only"
+  fi
   case "$arch" in
     x86_64|amd64) platform="$platform-amd64" ;;
     arm64|aarch64) platform="$platform-arm64" ;;
@@ -101,7 +104,7 @@ say "checksum verified ($GOT)"
 tar -xzf "$TMPDIR_INSTALL/$ARTIFACT" -C "$TMPDIR_INSTALL"
 
 mkdir -p "$INSTALL_DIR"
-for bin in pokerface registry; do
+for bin in pokerface pokerface-registry; do
   if [ -f "$TMPDIR_INSTALL/$bin" ]; then
     chmod 755 "$TMPDIR_INSTALL/$bin"
     mv "$TMPDIR_INSTALL/$bin" "$INSTALL_DIR/$bin"

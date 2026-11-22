@@ -4,9 +4,8 @@
 #
 # Docker Hub is never contacted: every image is built FROM scratch and
 # served by the local registry the scripts start — there are no base images
-# to pre-cache, and the Emo toolchain (the heavy step) is cached by
-# setup-ocaml and pinned to a fixed upstream commit, so the whole run stays
-# inside the 15-minute budget.
+# to pre-cache, and the Emo toolchain is the published binary release,
+# pinned by EMO_VERSION, so the whole run stays inside the 15-minute budget.
 
 name: e2e
 
@@ -35,24 +34,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      # The Emo toolchain is pinned: the cache key and the install pin use
-      # the same commit, so a rebuild is reproducible.
-      EMO_REF: 88281e111aecbc919b041e911fa0d2fda1fe5296
+      # The published toolchain release, pinned so a rerun compiles with the
+      # same compiler.
+      EMO_VERSION: v0.26.1120.1
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up OCaml
-        uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: 5.5.0
-          opam-disable-sandboxing: true
-          cache-prefix: emo-toolchain-${{ env.EMO_REF }}
-
-      - name: Install the Emo toolchain (cached)
+      - name: Install the Emo toolchain (binary)
+        env:
+          EMO_PREFIX: ${{ runner.temp }}/emo
         run: |
-          opam pin add emo.dev "git+https://github.com/emo-lang/emo.git#${EMO_REF}" --yes
-          opam install emo.dev --yes
-          emo version
+          # The prefix is on PATH first, so the installer skips the shell-rc edit.
+          export PATH="$EMO_PREFIX/bin:$PATH"
+          curl -fsSL https://www.emo-lang.cn/cdn/install.sh | sh
+          echo "$EMO_PREFIX/bin" >> "$GITHUB_PATH"
+          "$EMO_PREFIX/bin/emo" version
 
       - name: Install skopeo (the runtime import leg)
         run: sudo apt-get update && sudo apt-get install -y skopeo

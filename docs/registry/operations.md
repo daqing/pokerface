@@ -11,8 +11,8 @@
 1. **Compose stack** (recommended): `cd deploy && cp ../.env.example .env &&
    docker compose up -d` — registry + MinIO + Caddy, TLS automatic, MinIO
    never exposed. See `docs/registry/deployment.md`.
-2. **Bare binary**: the release's `registry` binary with a config file —
-   `registry --config registry.yaml`. The fs backend is the default store
+2. **Bare binary**: the release's `pokerface-registry` binary with a config file —
+   `pokerface-registry --config registry.yaml`. The fs backend is the default store
    (`docs/spec/registry-blobstore.md`); the shutdown protocol applies (see
    Stopping, below).
 
@@ -92,7 +92,7 @@ $ touch "$DATA_DIR/registry.shutdown"      # the documented stop protocol
 $ # wait for the process to exit; the drain is clean
 $ tar -czf backup-$(date +%F).tgz "$DATA_DIR" "$STORE_ROOT"
 $ rm "$DATA_DIR/registry.shutdown"         # per your own procedure, e.g. mv to /tmp
-$ registry --config registry.yaml &
+$ pokerface-registry --config registry.yaml &
 $ curl -sf "$URL/readyz"                   # 200 = migrations done, store reachable
 ```
 

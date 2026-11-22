@@ -154,7 +154,7 @@ machine, an image built `FROM scratch`:
 
 ```bash
 # Start a local registry (docs/registry/operations.md has the real one)
-registry --config registry.yaml &
+pokerface-registry --config registry.yaml &
 
 # In your application repository (docs/getting-started.md walks this):
 pokerface build --write-lock     # buildx builds, pokerface pushes, lock records the digest
