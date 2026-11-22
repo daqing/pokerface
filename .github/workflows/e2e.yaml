@@ -4,9 +4,9 @@
 #
 # Docker Hub is never contacted: every image is built FROM scratch and
 # served by the local registry the scripts start — there are no base images
-# to pre-cache, and the Emo toolchain (the heavy step) is cached and pinned
-# to a fixed upstream commit, so the whole run stays inside the 15-minute
-# budget.
+# to pre-cache, and the Emo toolchain (the heavy step) is cached by
+# setup-ocaml and pinned to a fixed upstream commit, so the whole run stays
+# inside the 15-minute budget.
 
 name: e2e
 
@@ -22,6 +22,7 @@ on:
       - "main.emo"
       - "package.emo"
       - "package.lock"
+      - ".github/workflows/e2e.yaml"
   schedule:
     - cron: "23 2 * * *"
   workflow_dispatch:
@@ -40,19 +41,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/cache@v4
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
         with:
-          path: ~/.opam
-          key: emo-toolchain-${{ env.EMO_REF }}
+          ocaml-compiler: 5.5.0
+          opam-disable-sandboxing: true
+          cache-prefix: emo-toolchain-${{ env.EMO_REF }}
 
       - name: Install the Emo toolchain (cached)
         run: |
-          if [ ! -x "$HOME/.opam/default/bin/emo" ]; then
-            opam init --auto-setup --disable-sandboxing -y
-            opam pin add emo.dev "git+https://github.com/emo-lang/emo.git#${EMO_REF}" --yes
-            opam install emo.dev --yes
-          fi
-          echo "$HOME/.opam/default/bin" >> "$GITHUB_PATH"
+          opam pin add emo.dev "git+https://github.com/emo-lang/emo.git#${EMO_REF}" --yes
+          opam install emo.dev --yes
           emo version
 
       - name: Install skopeo (the runtime import leg)

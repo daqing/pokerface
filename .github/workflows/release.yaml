@@ -5,9 +5,9 @@
 # no emulation.
 #
 # The Emo toolchain step is the heavy one (opam pins the compiler from the
-# emo-lang repository); when a published builder image lands, this step
-# becomes one `docker run` — the same caveat deploy/Dockerfile records
-# (T2.17).
+# emo-lang repository at a fixed commit, so a release rebuilds identically);
+# when a published builder image lands, this step becomes one `docker run` —
+# the same caveat deploy/Dockerfile records (T2.17).
 
 name: release
 
@@ -29,13 +29,23 @@ jobs:
           - { os: macos-latest, platform: darwin-arm64 }
           - { os: macos-13, platform: darwin-amd64 }
     runs-on: ${{ matrix.os }}
+    env:
+      # The compiler commit behind the v0.26.1120.1 toolchain the release was
+      # built and verified with; a tag rebuilds with the same compiler. (The
+      # package file lives on develop — main has none.)
+      EMO_REF: 2d94fcec9a07d72d048bff5c5264d3cd655c21c5
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.5.0
+          opam-disable-sandboxing: true
+
       - name: Install the Emo toolchain
         run: |
-          opam init --auto-setup --disable-sandboxing -y
-          opam pin add emo.dev git+https://github.com/emo-lang/emo.git#main --yes
+          opam pin add emo.dev "git+https://github.com/emo-lang/emo.git#${EMO_REF}" --yes
           opam install emo.dev --yes
           opam exec -- emo version
 
