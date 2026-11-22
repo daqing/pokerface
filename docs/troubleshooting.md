@@ -206,13 +206,22 @@
 
 ## 13. Stopping the registry
 
-- **Symptom**: `kill -TERM` on the registry process does nothing.
+- **Symptom**: `kill -TERM` on the registry process does nothing; under
+  systemd, `systemctl stop`/`restart` hangs for about 90 seconds and then
+  the process is SIGKILLed.
 - **Cause**: by design — the server has no signal handlers; the documented
   stop protocol is the shutdown marker file
-  (`docs/spec/registry-config.md`).
-- **Handling**: `touch <data_dir>/registry.shutdown` and wait for the
-  drain. If the marker cannot be created (the data dir was deleted), the
-  process is orphaned: `kill -9` is the only option — prefer deleting the
-  *marker's directory* being the last thing you do, not the first.
+  (`docs/spec/registry-config.md`). systemd sends SIGTERM and waits
+  `TimeoutStopSec` (90 s by default) before SIGKILL.
+- **Handling**: `touch <shutdown_file>` and wait for the drain. Under
+  systemd, add `ExecStop=/usr/bin/touch <shutdown_file>` — see
+  `deploy/pokerface-registry.service` — and make sure the path matches what
+  the server watches (`shutdown_file` in the config, or
+  `POKERFACE_REGISTRY_SHUTDOWN_FILE`) and is writable by the service user.
+  Alternatively run the service through `scripts/run-registry.sh`, which
+  owns the signal. If the marker cannot be created (the data dir was
+  deleted), the process is orphaned: `kill -9` is the only option — prefer
+  deleting the *marker's directory* being the last thing you do, not the
+  first.
 - **Verification**: `deploy/registry-entrypoint.sh` and `e2e-m2.sh` both
   drive the marker protocol; executed repeatedly.

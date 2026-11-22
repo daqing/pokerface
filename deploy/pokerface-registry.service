@@ -1,0 +1,34 @@
+# Example systemd unit for the bare registry binary.
+#
+# The registry ignores SIGTERM/SIGINT by design (Emo offers no signal
+# handlers); its stop protocol is a marker file. systemd's default stop
+# would send SIGTERM, wait out TimeoutStopSec (90 s), then SIGKILL — which
+# is why `systemctl stop`/`restart` appears to hang. ExecStop touches the
+# marker instead: the server stops accepting, drains in-flight requests,
+# and exits 0, so a restart proceeds immediately.
+#
+# Adjust User/Group and the ExecStart paths to your install. The marker
+# rides POKERFACE_REGISTRY_SHUTDOWN_FILE (it overrides the config's
+# shutdown_file), so it stays on tmpfs and registry.yaml needs no change.
+
+[Unit]
+Description=PokerFace OCI registry
+Documentation=https://github.com/daqing/pokerface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pokerface
+Group=pokerface
+RuntimeDirectory=pokerface
+RuntimeDirectoryMode=0750
+Environment=POKERFACE_REGISTRY_SHUTDOWN_FILE=/run/pokerface/registry.shutdown
+ExecStart=/usr/local/bin/pokerface-registry --config /etc/pokerface/registry.yaml
+ExecStop=/usr/bin/touch /run/pokerface/registry.shutdown
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

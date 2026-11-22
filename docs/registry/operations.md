@@ -14,7 +14,13 @@
 2. **Bare binary**: the release's `pokerface-registry` binary with a config file —
    `pokerface-registry --config registry.yaml`. The fs backend is the default store
    (`docs/spec/registry-blobstore.md`); the shutdown protocol applies (see
-   Stopping, below).
+   Stopping, below). Under systemd, start from
+   `deploy/pokerface-registry.service`: the registry ignores SIGTERM, so the
+   unit's `ExecStop` touches the shutdown marker. Without that, `systemctl
+   stop`/`restart` sends SIGTERM, waits out `TimeoutStopSec` (90 s by
+   default), and only then SIGKILLs — the restart looks hung. The unit keeps
+   the marker on tmpfs via `POKERFACE_REGISTRY_SHUTDOWN_FILE`; if you set
+   `shutdown_file` in the config, point `ExecStop` at that same path instead.
 
 ## Storage
 
