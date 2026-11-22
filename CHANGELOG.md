@@ -4,6 +4,14 @@ All notable changes to pokerface. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the release
 tags (`vX.Y.Z`), and unreleased work lives at the top.
 
+## [0.3.1] — 2026-11-22
+
+### Fixed
+
+- The macOS release job builds the Emo toolchain from source again: the
+  published macOS archive targets a newer macOS than the runners, so dyld
+  failed at start-up.
+
 ## [0.3.0] — 2026-11-22
 
 ### Fixed

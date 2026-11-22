@@ -79,8 +79,10 @@ POKERFACE_VERSION=vX.Y.Z POKERFACE_INSTALL_DIR=/tmp/pf-release-check \
 
 ## Known limitations to state in the notes
 
-- The binaries are built with the published Emo toolchain (the binary
-  release pinned by `EMO_VERSION`).
+- The Linux binaries are built with the published Emo toolchain (the
+  binary release pinned by `EMO_VERSION`); macOS builds the compiler from
+  source with opam, because the released macOS archive targets a newer
+  macOS than the runners.
 - Plain-HTTP GET responses larger than ~64 KiB can die mid-transfer (the
   runtime's socket-write limitation, `docs/notes/runtime-capabilities.md`);
   `pokerface`'s own push/pull walk bounded windows and are unaffected.

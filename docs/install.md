@@ -55,9 +55,10 @@ $ sha256sum -c <(grep linux-amd64 checksums.txt)        # Linux
 and the registry build natively on three runners (linux-amd64, linux-arm64,
 darwin-arm64 — no cross-compilation, no emulation), land as
 `pokerface-<platform>.tar.gz` with per-platform `.sha256` files and a
-combined `checksums.txt`, and publish as a GitHub Release. The binaries are
-built with the published Emo toolchain (the binary release pinned by
-`EMO_VERSION`).
+combined `checksums.txt`, and publish as a GitHub Release. The Linux
+binaries are built with the published Emo toolchain (the binary release
+pinned by `EMO_VERSION`); the macOS archive targets a newer macOS than the
+runners, so `darwin-arm64` builds the compiler from source with opam.
 
 ## Building from source
 
