@@ -4,6 +4,14 @@ All notable changes to pokerface. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the release
 tags (`vX.Y.Z`), and unreleased work lives at the top.
 
+## [0.3.0] — 2026-11-22
+
+### Fixed
+
+- `pokerface resolve` and `pokerface pull` accept `.` and `..` as local
+  references (e.g. `.:main`, as the quick start documents); relative local
+  paths resolve against the working directory.
+
 ## [0.2.0] — 2026-11-22
 
 ### Changed

@@ -4,7 +4,7 @@ package {
   // e.g. "acme/hello".
   name = "daqing/pokerface"
   // This package's own version: exact major.minor.patch.
-  version = "0.2.0"
+  version = "0.3.0"
   // The backends this package runs and builds on. Known targets:
   // "ocaml", "c", "wasm", "typescript", "browser", "beam", "riscv64".
   targets = ["c"]

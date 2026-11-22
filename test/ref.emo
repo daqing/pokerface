@@ -1,5 +1,7 @@
 // T1.3 table-driven tests for src/ref.emo — run with `emo test`.
 
+require "os"
+
 const ref_parser = src.ref
 
 def test_valid_references() {
@@ -25,6 +27,34 @@ def test_invalid_references() {
 def test_default_ref_is_latest() {
   const (R.ok, r) = ref_parser.parse("github.com/acme/app")
   expect_equal("latest", r.ref)
+}
+
+def test_dot_reference_names_the_current_directory() {
+  const cwd = os.getcwd()
+  case ref_parser.parse(".:main") {
+    (R.ok, r) then {
+      expect_equal(cwd, r.git_url)
+      expect_equal("main", r.ref)
+      const parts = cwd.split("/")
+      expect_equal(parts[parts.length() - 2], r.owner)
+      expect_equal(parts[parts.length() - 1], r.repo)
+    }
+    (R.error, why) then {
+      expect_fail("expected '.:main' to parse, got: " + why)
+    }
+  }
+}
+
+def test_dotdot_reference_names_the_parent_directory() {
+  case ref_parser.parse("..:main") {
+    (R.ok, r) then {
+      expect_equal(ref_parser.parent_path(os.getcwd()), r.git_url)
+      expect_equal("main", r.ref)
+    }
+    (R.error, why) then {
+      expect_fail("expected '..:main' to parse, got: " + why)
+    }
+  }
 }
 
 def expect_valid(input String, want_host String, want_owner String, want_repo String, want_url String, want_ref String) {

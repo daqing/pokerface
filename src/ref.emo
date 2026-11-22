@@ -4,6 +4,8 @@
 // stripped. Pure parsing — no network calls; git refname rules beyond the
 // character set stay with T1.6's resolution.
 
+require "os"
+
 const default_ref = "latest"
 const ref_charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_+"
 const digits = "0123456789"
@@ -47,11 +49,13 @@ def parse(input String) (R, Reference) {
   var host = ""
   var path = ""
   if is_local_path(body) {
-    // Local path form (T1.9): "/...", "./...", "../..." — a filesystem path
-    // git can use directly; host names it for display, owner/repo come from
-    // the last two segments. This is what keeps local e2e fixtures possible.
+    // Local path form (T1.9): "/...", ".", "..", "./...", "../..." — a
+    // filesystem path git can use directly, normalized to an absolute path
+    // so "." names the current repository. Host names it for display,
+    // owner/repo come from the last two segments. This is what keeps local
+    // e2e fixtures possible.
     host = "(local)"
-    path = body
+    path = local_path(body)
   } else {
     if body.starts_with("https://") {
       const rest = body.substring(8, body.length() - 8)
@@ -143,10 +147,40 @@ def parse(input String) (R, Reference) {
   return (R.ok, Reference.new(host, owner, repo, git_url, ref))
 }
 
-// Local path form: absolute, ./, or ../ prefixes — never a bare relative
-// name, which stays <host>/<owner>/<repo>.
+// Local path form: absolute, ., .., ./, or ../ prefixes — never a bare
+// relative name, which stays <host>/<owner>/<repo>.
 def is_local_path(body String) Bool {
+  if body == "." || body == ".." {
+    return true
+  }
   return body.starts_with("/") || body.starts_with("./") || body.starts_with("../")
+}
+
+// Relative local paths resolve against the working directory, so the parsed
+// reference means the same repository wherever git later runs.
+def local_path(body String) String {
+  if body.starts_with("/") {
+    return body
+  }
+  const cwd = os.getcwd()
+  if body == "." {
+    return cwd
+  }
+  if body == ".." {
+    return parent_path(cwd)
+  }
+  if body.starts_with("./") {
+    return cwd + body.substring(1, body.length() - 1)
+  }
+  return cwd + "/" + body
+}
+
+def parent_path(path String) String {
+  const slash = last_index_of(path, "/")
+  if slash <= 0 {
+    return "/"
+  }
+  return path.substring(0, slash)
 }
 
 def valid_ref(ref String) Bool {
