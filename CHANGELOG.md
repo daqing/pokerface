@@ -4,6 +4,20 @@ All notable changes to pokerface. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the release
 tags (`vX.Y.Z`), and unreleased work lives at the top.
 
+## [0.3.2] — 2026-11-22
+
+### Fixed
+
+- The release job checks out the repository before publishing:
+  `gh release create --verify-tag` and `--generate-notes` need a git
+  repository, and only the downloaded artifacts were present.
+
+### Changed
+
+- Documentation notes the emo runtime's would-block send fix (unreleased at
+  the time of writing); toolchains built before it still need the Range
+  windows for large transfers.
+
 ## [0.3.1] — 2026-11-22
 
 ### Fixed
