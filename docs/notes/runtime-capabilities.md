@@ -116,12 +116,17 @@ Consequences and the workaround, both shipped in T4.13:
   is reached, then the digest verifies (`src/blob.emo`
   `download_blob_with`).
 
-The root-cause fix belongs in the runtime (wait for writability on
-EAGAIN, mirroring the TLS path, in `emo_c_runtime.c` and the interpreter's
-write path) — recommended upstream follow-up; until it lands, a plain
-200 GET of a blob larger than the socket buffer dies mid-body for
-every client (curl included), which is why the pull always resumes
-through windows.
+The root-cause fix landed in the emo runtime's `develop` branch on
+2026-11-22 (c target, `emo_net_write_once`; unreleased at the time of
+writing): a raw `send` that answers `EAGAIN`/`EWOULDBLOCK` now parks the
+fiber on writability and retries, toward the connection's timeout — a
+deadline past with nothing writable answers "timed out writing to …" —
+the same discipline reads and the TLS path already kept. With the fix a
+plain 200 GET of a large blob completes for every client (curl, crane,
+skopeo), and a `conn.write` above the socket buffer no longer fails. The
+window workarounds above stay: they are still correct and keep memory
+bounded. Toolchains released before the fix still need the windows for
+large transfers.
 
 ## The Linux runtime's HTTP stack (T4.16 checklist verification, 2026-11-20)
 
